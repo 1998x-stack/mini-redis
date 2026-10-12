@@ -1,0 +1,28 @@
+APP := mini-redis-server
+PKG := ./...
+
+.PHONY: all build test fmt vet run clean smoke
+
+all: fmt vet test build
+
+build:
+	mkdir -p bin
+	go build -o bin/$(APP) ./cmd/mini-redis-server
+
+test:
+	go test $(PKG)
+
+fmt:
+	gofmt -w $$(find . -name '*.go' -type f)
+
+vet:
+	go vet $(PKG)
+
+run:
+	go run ./cmd/mini-redis-server -addr 127.0.0.1:6379
+
+smoke: build
+	./scripts/smoke.sh
+
+clean:
+	rm -rf bin coverage.out *.aof
