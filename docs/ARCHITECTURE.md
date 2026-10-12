@@ -1,222 +1,199 @@
-# Architecture — v0.2
+# Architecture — v0.3
 
 ## 1. Architectural goal
 
-mini-redis is a teaching implementation. v0.2 keeps protocol, command, storage and persistence semantics stable while replacing the network/runtime boundary with a readiness-driven reactor.
+v0.3 keeps the v0.2 event loop and public String/TTL/AOF behavior, but replaces the memory engine's opaque Go maps with a visible Redis-like dictionary.
 
 ```text
-                             Linux
-                              │
-                              ▼
-                       nonblocking sockets
-                              │
-                              ▼
-                      +---------------+
-                      | epoll Poller  |
-                      +-------+-------+
-                              │ readiness
-                    ┌─────────┼─────────┐
-                    ▼         ▼         ▼
-                 client A  client B  client C
-                 in/out    in/out    in/out
-                 buffers   buffers   buffers
-                    └─────────┼─────────┘
-                              ▼
-                       +--------------+
-                       | Event Loop   |
-                       +------+-------+
-                              │
-                       parse / execute
-                              │
-            +-----------------+-----------------+
-            ▼                                   ▼
-     command.Registry                       RESP reply
-            │                                   │
-            ▼                                   ▼
-       store.Store                       client output buf
-        │       │                               │
-        ▼       ▼                               ▼
-      values   TTL                       writable readiness
-            │
-            ▼
-            AOF
+redis-cli
+   ↓
+RESP / reactor
+   ↓
+command.Registry
+   ↓
+store.Store
+   ↓
+versionedmemory.Memory
+   ├── data    Dict[Object]
+   └── expires Dict[time.Time]
+   ↓
+successful mutation
+   ↓
+AOF
 ```
 
-## 2. Poller vs event loop
+Command code still knows only the Store interface. Dictionary mechanics remain a storage implementation detail.
 
-These are intentionally separate responsibilities.
+## 2. Dict structure
 
-`internal/netpoll` answers only:
-
-> Which file descriptors are ready for which kinds of I/O?
-
-The server event loop answers:
-
-> What should mini-redis do because those descriptors are ready?
-
-That separation prevents epoll-specific details from leaking into RESP, command handlers or storage.
-
-## 3. Why nonblocking I/O needs buffers
-
-TCP is a byte stream. One `read(2)` does not equal one Redis command and one `write(2)` does not equal one complete Redis response.
-
-Therefore every client owns:
+Each table is an array of bucket-chain heads:
 
 ```text
-input buffer                         output buffer
-────────────                         ─────────────
-partial command bytes                encoded replies
-multiple pipelined commands          bytes not yet accepted by kernel
+buckets
+ [0] ─► entry(key,value) ─► entry ─► nil
+ [1] ─► nil
+ [2] ─► entry ─► nil
 ```
 
-### Read side
+Separate chaining makes collisions explicit without introducing open-addressing tombstones as a second lesson. A `Hasher` boundary keeps the algorithm replaceable; deterministic FNV-1a is the educational default, not an attempt to match Redis' exact hash implementation.
+
+Power-of-two sizes make bucket selection visible:
 
 ```text
-EPOLLIN
-  ↓
-read until EAGAIN
-  ↓
-append bytes to client input
-  ↓
-parse complete commands repeatedly
-  ↓
-leave incomplete suffix buffered
+bucket = hash & (size - 1)
 ```
 
-### Write side
+## 3. Two hash tables during rehash
+
+A Dict owns `ht[0]`, `ht[1]` and `rehashIndex`.
+
+Stable:
 
 ```text
-reply encoded
-  ↓
-append to client output
-  ↓
-request EPOLLOUT
-  ↓
-write until EAGAIN or empty
-  ↓
-if empty: stop requesting EPOLLOUT
+ht[0] = live table
+ht[1] = empty
+rehashIndex = -1
 ```
 
-Always registering writable readiness would make epoll repeatedly wake for sockets that are normally writable, causing unnecessary busy work.
-
-## 4. Incremental RESP parsing
-
-The blocking v0.1 parser can wait for more bytes. A reactor cannot block the event-loop thread waiting for one client.
-
-`resp.ParseCommand` therefore has a tri-state result:
+Rehashing:
 
 ```text
-complete command  -> argv + consumed bytes
-valid prefix      -> complete=false, consumed=0
-malformed frame   -> protocol error
+              old/current                       target
+              ht[0]                             ht[1]
+       ┌────────────────┐                ┌────────────────────┐
+       │ bucket 0       │                │ bucket 0           │
+       │ bucket 1       │    migrate     │ bucket 1           │
+       │ ...            │ ─────────────► │ ...                │
+       └────────────────┘                └────────────────────┘
+                 ▲
+           rehashIndex
 ```
 
-The implementation deliberately reuses the existing RESP Reader semantics rather than inventing a second protocol grammar.
+Lookups search both. New keys go to `ht[1]`. Existing keys update the table that already owns them. That owner rule prevents duplicate logical keys during migration.
 
-## 5. Command execution ordering
+## 4. Entry-level incremental migration
 
-Within the reactor, commands execute serially on the event-loop goroutine.
-
-For one pipeline:
+Moving one whole bucket is not strongly bounded when a collision chain is long. v0.3 defines one work unit as:
 
 ```text
-SET n 1
-INCR n
-GET n
+non-empty source bucket -> move ONE head entry
+empty source bucket     -> advance rehashIndex once
 ```
 
-execution and response queueing are:
+Thus `RehashStep(N)` consumes at most `N` migration/scan units. A chain `A -> B -> C -> D` requires four entry-migration units. This makes the event-loop maintenance budget directly inspectable.
+
+## 5. Rehash scheduling
+
+Two mechanisms make progress.
+
+### Opportunistic
+
+`Dict.Get`, `Set` and `Delete` each attempt one work unit before the normal operation.
+
+### Time-event maintenance
+
+The existing maintenance point becomes:
 
 ```text
-SET  -> +OK
-INCR -> :2
-GET  -> $1 2
+maintenance timer
+   ├── ExpireDue(sample)
+   └── RehashStep(work budget)
 ```
 
-The output buffer preserves this order even if the kernel only accepts part of the bytes on the first write.
+The server depends only on optional `store.RehashStepper`; Store depends on Dict; Dict never imports server/runtime code.
 
-Across clients, readiness order is determined by epoll delivery; once one command begins executing it completes before the loop moves to another command.
+## 6. Grow / shrink policy
 
-## 6. Slow-client isolation and backpressure
-
-A slow reader should not stall the event loop.
-
-v0.2 never blocks waiting for that socket to become writable. Instead it retains the unsent suffix and continues serving other ready descriptors.
-
-But a client that never drains replies can create unbounded server memory. v0.2 therefore applies a per-client output-buffer ceiling:
+Reference policy:
 
 ```text
-queued bytes + next reply > limit
-             ↓
-         disconnect client
+grow:   used >= size
+         target = size * 2
+
+shrink: used / size < 10%
+         keep headroom
+         never below initial size
 ```
 
-This is intentionally simpler than production Redis' differentiated output-buffer policies.
+Mechanism and policy are separate: policy determines *when/what size*; rehash determines *how migration happens*.
 
-An input-buffer ceiling also prevents an indefinitely incomplete request from growing without bound.
+## 7. Iteration during migration
 
-## 7. Timer events
+A rehashing dictionary has live entries in two tables. `Range` visits both; its callback must not mutate that Dict. Memory paths that may delete expired keys first snapshot names with `Keys()` and mutate afterward.
 
-The reactor's `epoll_wait` timeout is chosen from the next server timer deadline.
+## 8. Keyspace and expiry metadata
 
-Current timer work:
-
-- active TTL expiration;
-- optional idle-client sweep.
-
-This teaches the relationship between file events and time events without requiring one timer per key or one goroutine per timer.
-
-## 8. Wakeup and shutdown
-
-A blocking `epoll_wait` must be interrupted when the parent context is cancelled.
-
-v0.2 registers the read side of a nonblocking pipe with epoll. Cancellation writes one byte to the pipe:
+The two conceptual dictionaries are preserved:
 
 ```text
-context cancelled
+keyspace Dict: key -> Object
+expires Dict:  key -> absolute deadline
+```
+
+A persistent key exists only in the first; a volatile key exists in both. They may resize independently.
+
+## 9. Object type and encoding
+
+The keyspace value is now:
+
+```text
+Object
+  Type
+  Encoding
+  payload
+```
+
+Current String representations:
+
+```text
+raw  -> string payload
+int  -> int64 payload
+```
+
+`NewString` uses `int` only for byte-for-byte canonical integer text. Therefore `"42"` may be encoded as int, while `"001"`, `"+1"` and `"-0"` remain raw. Commands use accessors rather than switching directly on Go payload types.
+
+This is the architectural bridge to v0.4, where one logical List/Hash/Set/ZSet can use multiple physical encodings.
+
+## 10. Atomicity and concurrency
+
+Memory still owns a mutex; Dict is deliberately not concurrency-safe. This keeps hashing/rehash separate from synchronization policy. Reactor commands remain serial as in v0.2, while the legacy goroutine engine safely shares the Store through the mutex.
+
+Because even `Get` may progress rehash or lazily expire a key, Memory uses its write lock for key access in v0.3.
+
+## 11. Persistence remains above representation
+
+AOF records logical commands, not buckets, object payload layout or `rehashIndex`.
+
+```text
+AOF SET key value
+      ↓ replay
+NewString(value)
       ↓
-wake pipe write
+current encoding
       ↓
-epoll returns readable event
-      ↓
-event loop observes cancellation
-      ↓
-close clients + listener + poller
+current Dict layout
 ```
 
-This is the only reactor-support goroutine; it does not process client commands.
+Restart may reconstruct a different physical layout while preserving logical state. Integration tests replay enough keys to cross multiple resizes and verify the restored state.
 
-## 9. Legacy engine as controlled baseline
+## 12. Reference demo
 
-The v0.1 mechanism remains available as `-network-engine=legacy`:
+```bash
+make rehash-demo
+```
+
+The example forces every key into one bucket and prints the state after each `RehashStep(1)`, making the bounded-work invariant visible.
+
+## 13. Next layer
+
+v0.4 uses the Object/Encoding boundary for collections:
 
 ```text
-legacy                              reactor
-──────                              ───────
-net.Listener                        raw nonblocking fd
-Accept                              epoll readiness
-blocking conn.Read                  read until EAGAIN
-goroutine/client                    one event loop
-immediate reply write               output queue + EPOLLOUT
-expiration goroutine                event-loop timer
+logical object
+      ↓
+encoding choice
+      ↓
+compact representation OR general representation
 ```
 
-Keeping both behind one command/storage stack makes the networking architecture the independent variable in benchmarks.
-
-## 10. Persistence boundary remains unchanged
-
-AOF is intentionally not redesigned in v0.2.
-
-Successful mutations are still appended before success is acknowledged. `appendfsync everysec` still uses its existing sync goroutine.
-
-That means disk I/O may still delay the command loop. This is documented rather than hidden because v0.2 isolates **network scheduling**, not every possible blocking source in Redis.
-
-## 11. Platform boundary
-
-The reactor uses Linux epoll. `auto` chooses reactor on Linux and legacy elsewhere. The non-Linux binary still compiles, and explicit reactor selection reports that epoll is unavailable.
-
-kqueue and IOCP are future optional portability work, not part of the v0.2 learning target.
-
-## 12. Next architecture replacement
-
-v0.3 leaves the reactor intact and replaces Go's hidden map implementation with an explicit educational dictionary capable of incremental rehash.
+Only after this boundary exists does it make sense to teach listpack/quicklist-like structures, integer sets, hash representation conversion and ZSet's dictionary + skip-list pairing.

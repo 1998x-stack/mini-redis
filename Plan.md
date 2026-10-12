@@ -4,383 +4,152 @@
 
 ## 1. Why this project exists
 
-Redis looks simple from the outside: TCP requests mutate an in-memory key/value database. The interesting architecture is everything that makes that model fast, durable, bounded and eventually distributed.
-
-mini-redis removes one layer of magic at a time so the code can answer:
-
-- what bytes does `redis-cli` send?
-- how are protocol and command semantics separated?
-- why does a command table exist?
-- how can many sockets share one event loop?
-- why do partial TCP reads/writes require client buffers?
-- how can a hash table grow without a long pause?
-- why does Redis separate logical type from physical encoding?
-- why are lazy and active expiration both needed?
-- what exactly does AOF persist and what does fsync change?
-- how do RDB and AOF make different durability/restart trade-offs?
-- how do LRU/LFU approximations bound eviction cost?
-- what state makes partial replication resynchronization possible?
-- what does Sentinel add beyond replication?
-- why does Cluster use hash slots and MOVED/ASK?
+mini-redis removes one Redis layer of “magic” at a time: protocol, scheduling, dictionary internals, object encodings, persistence, memory policy and distributed topology. The desired codebase should explain why each boundary exists rather than maximize command count.
 
 ## 2. Architectural reference model
 
 ```text
-                   Client / redis-cli
-                          │
-                          ▼
-                  TCP / event loop
-                          │
-                          ▼
-                     RESP protocol
-                          │
-                          ▼
-                   command registry
-                          │
-                          ▼
-                   command semantics
-                          │
-                          ▼
-                      Store API
-                 ┌────────┼────────┐
-                 ▼        ▼        ▼
-              Object     TTL      Dict
-                 └────────┼────────┘
-                          ▼
-                      memory state
-                          │
-             ┌────────────┴────────────┐
-             ▼                         ▼
-            AOF                       RDB
-        command log                snapshot
+Client / redis-cli
+      ↓
+TCP / event loop
+      ↓
+RESP
+      ↓
+command registry / semantics
+      ↓
+Store API
+ ┌────┼────┐
+ ▼    ▼    ▼
+Object TTL Dict
+      ↓
+memory state
+  ┌───┴───┐
+  ▼       ▼
+ AOF     RDB
 
-later:
-replication offsets/backlog
-          ↓
-   replica convergence
-       ┌──┴──┐
-       ▼     ▼
-  Sentinel  Cluster
+later: replication -> Sentinel / Cluster
 ```
 
-The roadmap follows dependency order, not command popularity.
-
-## 3. Repository/version model
+## 3. Repository / completion model
 
 ```text
-main ───────────────────────────────────────────────► newest validated
-  │
-  ├── v0.1  request → state → persistence
-  ├── v0.2  nonblocking I/O + epoll reactor
-  ├── v0.3  Dict + incremental rehash + object metadata
-  ├── v0.4  collections + encodings + skip list
+main ───────────────────────────────► newest validated
+  ├── v0.1 request/state/persistence
+  ├── v0.2 nonblocking I/O + epoll
+  ├── v0.3 Dict + rehash + object metadata
+  ├── v0.4 collections + encodings + skip list
   └── ...
 ```
 
-A version is complete only after:
-
-```text
-mechanism
-   ↓
-unit + invariant + error-path tests
-   ↓
-integration / smoke
-   ↓
-race/recovery validation where relevant
-   ↓
-documentation + version.md
-   ↓
-validated state synchronized to main
-```
+A version completes only after mechanism implementation, invariant/error/integration tests, race/recovery checks where applicable, docs/version update, and synchronization of the validated state into `main`.
 
 ## 4. Completed versions
 
-### v0.1 — Core request/state/persistence MVP
+### v0.1 — Request → state → persistence
 
-Primary question:
+Primary question: what happens between `SET key value` bytes and durable observable state?
 
-> What happens between `SET key value` bytes and durable observable state?
-
-Implemented:
-
-- RESP2 array-of-bulk request parser;
-- RESP response encoder;
-- table-driven command registry;
-- string Store abstraction and memory engine;
-- `PING`, `ECHO`, `SET`, `GET`, `DEL`, `EXISTS`, `INCR`, `INCRBY`, `EXPIRE`, `PEXPIREAT`, `TTL`, `KEYS`, `DBSIZE`, `FLUSHDB`;
-- lazy + active expiration;
-- RESP-formatted AOF;
-- `always` / `everysec` / `no` fsync policies;
-- restart replay;
-- relative TTL rewritten to absolute deadline for AOF;
-- goroutine-per-client networking baseline.
-
-Deliberate baseline choices:
-
-- Go map hides dictionary internals;
-- one goroutine/client hides reactor mechanics;
-- strings only;
-- no RDB/rewrite/eviction/distribution.
+Implemented RESP2 request/response paths, command registry, String Store, core String/key/TTL commands, lazy + active expiration, RESP AOF, fsync policies, replay and absolute expiry rewrite. Networking baseline was one goroutine/client; Go maps intentionally hid dictionary internals.
 
 ### v0.2 — Nonblocking networking + event loop
 
-Primary question:
+Primary question: why can one reactor serve many sockets without one blocking thread per connection?
 
-> Why can one reactor serve many sockets without one blocking thread per connection?
+Implemented Poller abstraction, Linux epoll, nonblocking listener/clients, one reactor, per-client buffers, incremental RESP parsing, pipeline ordering, partial writes, writable-interest control, buffer ceilings/backpressure, expiry/idle timers, wake-pipe shutdown, legacy comparison path and dual-engine tests/benchmark harness.
 
-Architecture:
+### v0.3 — Redis-like Dict, incremental rehash and object metadata
+
+Primary question: how can a hash table resize while the event loop keeps serving commands without one stop-the-world resize?
 
 ```text
-                nonblocking listener
-                        │
-                        ▼
-                       epoll
-                        │
-       ┌────────────────┼────────────────┐
-       ▼                ▼                ▼
-    client A         client B         client C
-    in / out         in / out         in / out
-    buffers          buffers          buffers
-       └────────────────┼────────────────┘
-                        ▼
-                    Event Loop
-          accept → read → parse → execute
-                         → queue reply
-                         → partial write
+Dict
+ ├── ht[0] source/current
+ ├── ht[1] target during rehash
+ └── rehashIndex
+
+lookup: ht[0] -> miss -> ht[1]
+maintenance: bounded RehashStep(N)
 ```
 
 Implemented:
 
-- `Poller` abstraction;
-- Linux epoll implementation;
-- nonblocking listener/accepted fds;
-- single reactor loop;
-- per-client input/output buffers;
-- incremental RESP parsing;
-- pipelining and ordered replies;
-- partial writes;
-- writable readiness only while output exists;
-- input/output buffer ceilings;
-- slow-client isolation;
-- event-loop TTL timer;
-- idle-client timer;
-- wake-pipe shutdown;
-- legacy engine retained as a controlled comparison baseline;
-- dual-engine smoke + benchmark harness.
+- generic explicit bucket tables with separate chaining;
+- hash-function boundary + deterministic FNV-1a reference hasher;
+- power-of-two capacities and visible grow/shrink policy;
+- two-table migration state;
+- entry-level bounded work: one unit moves at most one entry or skips one empty bucket;
+- correct lookup/update/delete while keys occupy either table;
+- no duplicate logical-key ownership across rehash tables;
+- explicit no-mutation-inside-`Range` policy;
+- opportunistic rehash plus timer-driven `RehashStepper` maintenance;
+- keyspace and expiry metadata both using the custom Dict;
+- logical Object type separated from physical encoding;
+- String `raw` and canonical `int` encodings;
+- `OBJECT ENCODING` inspection;
+- forced-collision rehash demo, randomized Go-map reference model and dictionary benchmarks;
+- AOF replay validation across multiple resizes.
 
-Critical invariants:
+Non-goals: no collection commands/compact encodings and no persistence redesign.
 
-- a partial frame from client A cannot block client B;
-- pipelined replies preserve command order;
-- slow writers do not block unrelated clients;
-- output growth is bounded per client;
-- command/Store/AOF semantics are unchanged across transports.
-
-Deliberate simplifications:
-
-- Linux epoll only;
-- level-triggered readiness;
-- synchronous AOF append remains on command path;
-- v0.1 mutex-protected Store remains unchanged;
-- no I/O thread pool/TLS/io_uring.
-
-## 5. v0.3 — Redis-like Dict, incremental rehash and object metadata
-
-Why next: after scheduling is explicit, Go's `map` is the largest hidden core mechanism.
-
-Primary question:
-
-> How can a hash table resize while the server keeps serving commands without one stop-the-world rehash?
-
-Target model:
-
-```text
-Dict
- ├── ht[0]  old/current table
- ├── ht[1]  target table while rehashing
- └── rehashIndex
-
-lookup during rehash:
-  search ht[0]
-      ↓ miss
-  search ht[1]
-
-per command/tick:
-  migrate bounded number of buckets
-```
-
-Required:
-
-- explicit buckets;
-- documented collision strategy;
-- hash-function boundary;
-- insert/find/delete;
-- load-factor tracking;
-- grow/shrink triggers;
-- two-table rehash state;
-- bounded rehash steps;
-- lookup/update/delete correctness while migrating;
-- explicit iterator policy;
-- event-loop timer/opportunistic rehash steps;
-- Redis-like object metadata separating logical type and encoding;
-- optional SDS-inspired string representation if it clarifies length/capacity/binary safety.
-
-Invariant tests must prove:
-
-- no key disappears during rehash;
-- one logical key never exists as conflicting duplicates in two tables;
-- updates find the correct owner;
-- deletes work in either table;
-- each rehash step has bounded work;
-- existing string command behavior remains unchanged.
-
-Non-goals:
-
-- no collection commands yet;
-- no compact collection encodings;
-- no persistence redesign.
-
-## 6. v0.4 — Core data types and internal encodings
+## 5. v0.4 — Core data types and internal encodings
 
 Primary question:
 
 > Why can one Redis logical type use multiple physical representations?
 
-Implement:
+Required logical types and educational command subset:
 
 - List: `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LLEN`, `LRANGE`;
 - Hash: `HSET`, `HGET`, `HDEL`, `HLEN`, `HGETALL`;
 - Set: `SADD`, `SREM`, `SISMEMBER`, `SMEMBERS`, `SCARD`;
-- ZSet: `ZADD`, `ZSCORE`, `ZRANK`, `ZRANGE`, `ZREM`;
-- `WRONGTYPE` semantics;
-- explicit type/encoding conversion thresholds;
-- same logical results before/after representation conversion;
-- ZSet educational model: member→score dict + ordered skip list.
+- ZSet: `ZADD`, `ZSCORE`, `ZRANK`, `ZRANGE`, `ZREM`.
 
-## 7. v0.5 — Persistence depth: RDB + AOF rewrite
+Required architecture:
 
-Primary question:
+- `WRONGTYPE` behavior before broad APIs;
+- stable logical Object API independent of encoding;
+- explicit representation thresholds and conversion tests;
+- List compact/reference representation progression;
+- Hash compact → Dict;
+- Set integer-set-like → Dict;
+- ZSet member→score Dict + ordered skip list;
+- identical logical answers before/after conversion.
 
-> How does an in-memory database trade write cost, restart speed and durability?
+## 6. v0.5 — Persistence depth: RDB + AOF rewrite
 
-Implement:
+Primary question: how does an in-memory database trade write cost, restart speed and durability?
 
-- deterministic educational RDB format;
-- type + absolute-expiry metadata;
-- checksum/corruption detection;
-- blocking snapshot reference path;
-- atomic temp-file replacement;
-- AOF rewrite from current logical state;
-- mutations captured during rewrite;
-- atomic AOF replacement;
-- startup precedence and corruption policy;
-- fork/COW as an isolated experiment/documented production concept after correctness is clear.
+Implement deterministic educational RDB with type + absolute expiry metadata, corruption detection, blocking snapshot reference path, atomic temp-file replacement, AOF rewrite from logical state, mutation capture during rewrite, atomic replacement, startup precedence and corruption policy. Fork/COW comes only as an isolated experiment/concept after correctness.
 
-## 8. v0.6 — Expiration, maxmemory and eviction
+## 7. v0.6 — Expiration, maxmemory and eviction
 
-Primary questions:
+Implement time-budgeted active expiry, approximate memory accounting, `maxmemory`, no-eviction/random policies and sampled LRU/LFU approximations. Keep expiration (time-invalid state) conceptually distinct from eviction (valid state removed under memory policy).
 
-- why not scan all TTL keys continuously?
-- what differs between expiration and eviction?
-- how can LRU/LFU be approximated cheaply?
+## 8. v0.7 — Transactions + Pub/Sub
 
-Implement:
+Implement `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH`, queued uninterrupted execution and optimistic key versioning; then `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH` and subscribed-client/output-buffer behavior. Redis transactions are not SQL rollback transactions.
 
-- time-budgeted adaptive active-expire cycle;
-- approximate memory accounting;
-- `maxmemory`;
-- no-eviction;
-- random policies;
-- sampled LRU approximation;
-- sampled LFU approximation;
-- metrics showing approximation/cost.
+## 9. v0.8 — Replication + partial resynchronization
 
-## 9. v0.7 — Transactions + Pub/Sub
+Implement primary/replica roles, initial full sync, replication offset, backlog ring buffer, command propagation, reconnect/partial resync when backlog covers the gap, fallback full sync otherwise, and convergence tests.
 
-Transactions:
+## 10. v0.9 — Sentinel-inspired high availability
 
-- `MULTI`, `EXEC`, `DISCARD`;
-- `WATCH`, `UNWATCH`;
-- queued execution;
-- optimistic key versioning.
+Implement educational health monitoring, subjective/objective failure, quorum, election decision, replica promotion, topology reconfiguration and explicit split-brain limitations.
 
-Learning target: Redis transactions execute an uninterrupted queued batch; they are not SQL rollback transactions.
+## 11. v0.10 — Cluster / hash slots
 
-Pub/Sub:
+Implement 16384 slots, deterministic key→slot mapping, ownership, `MOVED`, migration/importing state, `ASK`, basic topology gossip and resharding experiment.
 
-- `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH`;
-- subscribed-client state;
-- output-buffer/backpressure interaction.
+## 12. v0.11 — RESP3
 
-## 10. v0.8 — Replication + partial resynchronization
+Add richer scalar/container types, push messages where useful, protocol negotiation and compatibility tests only after server/data/distributed concepts are stable.
 
-Primary question:
+## 13. v0.12 — Observability and performance engineering
 
-> What state lets a replica catch up without receiving the whole dataset again?
+Add command latency, connection/event-loop counters, expiration/eviction metrics, persistence timing, replication lag/offset metrics, CPU/memory profiling examples and repeatable benchmark methodology. A performance result matters only when the mechanism causing it is explained.
 
-Implement:
-
-- primary/replica roles;
-- full initial synchronization;
-- replication offset;
-- backlog ring buffer;
-- command propagation;
-- reconnect + partial resync when backlog still covers the gap;
-- fallback to full sync otherwise;
-- convergence tests.
-
-## 11. v0.9 — Sentinel-inspired high availability
-
-Implement educational versions of:
-
-- health monitoring;
-- subjective vs objective failure;
-- quorum;
-- leader/election decision;
-- replica promotion;
-- topology reconfiguration;
-- split-brain limitations documented explicitly.
-
-## 12. v0.10 — Cluster / hash slots
-
-Implement:
-
-- 16384-slot model;
-- deterministic key→slot mapping;
-- slot ownership;
-- `MOVED`;
-- migration/importing state;
-- `ASK` semantics;
-- basic node gossip/topology exchange;
-- resharding experiment.
-
-## 13. v0.11 — RESP3 and richer client semantics
-
-Add RESP3 only after server/runtime/data/distributed concepts are stable:
-
-- richer scalar/container types;
-- push-style messages where useful;
-- protocol negotiation;
-- compatibility tests.
-
-## 14. v0.12 — Observability and performance engineering
-
-Add:
-
-- command latency stats;
-- connection/event-loop counters;
-- expiration/eviction metrics;
-- AOF/RDB timing;
-- replication lag/offset metrics;
-- CPU/memory profiling examples;
-- repeatable benchmark methodology;
-- explicit comparison against prior reference implementations.
-
-Performance is a learning result only when the mechanism causing the change is explained.
-
-## 15. Version sequencing invariant
-
-The intended dependency chain is:
+## 14. Sequencing invariant
 
 ```text
 request semantics
@@ -389,13 +158,13 @@ event-loop scheduling
    ↓
 dictionary internals
    ↓
-objects/collections/encodings
+objects / collections / encodings
    ↓
 persistence depth
    ↓
 memory policy
    ↓
-transactions/client fan-out
+transactions / fan-out
    ↓
 replication
    ↓
@@ -403,15 +172,15 @@ failover
    ↓
 sharding
    ↓
-protocol/observability refinement
+protocol / observability refinement
 ```
 
-Do not skip ahead simply because a later feature is more visible. The learning value comes from being able to explain why each later subsystem needs the earlier one.
+Do not skip forward because a later feature is more visible; the learning value is the dependency chain.
 
-## 16. Current directive
+## 15. Current directive
 
-Current integrated version: **v0.2**.
+Current integrated version after validation: **v0.3**.
 
-Next active version should be **v0.3** and must be created from latest validated `main`.
+Next active version: **v0.4**, created from latest validated `main`.
 
-Do not begin v0.4 collection encodings until v0.3 can demonstrate correct bounded incremental rehash under the existing event loop.
+v0.4 must build collection types on the logical type / physical encoding boundary introduced in v0.3. Do not skip directly to persistence/distribution before representation conversion and `WRONGTYPE` semantics are explicit.

@@ -2,48 +2,81 @@
 
 A compact, architecture-driven Redis learning implementation in Go.
 
-**Current version: v0.2.0 — nonblocking I/O + epoll event loop**
+**Current version: v0.3.0 — Redis-like Dict + bounded incremental rehash + Object encoding**
 
-The project is not trying to clone every Redis command. Each version removes one important layer of “magic” while preserving the layers already understood.
+The project does not try to clone every Redis command. Each version removes one important layer of “magic” while preserving the layers already understood.
 
 ```text
 v0.1
 TCP -> RESP -> Command Registry -> Store -> TTL -> AOF
 
 v0.2
-                    epoll
-                      │
-       ┌──────────────┼──────────────┐
-       ▼              ▼              ▼
-    client A       client B       client C
-    in / out       in / out       in / out
-    buffers        buffers        buffers
-       └──────────────┼──────────────┘
-                      ▼
-                  Event Loop
-            read → parse → execute
-                 → queue reply
-                 → partial write
-                      │
-                      ▼
-              same command/store/AOF
+many sockets -> epoll -> one nonblocking event loop -> client buffers
+
+v0.3
+Store
+  ├── data Dict[Object]
+  │      ├── ht[0]
+  │      ├── ht[1]
+  │      └── rehashIndex
+  └── expires Dict[time.Time]
+
+Object = logical type + physical encoding + payload
 ```
 
-## What v0.2 teaches
+## What v0.3 teaches
 
-- why socket readiness is different from blocking I/O;
-- how epoll separates “which fd is ready?” from “what should the server do?”;
-- why TCP requires per-client input buffers;
-- how a partial RESP frame can wait without blocking other clients;
-- how Redis-style pipelining can parse multiple commands from one read;
-- why nonblocking writes require an output queue;
-- why `EPOLLOUT` should only be watched when output is pending;
-- how slow readers create server-side memory pressure;
-- how output-buffer limits implement simple backpressure;
-- how time events such as expiration fit into the same event loop;
-- how v0.1 goroutine-per-client differs from a single reactor.
+- what a hash table contains after `map` stops being a black box;
+- how separate chaining resolves collisions;
+- why load factor triggers growth/shrink policy;
+- why Redis-like resizing can keep two hash tables alive at once;
+- how lookup/update/delete remain correct while keys are split across `ht[0]` and `ht[1]`;
+- how bounded rehash work avoids one large stop-the-world resize;
+- how normal operations and event-loop timer work both advance rehash;
+- why iteration during migration needs an explicit mutation policy;
+- why Redis separates logical Object type from physical encoding;
+- why persistence records logical state rather than transient bucket layout.
 
-The v0.1 request/state/persistence path remains intact underneath the new networking layer.
+The v0.2 reactor and v0.1 RESP/command/TTL/AOF stack remain intact underneath the new memory engine.
+
+## Core dictionary mental model
+
+```text
+stable:
+ht[0] = current
+ht[1] = empty
+rehashIndex = -1
+
+resize:
+              source                         target
+               ht[0]                          ht[1]
+        ┌────────────────┐              ┌────────────────────┐
+        │ bucket chains  │  incremental │ bucket chains      │
+        │                │ ────────────► │                    │
+        └────────────────┘              └────────────────────┘
+               ▲
+          rehashIndex
+```
+
+During migration: lookup searches both tables, update modifies the owner, new keys enter `ht[1]`, and delete searches both. One `RehashStep(1)` moves **at most one entry**, or advances over one empty bucket, so a long collision chain is not moved wholesale.
+
+## Object type vs encoding
+
+```text
+SET a 42
+OBJECT ENCODING a
+"int"
+GET a
+"42"
+
+SET b 001
+OBJECT ENCODING b
+"raw"
+GET b
+"001"
+```
+
+The logical value is stable even when physical representation differs.
 
 ## Supported commands
 
@@ -51,18 +84,17 @@ The v0.1 request/state/persistence path remains intact underneath the new networ
 |---|---|---|
 | PING | `PING` | optional one-message echo |
 | ECHO | `ECHO hello` | bulk-string response |
-| SET | `SET k v`, `SET k v EX 10`, `SET k v PX 500` | strings only |
+| SET | `SET k v`, `SET k v EX 10`, `SET k v PX 500` | String only |
 | GET | `GET k` | null bulk when missing |
 | DEL | `DEL a b` | multi-key |
-| EXISTS | `EXISTS a b` | counts each existing argument |
-| INCR | `INCR n` | int64 integer strings |
-| INCRBY | `INCRBY n 5` | preserves TTL |
-| EXPIRE | `EXPIRE k 10` | seconds |
-| PEXPIREAT | `PEXPIREAT k 1770000000000` | absolute unix ms; used by AOF |
+| EXISTS | `EXISTS a b` | counts existing arguments |
+| INCR / INCRBY | `INCR n`, `INCRBY n 5` | int64 semantics, TTL preserved |
+| EXPIRE / PEXPIREAT | `EXPIRE k 10` | relative/absolute expiry |
 | TTL | `TTL k` | `-2` missing, `-1` persistent |
 | KEYS | `KEYS user:*` | full scan; educational only |
 | DBSIZE | `DBSIZE` | live keys |
 | FLUSHDB | `FLUSHDB` | one logical DB |
+| OBJECT | `OBJECT ENCODING k` | inspect `raw` / `int` |
 
 ## Quick start
 
@@ -73,49 +105,30 @@ make all
 ./bin/mini-redis-server
 ```
 
-On Linux, the default `auto` network engine chooses the v0.2 reactor.
-
-```bash
-./bin/mini-redis-server \
-  -network-engine=reactor \
-  -addr 127.0.0.1:6379
-```
-
-Then:
+On Linux, `auto` selects the epoll reactor introduced in v0.2.
 
 ```bash
 redis-cli -p 6379
-127.0.0.1:6379> SET name redis
+127.0.0.1:6379> SET answer 42
 OK
-127.0.0.1:6379> GET name
-"redis"
-127.0.0.1:6379> INCR visits
-(integer) 1
+127.0.0.1:6379> OBJECT ENCODING answer
+"int"
 ```
 
-### Compare v0.1 and v0.2 networking directly
-
-The old mechanism is intentionally retained as a reference engine:
+## Watch rehash happen
 
 ```bash
-./bin/mini-redis-server -network-engine=legacy
-./bin/mini-redis-server -network-engine=reactor
+make rehash-demo
 ```
 
-Both use the same RESP, command, Store, TTL and AOF layers. The independent variable is the networking/execution model.
-
-## Pipelining
-
-v0.2 can receive multiple RESP commands in one TCP read and queues responses in command order.
-
-Conceptually:
+The demo deliberately hashes every key into the same bucket and prints stats after each `RehashStep(1)`:
 
 ```text
-SET n 1 | INCR n | GET n
-    ↓        ↓        ↓
-  +OK       :2      $1 2
-    └────────┴────────┘
-       one output queue
+start: old=4 new=1
+step1: old=3 new=2
+step2: old=2 new=3
+step3: old=1 new=4
+step4: old=0 -> target becomes current
 ```
 
 ## Server flags
@@ -130,116 +143,80 @@ SET n 1 | INCR n | GET n
 -appendfsync everysec             # always | everysec | no
 -active-expire-every 100ms
 -active-expire-sample 64
+-rehash-work-per-cycle 64         # 0 disables timer-driven work
 -idle-timeout 0s
 -version false
 ```
 
-On non-Linux systems `auto` selects the portable legacy engine. The reactor implementation is deliberately Linux/epoll-specific in v0.2. Docker is an easy way to run the reactor from macOS or Windows.
+Dictionary commands also make opportunistic rehash progress, so disabling timer work does not freeze a resize under active traffic.
 
 ## Repository map
 
 ```text
 cmd/mini-redis-server/       process entrypoint
-internal/netpoll/            Poller contract + Linux epoll implementation
-internal/resp/               blocking + incremental RESP2 parsing/encoding
-internal/server/             reactor, legacy baseline, lifecycle
-internal/command/            command specs, registry, handlers
-internal/store/              stable storage contract
+examples/rehash/             forced-collision demo
+internal/netpoll/            Poller + Linux epoll
+internal/resp/               RESP2 parsing/encoding
+internal/server/             reactor, legacy baseline, timers/lifecycle
+internal/command/            command specs/handlers
+internal/dict/               buckets, chains, ht[0]/ht[1], incremental rehash
+internal/store/              Store contract + Object type/encoding
 internal/store/versionedmemory/
-                             current in-memory engine
-internal/aof/                append-only log and replay
-internal/config/             runtime policy/flags
-Agents.md                    mandatory engineering contract
+                             Dict-backed keyspace + expiry engine
+internal/aof/                logical command log + replay
+Agents.md                    engineering contract
 Plan.md                      canonical architecture roadmap
-version.md                   current version delta/learning boundary
-docs/ARCHITECTURE.md         v0.2 mechanism explanation
-scripts/smoke.sh             end-to-end RESP smoke test
-scripts/compare-engines.sh   legacy vs reactor benchmark harness
+version.md                   current version boundary
 ```
 
-## Read the code in this order
-
-For the v0.2 learning path:
+## Read v0.3 in this order
 
 ```text
-1. internal/netpoll/poller.go
-2. internal/netpoll/poller_linux.go
-3. internal/resp/incremental.go
-4. internal/server/reactor_linux.go
-5. internal/server/server.go
-6. internal/server/legacy.go
-7. internal/config/config.go
+1. internal/dict/dict.go
+2. internal/dict/dict_test.go
+3. internal/store/store.go
+4. internal/store/versionedmemory/memory.go
+5. internal/command/core.go
+6. internal/server/server.go
+7. internal/server/reactor_linux.go
 ```
 
-Then compare `internal/server` against the frozen `v0.1` branch.
-
-For the underlying v0.1 Redis semantics, read:
-
-```text
-resp -> command -> store -> aof
-```
-
-## Tests
+Then compare snapshots:
 
 ```bash
-make test
-make vet
-make smoke
+git diff v0.2..v0.3 -- internal/dict internal/store
 ```
 
-Concurrency validation:
+## Validation / exploration
 
 ```bash
+go vet ./...
+go test ./...
 go test -race ./...
+NETWORK_ENGINE=reactor make smoke
+NETWORK_ENGINE=legacy PORT=16380 make smoke
+make rehash-demo
+make benchmark-dict       # optional, machine-dependent
 ```
 
-Important reactor tests prove:
+AOF still stores logical RESP commands, not physical Dict layout. Relative TTL is still rewritten to an absolute `PEXPIREAT` deadline, so restarts do not extend expiry.
 
-- partial-frame client isolation;
-- pipeline reply ordering;
-- output-buffer backpressure;
-- protocol-error close behavior;
-- epoll registration/readiness lifecycle.
-
-## Benchmark both networking models
-
-```bash
-make benchmark
-```
-
-The harness compares the two engines from the same build so command/storage behavior is held constant. Numbers depend heavily on OS/kernel/CPU and should be interpreted as a learning experiment, not a Redis performance claim.
-
-## Docker
-
-```bash
-docker build -t mini-redis:v0.2.0 .
-docker run --rm -p 6379:6379 mini-redis:v0.2.0
-```
-
-Docker runs Linux, so `auto` selects the reactor.
-
-## Development model
-
-Before changing architecture or version scope, read `Agents.md` and `Plan.md`.
+## Version sequence
 
 ```text
-main = newest validated integrated state
-v0.x = frozen educational snapshots
+v0.1  RESP / command / Store / TTL / AOF
+  ↓
+v0.2  epoll / reactor / partial I/O / pipeline / backpressure
+  ↓
+v0.3  Dict / collisions / incremental rehash / Object encoding   <- current
+  ↓
+v0.4  List / Hash / Set / ZSet / encoding conversion / skip list
+  ↓
+v0.5  RDB / AOF rewrite
+  ↓
+v0.6  maxmemory / eviction / approximate LRU/LFU
+  ↓
+v0.7+ transactions / PubSub / replication / Sentinel / Cluster
 ```
 
-The next planned version is **v0.3: custom Redis-like Dict + incremental rehash + object encoding metadata**.
-
-## Important differences from production Redis
-
-v0.2 is educational. It does not claim production Redis compatibility or performance. Notable simplifications include:
-
-- Linux epoll only for the reactor;
-- level-triggered readiness;
-- simple fixed client buffer limits;
-- Go map storage;
-- mutex-protected Store retained from v0.1;
-- synchronous AOF append on the command path;
-- strings only;
-- no RDB, eviction, transactions, replication, Sentinel or Cluster.
-
-See [`version.md`](version.md), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`Plan.md`](Plan.md).
+mini-redis remains educational: v0.3 intentionally does not copy Redis' exact hash function/resize heuristics, production iterator semantics, object header/refcount/LRU metadata, compact collection encodings, allocator behavior, RDB/AOF rewrite, eviction or distributed features.
