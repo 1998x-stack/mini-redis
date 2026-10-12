@@ -32,7 +32,7 @@ func (s *Server) serveLegacy(ctx context.Context) error {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				s.store.ExpireDue(s.cfg.ActiveExpireSample)
+				s.runMaintenance()
 			}
 		}
 	}()

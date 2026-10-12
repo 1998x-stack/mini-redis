@@ -28,6 +28,7 @@ type Config struct {
 	AppendFsync             aof.FsyncPolicy
 	ActiveExpireEvery       time.Duration
 	ActiveExpireSample      int
+	RehashWorkPerCycle      int
 	IdleTimeout             time.Duration
 }
 
@@ -42,6 +43,7 @@ func Default() Config {
 		AppendFsync:             aof.FsyncEverySec,
 		ActiveExpireEvery:       100 * time.Millisecond,
 		ActiveExpireSample:      64,
+		RehashWorkPerCycle:      64,
 		IdleTimeout:             0,
 	}
 }
@@ -71,6 +73,7 @@ func ParseFlags() (Config, error) {
 	flag.StringVar(&fsync, "appendfsync", fsync, "AOF fsync policy: always|everysec|no")
 	flag.DurationVar(&cfg.ActiveExpireEvery, "active-expire-every", cfg.ActiveExpireEvery, "active expiration cycle interval")
 	flag.IntVar(&cfg.ActiveExpireSample, "active-expire-sample", cfg.ActiveExpireSample, "max TTL entries checked per cycle; <=0 full scan")
+	flag.IntVar(&cfg.RehashWorkPerCycle, "rehash-work-per-cycle", cfg.RehashWorkPerCycle, "bounded dictionary rehash work units per maintenance cycle; 0 disables timer-driven work")
 	flag.DurationVar(&cfg.IdleTimeout, "idle-timeout", cfg.IdleTimeout, "connection idle timeout; 0 disables")
 	flag.Parse()
 
@@ -95,6 +98,9 @@ func ParseFlags() (Config, error) {
 	}
 	if cfg.ActiveExpireEvery <= 0 {
 		return Config{}, fmt.Errorf("active-expire-every must be positive")
+	}
+	if cfg.RehashWorkPerCycle < 0 {
+		return Config{}, fmt.Errorf("rehash-work-per-cycle must be non-negative")
 	}
 	return cfg, nil
 }

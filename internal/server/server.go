@@ -125,6 +125,16 @@ func (s *Server) executeCommand(argv []string) resp.Value {
 	return result.Reply
 }
 
+func (s *Server) runMaintenance() {
+	s.store.ExpireDue(s.cfg.ActiveExpireSample)
+	if s.cfg.RehashWorkPerCycle <= 0 {
+		return
+	}
+	if stepper, ok := s.store.(store.RehashStepper); ok {
+		stepper.RehashStep(s.cfg.RehashWorkPerCycle)
+	}
+}
+
 func (s *Server) setAddr(addr net.Addr) {
 	s.stateMu.Lock()
 	s.addr = addr

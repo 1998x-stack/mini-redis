@@ -72,6 +72,9 @@ func (s *Server) serveReactor(ctx context.Context) error {
 		}
 	}()
 
+	// Context cancellation must wake EpollWait. A single wake goroutine replaces
+	// the v0.1 one-goroutine-per-client execution model; it never executes
+	// commands or touches client state.
 	go func() {
 		<-ctx.Done()
 		_, _ = syscall.Write(wakeWrite, []byte{1})
@@ -91,6 +94,7 @@ func (s *Server) serveReactor(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return nil
 		}
+
 		timeout := untilNextTimer(time.Now(), nextExpire, nextIdleSweep)
 		events, err := poller.Wait(timeout)
 		if err != nil {
@@ -102,7 +106,7 @@ func (s *Server) serveReactor(ctx context.Context) error {
 
 		now = time.Now()
 		if !now.Before(nextExpire) {
-			s.store.ExpireDue(s.cfg.ActiveExpireSample)
+			s.runMaintenance()
 			nextExpire = now.Add(s.cfg.ActiveExpireEvery)
 		}
 		if !nextIdleSweep.IsZero() && !now.Before(nextIdleSweep) {
@@ -131,6 +135,7 @@ func (s *Server) serveReactor(ctx context.Context) error {
 			if client == nil {
 				continue
 			}
+
 			if event.Readable {
 				peerClosed, err := s.readReady(client)
 				if err != nil {
@@ -141,6 +146,7 @@ func (s *Server) serveReactor(ctx context.Context) error {
 					client.closeAfterWrite = true
 				}
 			}
+
 			if clients[event.FD] == nil {
 				continue
 			}
@@ -151,6 +157,7 @@ func (s *Server) serveReactor(ctx context.Context) error {
 					continue
 				}
 			}
+
 			if clients[event.FD] == nil {
 				continue
 			}
@@ -161,6 +168,7 @@ func (s *Server) serveReactor(ctx context.Context) error {
 			if event.Closed {
 				client.closeAfterWrite = true
 			}
+
 			if client.closeAfterWrite && len(client.output) == 0 {
 				s.closeReactorClient(poller, clients, client.fd)
 				continue
@@ -184,6 +192,7 @@ func (s *Server) acceptReady(poller netpoll.Poller, listenerFD int, clients map[
 		if err != nil {
 			return fmt.Errorf("accept: %w", err)
 		}
+
 		_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
 		client := &reactorClient{fd: fd, lastActive: now}
 		if err := poller.Add(fd, netpoll.Read); err != nil {
@@ -211,6 +220,7 @@ func (s *Server) readReady(client *reactorClient) (bool, error) {
 				return false, nil
 			}
 		}
+
 		if err == nil {
 			if n == 0 {
 				return true, nil
@@ -245,11 +255,13 @@ func (s *Server) processClientInput(client *reactorClient) error {
 		if !complete {
 			return nil
 		}
+
 		if consumed == len(client.input) {
 			client.input = nil
 		} else {
 			client.input = client.input[consumed:]
 		}
+
 		payload, err := resp.EncodeValue(s.executeCommand(argv))
 		if err != nil {
 			return err
@@ -321,6 +333,7 @@ func openNonblockingTCPListener(addr string) (int, net.Addr, error) {
 	if err != nil {
 		return -1, nil, err
 	}
+
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM|syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC, syscall.IPPROTO_TCP)
 	if err != nil {
 		return -1, nil, err
@@ -331,9 +344,11 @@ func openNonblockingTCPListener(addr string) (int, net.Addr, error) {
 			_ = syscall.Close(fd)
 		}
 	}()
+
 	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
 		return -1, nil, err
 	}
+
 	var bindAddr [4]byte
 	if resolved.IP != nil && !resolved.IP.IsUnspecified() {
 		ip4 := resolved.IP.To4()
@@ -348,6 +363,7 @@ func openNonblockingTCPListener(addr string) (int, net.Addr, error) {
 	if err := syscall.Listen(fd, 512); err != nil {
 		return -1, nil, err
 	}
+
 	sa, err := syscall.Getsockname(fd)
 	if err != nil {
 		return -1, nil, err
