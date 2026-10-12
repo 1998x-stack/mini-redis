@@ -26,6 +26,7 @@ func RegisterCore(r *Registry) {
 		{Name: "KEYS", Arity: 2, Handler: keys, Summary: "glob-style key scan (teaching only)"},
 		{Name: "DBSIZE", Arity: 1, Handler: dbsize, Summary: "number of live keys"},
 		{Name: "FLUSHDB", Arity: 1, Mutating: true, Handler: flushdb, Summary: "remove all keys"},
+		{Name: "OBJECT", Arity: -2, Handler: objectInfo, Summary: "inspect object encoding"},
 		{Name: "COMMAND", Arity: -1, Handler: commandInfo, Summary: "minimal compatibility response"},
 	}
 	for _, spec := range specs {
@@ -88,7 +89,11 @@ func get(ctx *Context, args []string) resp.Value {
 	if obj.Type != store.ObjectString {
 		return resp.Error("WRONGTYPE operation against a key holding the wrong kind of value")
 	}
-	return resp.BulkString(obj.Str)
+	value, ok := obj.StringValue()
+	if !ok {
+		return resp.Error("ERR invalid string object encoding")
+	}
+	return resp.BulkString(value)
 }
 
 func del(ctx *Context, args []string) resp.Value {
@@ -213,6 +218,17 @@ func dbsize(ctx *Context, _ []string) resp.Value { return resp.Integer(int64(ctx
 func flushdb(ctx *Context, _ []string) resp.Value {
 	ctx.Store.Flush()
 	return resp.SimpleString("OK")
+}
+
+func objectInfo(ctx *Context, args []string) resp.Value {
+	if len(args) != 2 || !strings.EqualFold(args[0], "ENCODING") {
+		return resp.Error("ERR syntax error")
+	}
+	obj, ok := ctx.Store.Get(args[1])
+	if !ok {
+		return resp.NullBulkString()
+	}
+	return resp.BulkString(obj.Encoding.String())
 }
 
 func commandInfo(_ *Context, _ []string) resp.Value {
