@@ -8,18 +8,28 @@ import (
 	"sync"
 	"time"
 
+	"github.com/1998x-stack/mini-redis/internal/dict"
 	"github.com/1998x-stack/mini-redis/internal/store"
 )
 
-// Memory is the v0.1 in-memory engine.
+// Memory is the v0.3 in-memory engine.
 //
-// data and expires intentionally use separate maps, matching Redis' core idea:
-// only keys with TTLs pay expiration metadata overhead.
+// data and expires remain separate dictionaries, preserving Redis' core idea
+// that only keys with TTLs pay expiration-metadata overhead. Unlike v0.1/v0.2,
+// the dictionaries are explicit educational hash tables with incremental
+// rehash rather than Go maps.
 type Memory struct {
 	mu      sync.RWMutex
-	data    map[string]store.Object
-	expires map[string]time.Time
+	data    *dict.Dict[store.Object]
+	expires *dict.Dict[time.Time]
 	clock   store.Clock
+}
+
+// DictStats is an inspectable snapshot for tests/teaching. It is intentionally
+// not part of the command-facing store.Store contract.
+type DictStats struct {
+	Data    dict.Stats
+	Expires dict.Stats
 }
 
 func New(clock store.Clock) *Memory {
@@ -27,14 +37,14 @@ func New(clock store.Clock) *Memory {
 		clock = store.RealClock{}
 	}
 	return &Memory{
-		data:    make(map[string]store.Object),
-		expires: make(map[string]time.Time),
+		data:    dict.New[store.Object](dict.FNV1a),
+		expires: dict.New[time.Time](dict.FNV1a),
 		clock:   clock,
 	}
 }
 
 func (m *Memory) expiredLocked(key string, now time.Time) bool {
-	deadline, ok := m.expires[key]
+	deadline, ok := m.expires.Get(key)
 	return ok && !deadline.After(now)
 }
 
@@ -42,33 +52,33 @@ func (m *Memory) deleteIfExpiredLocked(key string, now time.Time) bool {
 	if !m.expiredLocked(key, now) {
 		return false
 	}
-	delete(m.data, key)
-	delete(m.expires, key)
+	m.data.Delete(key)
+	m.expires.Delete(key)
 	return true
 }
 
 func (m *Memory) Get(key string) (store.Object, bool) {
-	// We need a write lock because a read can lazily delete an expired key.
+	// A read may lazily delete an expired key and dictionary lookups may advance
+	// incremental rehash, so v0.3 intentionally takes the write lock here.
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if m.deleteIfExpiredLocked(key, m.clock.Now()) {
 		return store.Object{}, false
 	}
-	v, ok := m.data[key]
-	return v, ok
+	return m.data.Get(key)
 }
 
 func (m *Memory) Set(key string, value store.Object, ttl *time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.data[key] = value
+	m.data.Set(key, value)
 	if ttl == nil {
-		delete(m.expires, key)
+		m.expires.Delete(key)
 		return
 	}
-	m.expires[key] = m.clock.Now().Add(*ttl)
+	m.expires.Set(key, m.clock.Now().Add(*ttl))
 }
 
 func (m *Memory) Delete(keys ...string) int {
@@ -79,11 +89,10 @@ func (m *Memory) Delete(keys ...string) int {
 	deleted := 0
 	for _, key := range keys {
 		m.deleteIfExpiredLocked(key, now)
-		if _, ok := m.data[key]; !ok {
+		if !m.data.Delete(key) {
 			continue
 		}
-		delete(m.data, key)
-		delete(m.expires, key)
+		m.expires.Delete(key)
 		deleted++
 	}
 	return deleted
@@ -96,8 +105,10 @@ func (m *Memory) Exists(keys ...string) int {
 	now := m.clock.Now()
 	count := 0
 	for _, key := range keys {
-		m.deleteIfExpiredLocked(key, now)
-		if _, ok := m.data[key]; ok {
+		if m.deleteIfExpiredLocked(key, now) {
+			continue
+		}
+		if _, ok := m.data.Get(key); ok {
 			count++
 		}
 	}
@@ -112,15 +123,23 @@ func (m *Memory) IncrBy(key string, delta int64) (int64, error) {
 	m.deleteIfExpiredLocked(key, now)
 
 	current := int64(0)
-	if obj, ok := m.data[key]; ok {
+	if obj, ok := m.data.Get(key); ok {
 		if obj.Type != store.ObjectString {
 			return 0, store.ErrNotInteger
 		}
-		n, err := strconv.ParseInt(obj.Str, 10, 64)
-		if err != nil {
-			return 0, store.ErrNotInteger
+		if n, encoded := obj.Int64(); encoded {
+			current = n
+		} else {
+			text, ok := obj.StringValue()
+			if !ok {
+				return 0, store.ErrNotInteger
+			}
+			n, err := strconv.ParseInt(text, 10, 64)
+			if err != nil {
+				return 0, store.ErrNotInteger
+			}
+			current = n
 		}
-		current = n
 	}
 
 	// Overflow-safe addition, equivalent to rejecting values outside int64.
@@ -130,7 +149,7 @@ func (m *Memory) IncrBy(key string, delta int64) (int64, error) {
 	}
 
 	next := current + delta
-	m.data[key] = store.NewString(strconv.FormatInt(next, 10))
+	m.data.Set(key, store.NewString(strconv.FormatInt(next, 10)))
 	// Redis INCR preserves an existing TTL, so expires is intentionally untouched.
 	return next, nil
 }
@@ -147,15 +166,15 @@ func (m *Memory) ExpireAt(key string, deadline time.Time) bool {
 	if m.deleteIfExpiredLocked(key, now) {
 		return false
 	}
-	if _, ok := m.data[key]; !ok {
+	if _, ok := m.data.Get(key); !ok {
 		return false
 	}
 	if !deadline.After(now) {
-		delete(m.data, key)
-		delete(m.expires, key)
+		m.data.Delete(key)
+		m.expires.Delete(key)
 		return true
 	}
-	m.expires[key] = deadline
+	m.expires.Set(key, deadline)
 	return true
 }
 
@@ -167,10 +186,10 @@ func (m *Memory) TTL(key string) store.TTLResult {
 	if m.deleteIfExpiredLocked(key, now) {
 		return store.TTLResult{}
 	}
-	if _, ok := m.data[key]; !ok {
+	if _, ok := m.data.Get(key); !ok {
 		return store.TTLResult{}
 	}
-	deadline, ok := m.expires[key]
+	deadline, ok := m.expires.Get(key)
 	if !ok {
 		return store.TTLResult{Exists: true}
 	}
@@ -185,9 +204,12 @@ func (m *Memory) Keys(pattern string) ([]string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// Iteration policy forbids mutation from a Dict.Range callback, so take a
+	// small snapshot of key names first, then perform lazy expiration/matching.
+	candidates := m.data.Keys(0)
 	now := m.clock.Now()
-	out := make([]string, 0, len(m.data))
-	for key := range m.data {
+	out := make([]string, 0, len(candidates))
+	for _, key := range candidates {
 		if m.deleteIfExpiredLocked(key, now) {
 			continue
 		}
@@ -206,22 +228,20 @@ func (m *Memory) Keys(pattern string) ([]string, error) {
 func (m *Memory) Flush() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.data = make(map[string]store.Object)
-	m.expires = make(map[string]time.Time)
+	m.data = dict.New[store.Object](dict.FNV1a)
+	m.expires = dict.New[time.Time](dict.FNV1a)
 }
 
 func (m *Memory) ExpireDue(limit int) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// Snapshot at most limit expiry keys. Dictionary order is intentionally not
+	// stable; active expiry only promises bounded sampling in this version.
+	keys := m.expires.Keys(limit)
 	now := m.clock.Now()
 	removed := 0
-	visited := 0
-	for key := range m.expires {
-		if limit > 0 && visited >= limit {
-			break
-		}
-		visited++
+	for _, key := range keys {
 		if m.deleteIfExpiredLocked(key, now) {
 			removed++
 		}
@@ -234,8 +254,31 @@ func (m *Memory) Len() int {
 	defer m.mu.Unlock()
 
 	now := m.clock.Now()
-	for key := range m.expires {
+	for _, key := range m.expires.Keys(0) {
 		m.deleteIfExpiredLocked(key, now)
 	}
-	return len(m.data)
+	return m.data.Len()
+}
+
+// RehashStep lets the server timer advance dictionary work even when command
+// traffic is low. The supplied budget is split between the keyspace and expiry
+// dictionaries so one cannot permanently starve the other.
+func (m *Memory) RehashStep(workUnits int) int {
+	if workUnits <= 0 {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	dataBudget := (workUnits + 1) / 2
+	expireBudget := workUnits / 2
+	used := m.data.RehashStep(dataBudget)
+	used += m.expires.RehashStep(expireBudget)
+	return used
+}
+
+func (m *Memory) Stats() DictStats {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return DictStats{Data: m.data.Stats(), Expires: m.expires.Stats()}
 }
