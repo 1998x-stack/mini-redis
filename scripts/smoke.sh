@@ -16,6 +16,10 @@ if command -v redis-cli >/dev/null 2>&1; then
   redis-cli -p "$PORT" SET hello world >/dev/null
   test "$(redis-cli -p "$PORT" --raw GET hello)" = "world"
   test "$(redis-cli -p "$PORT" INCR counter)" = "1"
+  redis-cli -p "$PORT" SET encoded 42 >/dev/null
+  test "$(redis-cli -p "$PORT" --raw OBJECT ENCODING encoded)" = "int"
+  redis-cli -p "$PORT" SET padded 001 >/dev/null
+  test "$(redis-cli -p "$PORT" --raw OBJECT ENCODING padded)" = "raw"
   redis-cli -p "$PORT" SET temp yes EX 1 >/dev/null
   echo "smoke test passed with redis-cli (engine=$NETWORK_ENGINE)"
 else
@@ -36,6 +40,10 @@ assert command("PING") == b"+PONG\r\n"
 assert command("SET", "hello", "world") == b"+OK\r\n"
 assert command("GET", "hello") == b"$5\r\nworld\r\n"
 assert command("INCR", "counter") == b":1\r\n"
+assert command("SET", "encoded", "42") == b"+OK\r\n"
+assert command("OBJECT", "ENCODING", "encoded") == b"$3\r\nint\r\n"
+assert command("SET", "padded", "001") == b"+OK\r\n"
+assert command("OBJECT", "ENCODING", "padded") == b"$3\r\nraw\r\n"
 print("smoke test passed with Python RESP client")
 PY
 fi

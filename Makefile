@@ -1,7 +1,7 @@
 APP := mini-redis-server
 PKG := ./...
 
-.PHONY: all build test fmt vet run clean smoke benchmark
+.PHONY: all build test fmt vet run clean smoke benchmark benchmark-dict rehash-demo
 
 all: fmt vet test build
 
@@ -26,6 +26,12 @@ smoke: build
 
 benchmark: build
 	bash ./scripts/compare-engines.sh
+
+benchmark-dict:
+	go test -run '^$$' -bench 'Benchmark(Dict|GoMap)' ./internal/dict
+
+rehash-demo:
+	go run ./examples/rehash
 
 clean:
 	rm -rf bin coverage.out *.aof
