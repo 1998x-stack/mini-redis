@@ -2,11 +2,12 @@
 set -euo pipefail
 
 PORT="${PORT:-16379}"
+NETWORK_ENGINE="${NETWORK_ENGINE:-auto}"
 AOF="${AOF:-/tmp/mini-redis-smoke-${PORT}.aof}"
 LOG="${LOG:-/tmp/mini-redis-smoke-${PORT}.log}"
 rm -f "$AOF" "$LOG"
 
-./bin/mini-redis-server -addr "127.0.0.1:${PORT}" -appendfilename "$AOF" >"$LOG" 2>&1 &
+./bin/mini-redis-server -addr "127.0.0.1:${PORT}" -network-engine "$NETWORK_ENGINE" -appendfilename "$AOF" >"$LOG" 2>&1 &
 PID=$!
 trap 'kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true; rm -f "$AOF"' EXIT
 sleep 0.2
@@ -16,7 +17,7 @@ if command -v redis-cli >/dev/null 2>&1; then
   test "$(redis-cli -p "$PORT" --raw GET hello)" = "world"
   test "$(redis-cli -p "$PORT" INCR counter)" = "1"
   redis-cli -p "$PORT" SET temp yes EX 1 >/dev/null
-  echo "smoke test passed with redis-cli"
+  echo "smoke test passed with redis-cli (engine=$NETWORK_ENGINE)"
 else
   python3 - "$PORT" <<'PY'
 import socket, sys

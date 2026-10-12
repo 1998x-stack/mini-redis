@@ -1,7 +1,7 @@
 APP := mini-redis-server
 PKG := ./...
 
-.PHONY: all build test fmt vet run clean smoke
+.PHONY: all build test fmt vet run clean smoke benchmark
 
 all: fmt vet test build
 
@@ -23,6 +23,9 @@ run:
 
 smoke: build
 	bash ./scripts/smoke.sh
+
+benchmark: build
+	bash ./scripts/compare-engines.sh
 
 clean:
 	rm -rf bin coverage.out *.aof
