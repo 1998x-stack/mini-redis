@@ -2,6 +2,7 @@ package resp
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"strconv"
@@ -60,6 +61,16 @@ func writeValue(w io.Writer, v Value) error {
 
 func sanitizeLine(s string) string {
 	return strings.ReplaceAll(strings.ReplaceAll(s, "\r", " "), "\n", " ")
+}
+
+// EncodeValue serializes a RESP value into an owned byte slice. Event-loop
+// clients use this to queue replies before a socket becomes writable.
+func EncodeValue(v Value) ([]byte, error) {
+	var b bytes.Buffer
+	if err := writeValue(&b, v); err != nil {
+		return nil, err
+	}
+	return b.Bytes(), nil
 }
 
 // EncodeCommand serializes a command as RESP2. AOF uses exactly this format,
