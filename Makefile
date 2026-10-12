@@ -22,7 +22,7 @@ run:
 	go run ./cmd/mini-redis-server -addr 127.0.0.1:6379
 
 smoke: build
-	./scripts/smoke.sh
+	bash ./scripts/smoke.sh
 
 clean:
 	rm -rf bin coverage.out *.aof
