@@ -1,215 +1,103 @@
-# mini-redis v0.1 — Core Request/State/Persistence MVP
+# mini-redis v0.2 — Nonblocking I/O and Event Loop
 
 ## 1. Identity
 
-- Integrated branch: `main`
-- Historical learning snapshot: `v0.1`
-- Version label: `v0.1.0`
-- Previous version: none — repository bootstrap
+- Integrated branch after validation: `main`
+- Historical learning snapshot: `v0.2`
+- Version label: `v0.2.0`
+- Previous snapshot: `v0.1`
 - Status: implemented and validated
-
-This is the first coherent mini-redis learning milestone. The `v0.1` branch is intended to remain a historical snapshot once created from this validated state.
-
----
 
 ## 2. Version theme
 
-**Make one Redis command visible from network bytes to memory mutation to persistent replay.**
+**Replace one blocking execution context per client with one readiness-driven reactor while preserving Redis command semantics.**
 
-The core trace is:
+v0.1 answered: what happens from RESP bytes to state mutation and AOF?
+
+v0.2 asks: how can one thread own many sockets without one blocked client stopping everybody else?
 
 ```text
-redis-cli
-   ↓ TCP
-RESP2 bytes
-   ↓
-RESP Reader
-   ↓
-argv []string
-   ↓
-Command Registry
-   ↓
-Command Handler
-   ↓
-Store
-   ├── value
-   └── expiry deadline
-   ↓
-AOF command log
-   ↓
-RESP reply
+                 nonblocking listen fd
+                         │
+                         ▼
+                    epoll Poller
+                         │
+        ┌────────────────┼────────────────┐
+        ▼                ▼                ▼
+     client A         client B         client C
+  input/output     input/output     input/output
+     buffers          buffers          buffers
+        └────────────────┼────────────────┘
+                         ▼
+                     Event Loop
+          read → parse → execute → queue reply
+                         → write when ready
+                         │
+                         ▼
+               timer hook / expiration
 ```
 
----
+## 3. What changed relative to v0.1, and why?
 
-## 3. What changed relative to the previous version, and why?
+v0.1 used blocking sockets and one goroutine per client. v0.2 keeps RESP semantics, command registry, Store, TTL and AOF unchanged but replaces transport/runtime ownership with nonblocking fds, epoll readiness, per-client buffers and one reactor command loop.
 
-There is no previous version. v0.1 establishes the stable conceptual boundaries that later versions will evolve independently:
-
-1. protocol parsing is separate from command semantics;
-2. command dispatch is table-driven;
-3. handlers depend on a `store.Store` contract rather than a concrete map;
-4. expiration metadata is separate from values;
-5. persistence reuses RESP command representation;
-6. server transport is isolated so v0.2 can replace goroutine-per-client networking with an event loop without rewriting command/storage semantics.
-
-The goal is not feature quantity. The goal is a complete and readable vertical slice.
-
----
+This controlled replacement makes networking architecture the independent variable.
 
 ## 4. Mechanisms added
 
-### RESP2
+- `internal/netpoll` Poller abstraction;
+- Linux epoll implementation;
+- nonblocking listener and accepted clients;
+- per-client input/output buffers;
+- incremental `resp.ParseCommand`;
+- pipelined command parsing;
+- ordered response queueing;
+- partial write handling;
+- writable readiness only while output exists;
+- configurable input/output buffer limits;
+- event-loop active-expiration timer;
+- idle-client timer cleanup;
+- wake-pipe cancellation;
+- explicit `legacy` reference engine.
 
-- request arrays of bulk strings;
-- response simple strings;
-- errors;
-- integers;
-- bulk strings;
-- null bulk response;
-- command encoding reused by AOF.
+Linux `auto` selects reactor; non-Linux `auto` selects legacy so the binary stays runnable while the reactor remains explicitly epoll-based.
 
-### Command registry
+## 5. Critical invariants proved by tests
 
-Each command owns metadata:
+- every truncated prefix of a valid command remains incomplete and consumes zero logical bytes;
+- one partial client frame does not block another client's `PING`;
+- pipeline replies preserve command order;
+- a client exceeding the output buffer limit is disconnected without harming another client;
+- malformed protocol produces an error then closes that connection;
+- epoll add/readiness/delete lifecycle works;
+- legacy transport still produces the same command-level behavior.
 
-- canonical name;
-- arity rule;
-- mutating/non-mutating flag;
-- handler;
-- optional AOF rewrite behavior;
-- summary.
+## 6. Atomicity/concurrency model
 
-### Supported commands
+Reactor command handlers execute serially on the event-loop goroutine. The v0.1 mutex-protected Store remains intentionally unchanged so this version isolates transport scheduling.
 
-- `PING`
-- `ECHO`
-- `SET` with optional `EX` / `PX`
-- `GET`
-- `DEL`
-- `EXISTS`
-- `INCR`
-- `INCRBY`
-- `EXPIRE`
-- `PEXPIREAT`
-- `TTL`
-- `KEYS`
-- `DBSIZE`
-- `FLUSHDB`
-
-### Storage
-
-- `store.Store` interface;
-- `ObjectType` / `Object` boundary;
-- string objects;
-- in-memory implementation;
-- mutex-protected operations;
-- integer increment with overflow/error handling.
-
-### Expiration
-
-- separate expiry metadata;
-- lazy expiration on access;
-- periodic active expiration;
-- TTL tri-state: missing / persistent / expiring.
-
-### AOF
-
-- RESP-formatted mutation log;
-- replay using normal command execution;
-- append batches;
-- `always`, `everysec`, `no` fsync modes;
-- truncated-tail tolerance;
-- relative TTL persistence rewritten to absolute deadline commands.
-
-### Server
-
-- TCP listener;
-- one goroutine per client;
-- request loop;
-- optional idle timeout;
-- active-expiry goroutine;
-- graceful shutdown.
-
----
-
-## 5. Important persistence invariant
-
-Persisting this literally is wrong across downtime:
-
-```text
-SET session abc EX 10
-```
-
-If replayed five seconds later with another relative 10-second TTL, the key lives too long.
-
-v0.1 therefore rewrites relative expiry into an absolute deadline for AOF, conceptually:
-
-```text
-SET session abc
-PEXPIREAT session <absolute-unix-ms>
-```
-
-The learning point is broader than Redis: persistence must record enough information to preserve **semantics across time**, not merely re-run superficially similar API calls.
-
----
-
-## 6. Mechanisms intentionally unchanged / hidden
-
-v0.1 deliberately uses:
-
-- Go `map` instead of a Redis-like custom dictionary;
-- one goroutine per TCP connection instead of epoll/kqueue;
-- a mutex-protected store instead of classic single-thread command execution;
-- strings only;
-- simple expiry sampling;
-- direct AOF growth without rewrite;
-- one logical database.
-
-These are baselines, not forgotten work.
-
----
+AOF `everysec` still has its fsync goroutine and AOF append remains synchronous before success acknowledgement. v0.2 therefore does not claim every process activity occurs on one OS thread.
 
 ## 7. Important source files
 
-Read in this order:
-
 ```text
-internal/resp/reader.go
-internal/resp/writer.go
+internal/netpoll/poller.go
+internal/netpoll/poller_linux.go
         ↓
-internal/command/registry.go
-internal/command/core.go
+internal/resp/incremental.go
         ↓
-internal/store/store.go
-internal/store/versionedmemory/memory.go
-        ↓
-internal/aof/aof.go
+internal/server/reactor_linux.go
         ↓
 internal/server/server.go
         ↓
-cmd/mini-redis-server/main.go
+internal/server/legacy.go
+        ↓
+internal/config/config.go
 ```
 
-Supporting docs:
+## 8. Validation
 
-- `Agents.md` — engineering contract;
-- `Plan.md` — canonical future roadmap;
-- `docs/ARCHITECTURE.md` — current implementation reasoning.
-
----
-
-## 8. Tests and validation
-
-Subsystem tests cover:
-
-- RESP parsing/encoding;
-- command execution;
-- store and expiration behavior;
-- AOF append/replay;
-- server request path.
-
-Validated baseline commands:
+Validated with:
 
 ```bash
 gofmt -d .
@@ -217,79 +105,40 @@ go vet ./...
 go test ./...
 go test -race ./...
 go build ./cmd/mini-redis-server
-```
-
-When `redis-cli` is available:
-
-```bash
 make smoke
+NETWORK_ENGINE=legacy PORT=16380 make smoke
 ```
 
----
+Additional checks covered real TCP pipelining, AOF restart/replay through the reactor, and Darwin/Windows cross-compilation.
 
-## 9. Learning goals
+## 9. Benchmark path
 
-After reading and running v0.1, a learner should be able to explain:
-
-1. how RESP2 converts bytes into a command vector;
-2. why command dispatch benefits from metadata and registration;
-3. why storage should be behind an interface before richer object types exist;
-4. why expiration needs both lazy and active cleanup;
-5. what atomic `INCR` means in this implementation;
-6. why an in-memory server still needs durability policy;
-7. the difference between `write` and `fsync`;
-8. why AOF can reconstruct state by replaying commands;
-9. why relative TTL persistence needs special handling;
-10. exactly which part v0.2 will replace to teach Redis' event loop.
-
----
+`make benchmark` compares legacy vs reactor from the same build for idle-connection RSS, pipelined PING throughput and slow-client isolation. Results are environment dependent and are not universal Redis performance claims.
 
 ## 10. Non-goals
 
-- production deployment;
-- full Redis compatibility;
-- event-loop networking;
-- custom hash table / incremental rehash;
-- List/Hash/Set/ZSet;
-- compact encodings;
-- eviction;
-- RDB;
-- AOF rewrite;
-- transactions;
-- Pub/Sub;
-- replication;
-- Sentinel;
-- Cluster;
-- RESP3.
+- no I/O thread pool;
+- no io_uring/TLS;
+- no kqueue/IOCP reactor;
+- no custom dictionary or incremental rehash;
+- no List/Hash/Set/ZSet;
+- no RDB/AOF rewrite;
+- no eviction;
+- no transactions/PubSub;
+- no replication/Sentinel/Cluster.
 
----
+## 11. Next version
 
-## 11. Remaining work in this version
-
-No planned feature work. Only fixes that preserve v0.1's learning scope should land on the frozen `v0.1` branch.
-
-`main` may evolve into v0.2 according to `Plan.md`.
-
----
-
-## 12. Next-version direction
-
-v0.2 replaces the networking model while preserving command/storage semantics:
+v0.3 replaces hidden Go-map behavior with a Redis-like dictionary:
 
 ```text
-v0.1
-blocking connection goroutines
-        ↓
-        ↓ replace transport/runtime only
-        ↓
-v0.2
-nonblocking sockets
-+ epoll Poller
-+ per-client buffers
-+ partial reads/writes
-+ pipelining
-+ backpressure
-+ event-loop timers
+Go map
+   ↓
+Dict: ht[0] + ht[1] + rehash index
+   ↓
+bounded incremental bucket migration
+   ↓
+object type / physical encoding metadata
 ```
 
-The point of v0.2 is not “more throughput” by itself. The point is to make the Redis reactor mental model explicit and measurable.
+Primary question: how can a hash table grow while the event loop keeps serving commands without one large stop-the-world resize?

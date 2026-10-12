@@ -1,912 +1,417 @@
 # mini-redis — Architecture-Driven Development Plan
 
-> This document is the canonical development plan for `main`.
->
-> **Repository rule:** `main` must always represent the newest integrated, validated state. Historical version branches (`v0.x`) are educational snapshots. Active development may occur on a version branch, but validated desired behavior must be synchronized into `main` so the integration branch never intentionally lags.
+> Canonical roadmap for `main`. `main` must always be the newest integrated, validated state; `v0.x` branches are frozen educational snapshots.
 
----
+## 1. Why this project exists
 
-# 1. Why this project exists
+Redis looks simple from the outside: TCP requests mutate an in-memory key/value database. The interesting architecture is everything that makes that model fast, durable, bounded and eventually distributed.
 
-Redis can look deceptively simple: a TCP server backed by an in-memory key/value map. Its educational value comes from everything required to make that idea fast, durable, predictable and distributed.
+mini-redis removes one layer of magic at a time so the code can answer:
 
-mini-redis exists to remove one layer of that “magic” at a time.
-
-The project should eventually make these questions answerable from code:
-
-- what bytes does `redis-cli` actually send?
-- how are protocol parsing and command semantics separated?
-- why does a command table exist instead of a giant switch statement?
-- how can expiry work without one timer per key?
+- what bytes does `redis-cli` send?
+- how are protocol and command semantics separated?
+- why does a command table exist?
+- how can many sockets share one event loop?
+- why do partial TCP reads/writes require client buffers?
+- how can a hash table grow without a long pause?
+- why does Redis separate logical type from physical encoding?
 - why are lazy and active expiration both needed?
-- what does `INCR` atomicity really depend on?
-- why can Redis handle many connections with an event loop?
-- how does a hash table keep serving lookups while it grows?
-- why does Redis separate logical type from internal encoding?
-- why is a sorted set naturally represented by both a hash table and a skip list?
-- what exactly does AOF persist, and what does `fsync` change?
-- how can RDB snapshotting coexist with writes?
-- how do approximate LRU/LFU eviction policies trade accuracy for cost?
-- what state is needed for partial replication resynchronization?
-- what problem does Sentinel solve that replication alone does not?
-- why does Redis Cluster use hash slots and MOVED/ASK redirects?
+- what exactly does AOF persist and what does fsync change?
+- how do RDB and AOF make different durability/restart trade-offs?
+- how do LRU/LFU approximations bound eviction cost?
+- what state makes partial replication resynchronization possible?
+- what does Sentinel add beyond replication?
+- why does Cluster use hash slots and MOVED/ASK?
 
-The desired end state is a compact educational system whose subsystems can be mapped to Redis concepts without inheriting production Redis' full implementation complexity.
-
----
-
-# 2. Architectural reference model
-
-The roadmap follows dependency order rather than feature popularity.
+## 2. Architectural reference model
 
 ```text
-                  Client / redis-cli
-                         │
-                         ▼
-                TCP connection lifecycle
-                         │
-                         ▼
-                    RESP protocol
-                         │
-                         ▼
-                  Command registry
-              metadata / arity / flags
-                         │
-                         ▼
-                  Command semantics
-                         │
-                         ▼
-                     Store API
-                         │
-             ┌───────────┼───────────┐
-             ▼           ▼           ▼
-           Object       TTL         Dict
-       type/encoding  deadlines   key lookup
-             │                       │
-             └───────────┬───────────┘
-                         ▼
-                    memory state
-                         │
-        successful mutation / snapshot point
-                         │
-             ┌───────────┴───────────┐
-             ▼                       ▼
-            AOF                     RDB
-       command history          state snapshot
+                   Client / redis-cli
+                          │
+                          ▼
+                  TCP / event loop
+                          │
+                          ▼
+                     RESP protocol
+                          │
+                          ▼
+                   command registry
+                          │
+                          ▼
+                   command semantics
+                          │
+                          ▼
+                      Store API
+                 ┌────────┼────────┐
+                 ▼        ▼        ▼
+              Object     TTL      Dict
+                 └────────┼────────┘
+                          ▼
+                      memory state
+                          │
+             ┌────────────┴────────────┐
+             ▼                         ▼
+            AOF                       RDB
+        command log                snapshot
 
-Later distributed layers:
-
-   replication offsets/backlog
-              │
-              ▼
-       replica convergence
-              │
-        ┌─────┴─────┐
-        ▼           ▼
-     Sentinel     Cluster
-     failover    sharding/slots
+later:
+replication offsets/backlog
+          ↓
+   replica convergence
+       ┌──┴──┐
+       ▼     ▼
+  Sentinel  Cluster
 ```
 
-The architecture deliberately makes boundaries visible before replacing them with faster implementations.
+The roadmap follows dependency order, not command popularity.
 
----
-
-# 3. Repository and version model
-
-## 3.1 `main`
-
-`main` is the newest integrated, validated state.
-
-Required invariants:
-
-1. `main` never intentionally trails a validated active version branch;
-2. `main/Plan.md` is the canonical future roadmap;
-3. `main/Agents.md` is the canonical engineering contract;
-4. version branches are learning snapshots, not independent long-lived products;
-5. later mechanisms do not leak backward into frozen historical branches.
-
-## 3.2 Version branches
+## 3. Repository/version model
 
 ```text
-main  ─────────────────────────────────────────────────► newest integrated state
+main ───────────────────────────────────────────────► newest validated
   │
-  ├──── v0.1   request → state → persistence MVP
-  │
-  ├────────── v0.2   nonblocking I/O + event loop
-  │
-  ├──────────────── v0.3   Dict + incremental rehash + object metadata
-  │
-  ├────────────────────── v0.4   collections + encodings + skip list
-  │
-  └──────────────────────────── ...
+  ├── v0.1  request → state → persistence
+  ├── v0.2  nonblocking I/O + epoll reactor
+  ├── v0.3  Dict + incremental rehash + object metadata
+  ├── v0.4  collections + encodings + skip list
+  └── ...
 ```
-
-Each version should introduce one dominant mental model and contain `version.md` explaining its delta.
-
-## 3.3 Completion rule
 
 A version is complete only after:
 
 ```text
-mechanism implemented
-       ↓
-unit + invariant tests
-       ↓
-error-path tests
-       ↓
-integration / redis-cli demonstration
-       ↓
-race / recovery validation where relevant
-       ↓
-documentation
-       ↓
-version.md updated
-       ↓
-Agents.md constraints satisfied
-       ↓
-validated state represented on main
+mechanism
+   ↓
+unit + invariant + error-path tests
+   ↓
+integration / smoke
+   ↓
+race/recovery validation where relevant
+   ↓
+documentation + version.md
+   ↓
+validated state synchronized to main
 ```
 
----
+## 4. Completed versions
 
-# 4. Current integrated version
+### v0.1 — Core request/state/persistence MVP
 
-# v0.1 — Core request, state, expiry and AOF loop
+Primary question:
 
-## Primary question
+> What happens between `SET key value` bytes and durable observable state?
 
-**What happens between `redis-cli SET key value` and durable observable state?**
+Implemented:
 
-## Mental model
+- RESP2 array-of-bulk request parser;
+- RESP response encoder;
+- table-driven command registry;
+- string Store abstraction and memory engine;
+- `PING`, `ECHO`, `SET`, `GET`, `DEL`, `EXISTS`, `INCR`, `INCRBY`, `EXPIRE`, `PEXPIREAT`, `TTL`, `KEYS`, `DBSIZE`, `FLUSHDB`;
+- lazy + active expiration;
+- RESP-formatted AOF;
+- `always` / `everysec` / `no` fsync policies;
+- restart replay;
+- relative TTL rewritten to absolute deadline for AOF;
+- goroutine-per-client networking baseline.
+
+Deliberate baseline choices:
+
+- Go map hides dictionary internals;
+- one goroutine/client hides reactor mechanics;
+- strings only;
+- no RDB/rewrite/eviction/distribution.
+
+### v0.2 — Nonblocking networking + event loop
+
+Primary question:
+
+> Why can one reactor serve many sockets without one blocking thread per connection?
+
+Architecture:
 
 ```text
-TCP bytes
-   ↓
-RESP2 parser
-   ↓
-[]string argv
-   ↓
-command.Registry
-   ↓
-handler
-   ↓
-store.Store
-   ├── data
-   └── expiry metadata
-   ↓
-successful mutation
-   ↓
-AOF append / fsync policy
-   ↓
-RESP reply
+                nonblocking listener
+                        │
+                        ▼
+                       epoll
+                        │
+       ┌────────────────┼────────────────┐
+       ▼                ▼                ▼
+    client A         client B         client C
+    in / out         in / out         in / out
+    buffers          buffers          buffers
+       └────────────────┼────────────────┘
+                        ▼
+                    Event Loop
+          accept → read → parse → execute
+                         → queue reply
+                         → partial write
 ```
 
-## Implemented mechanisms
+Implemented:
 
-### Protocol
+- `Poller` abstraction;
+- Linux epoll implementation;
+- nonblocking listener/accepted fds;
+- single reactor loop;
+- per-client input/output buffers;
+- incremental RESP parsing;
+- pipelining and ordered replies;
+- partial writes;
+- writable readiness only while output exists;
+- input/output buffer ceilings;
+- slow-client isolation;
+- event-loop TTL timer;
+- idle-client timer;
+- wake-pipe shutdown;
+- legacy engine retained as a controlled comparison baseline;
+- dual-engine smoke + benchmark harness.
 
-- RESP2 array-of-bulk-string request parser
-- simple string, error, integer, bulk string and null responses
-- reusable RESP command encoder for AOF
+Critical invariants:
 
-### Command registry
-
-- name -> command metadata
-- arity validation
-- mutating-command metadata
-- handler dispatch
-- AOF rewrite hook
-
-### Commands
-
-- `PING`, `ECHO`
-- `SET`, `GET`
-- `DEL`, `EXISTS`
-- `INCR`, `INCRBY`
-- `EXPIRE`, `PEXPIREAT`, `TTL`
-- `KEYS`, `DBSIZE`, `FLUSHDB`
-
-### Storage
-
-- stable `store.Store` interface
-- object type marker with v0.1 string support
-- mutex-protected in-memory implementation
-- atomic `IncrBy` at store-operation boundary
-
-### Expiration
-
-- expiration dictionary/metadata separate from values
-- lazy expiration on access
-- periodic active expiration
-- configurable sampling limit
-
-### Persistence
-
-- RESP-formatted AOF
-- replay through normal protocol/command execution path
-- `always`, `everysec`, `no` fsync policies
-- crash-tail tolerance for a truncated final command
-- relative TTL rewritten to absolute `PEXPIREAT` semantics so restart does not extend expiry
-
-### Server/runtime
-
-- TCP server
-- one goroutine per connection
-- graceful close
-- idle timeout option
-- active-expiration background cycle
-
-## Why v0.1 intentionally uses Go's map and goroutines
-
-The first version exposes semantic boundaries before recreating Redis internals. If v0.1 simultaneously implemented epoll, custom hash tables, compact encodings and persistence, each mechanism would hide the others.
-
-The simplifications are deliberate baselines for later architectural diffs.
-
-## v0.1 explicit non-goals
-
-- no epoll/kqueue reactor;
-- no custom Redis dictionary;
-- no List/Hash/Set/ZSet;
-- no object encodings;
-- no RDB;
-- no AOF rewrite;
-- no eviction;
-- no transactions;
-- no Pub/Sub;
-- no replication/Sentinel/Cluster;
-- no claim of production Redis compatibility.
-
----
-
-# 5. Planned core versions
-
-# v0.2 — Nonblocking networking and event loop
-
-## Why v0.2 follows v0.1
-
-v0.1 has correct enough request semantics, so the transport can now be replaced without changing the command/store mental model. This makes the event-loop architecture visible as a controlled before/after experiment.
-
-## Primary question
-
-**Why can Redis serve many concurrent sockets without one blocking thread per connection?**
-
-## Target architecture
-
-```text
-                  listening socket
-                        │
-                        ▼
-                   Poller (epoll)
-                        │
-       ┌────────────────┼─────────────────┐
-       ▼                ▼                 ▼
-   client A          client B          client C
- input/output       input/output       input/output
-   buffers            buffers            buffers
-       │                │                 │
-       └────────────────┼─────────────────┘
-                        ▼
-                    Event loop
-              read → parse → execute
-                  → queue reply
-                        │
-                        ▼
-              writable readiness
-```
-
-## Required implementation
-
-### v0.2.1 Poller boundary
-
-- `Poller` abstraction
-- Linux epoll implementation
-- readable/writable/error readiness
-- fd/client registration lifecycle
-
-### v0.2.2 Nonblocking clients
-
-- nonblocking listener/client sockets
-- per-client input buffer
-- per-client output buffer
-- partial request handling
-- pipelined commands
-- partial writes
-- writable-event registration only when output exists
-
-### v0.2.3 Event loop
-
-- deterministic event-loop ownership
-- accept/read/write phases
-- timer hook for active expiration
-- graceful shutdown
-- client cleanup on protocol/network errors
-
-### v0.2.4 Backpressure
-
-- configurable output-buffer limit
-- slow-client behavior
-- no unbounded output accumulation
-
-### v0.2.5 Comparative benchmark
-
-Compare v0.1 goroutine-per-client vs v0.2 reactor for:
-
-- idle connection count;
-- memory footprint;
-- simple GET/SET throughput;
-- slow-client isolation.
-
-## Critical invariants
-
-- one partial client frame cannot corrupt another client's parser state;
-- a slow writer cannot block unrelated clients;
+- a partial frame from client A cannot block client B;
 - pipelined replies preserve command order;
-- transport refactor does not change command semantics.
+- slow writers do not block unrelated clients;
+- output growth is bounded per client;
+- command/Store/AOF semantics are unchanged across transports.
 
-## Non-goals
+Deliberate simplifications:
 
-- no I/O thread pool yet;
-- no TLS;
-- no custom allocator;
-- no collection data types.
+- Linux epoll only;
+- level-triggered readiness;
+- synchronous AOF append remains on command path;
+- v0.1 mutex-protected Store remains unchanged;
+- no I/O thread pool/TLS/io_uring.
 
----
+## 5. v0.3 — Redis-like Dict, incremental rehash and object metadata
 
-# v0.3 — Redis-like dictionary, incremental rehash and object metadata
+Why next: after scheduling is explicit, Go's `map` is the largest hidden core mechanism.
 
-## Why v0.3 follows v0.2
+Primary question:
 
-Once connection scheduling is explicit, the next hidden “magic” is the in-memory dictionary itself. Go's map currently hides hashing, collisions, resizing and rehash cost.
+> How can a hash table resize while the server keeps serving commands without one stop-the-world rehash?
 
-## Primary question
-
-**How can a hash table resize without pausing the server for one giant rehash?**
-
-## Target dictionary model
+Target model:
 
 ```text
-Dictionary
-   │
-   ├── ht[0]  current table
-   └── ht[1]  target table during resize
-
-rehash_idx = -1         no rehash
-rehash_idx >= 0         migrate a few buckets per operation/tick
+Dict
+ ├── ht[0]  old/current table
+ ├── ht[1]  target table while rehashing
+ └── rehashIndex
 
 lookup during rehash:
-   search ht[0]
+  search ht[0]
       ↓ miss
-   search ht[1]
+  search ht[1]
+
+per command/tick:
+  migrate bounded number of buckets
 ```
-
-## Required implementation
-
-### v0.3.1 Dictionary
-
-- explicit buckets
-- collision chains or another documented educational strategy
-- hash function boundary
-- insert/find/delete
-- load factor tracking
-- grow/shrink trigger
-
-### v0.3.2 Incremental rehash
-
-- two-table state
-- bounded bucket migration per operation
-- background/timer rehash step
-- lookup/delete correctness while migrating
-- iterator policy documented explicitly
-
-### v0.3.3 String representation
-
-Introduce an SDS-inspired educational dynamic string abstraction if it clarifies:
-
-- length vs capacity;
-- binary-safe storage;
-- append growth;
-- avoiding repeated `strlen`-style work.
-
-Do not copy Redis SDS source.
-
-### v0.3.4 Redis object metadata
-
-Evolve `store.Object` into a clear logical-type / physical-encoding model:
-
-```text
-Object
-  type      = string/list/hash/set/zset
-  encoding  = raw/int/...
-  payload   = encoding-specific data
-```
-
-Initially only string encodings need to work.
-
-## Critical invariants
-
-- no key disappears during rehash;
-- updates do not create duplicate logical keys across both tables;
-- delete works regardless of which table owns the key;
-- rehash work per command remains bounded;
-- external String command behavior remains stable.
-
----
-
-# v0.4 — Core Redis data types and internal encodings
-
-## Why v0.4 follows the dictionary/object model
-
-Collections should be implemented after logical type and physical encoding are separate concepts. Otherwise command handlers become coupled to one representation and later compact encodings require rewrites.
-
-## Primary question
-
-**Why can one Redis logical type use multiple internal representations?**
-
-## Required logical types
-
-### List
-
-Commands:
-
-- `LPUSH`, `RPUSH`
-- `LPOP`, `RPOP`
-- `LLEN`
-- `LRANGE`
-
-Educational representation progression:
-
-- simple reference list/deque;
-- quicklist/listpack-inspired compact representation or a simplified equivalent.
-
-### Hash
-
-Commands:
-
-- `HSET`, `HGET`
-- `HDEL`
-- `HLEN`
-- `HGETALL`
-
-Representations:
-
-- compact small-hash encoding;
-- dictionary encoding after threshold.
-
-### Set
-
-Commands:
-
-- `SADD`, `SREM`
-- `SISMEMBER`
-- `SMEMBERS`
-- `SCARD`
-
-Representations:
-
-- integer-set-inspired encoding for suitable small integer sets;
-- dictionary encoding otherwise.
-
-### Sorted Set
-
-Commands:
-
-- `ZADD`
-- `ZSCORE`
-- `ZRANK`
-- `ZRANGE`
-- `ZREM`
-
-Core learning representation:
-
-```text
-member -> score dictionary
-          +
-score/member ordered skip list
-```
-
-## Required semantics
-
-- `WRONGTYPE` errors;
-- explicit encoding thresholds;
-- representation conversion tests;
-- same logical results before/after conversion.
-
-## Critical learning target
-
-A logical API is stable even when internal storage changes based on size/content.
-
----
-
-# v0.5 — Persistence depth: RDB and AOF rewrite
-
-## Why v0.5 follows richer in-memory state
-
-Persistence becomes more interesting once multiple object types and encodings exist. The version should teach snapshot vs command-log trade-offs rather than only file serialization.
-
-## Primary question
-
-**How does an in-memory database trade restart speed, write cost and durability?**
-
-## Required implementation
-
-### RDB-like snapshot
-
-- deterministic educational snapshot format
-- type + expiry metadata
-- checksum/corruption detection
-- save/load
-- atomic temp-file replacement
-
-### Snapshot execution model
-
-Stage 1 reference:
-
-- blocking snapshot for correctness.
-
-Stage 2 educational production concept:
-
-- Linux fork/COW experiment or clearly isolated simulation/documentation;
-- explain parent/child memory behavior and write amplification.
-
-### AOF rewrite
-
-- rebuild minimal command history from current logical state;
-- capture mutations while rewrite is in progress;
-- atomic replacement;
-- restart correctness.
-
-### Startup policy
-
-- clearly defined AOF vs RDB source precedence;
-- corrupted-file behavior;
-- explicit failure rather than silent data loss.
-
-## Critical invariants
-
-- snapshot/rewrite never publishes a partially written final file;
-- TTL remains an absolute deadline through restart;
-- logical state after reload matches pre-save state;
-- rewrite reduces redundant history without changing state.
-
----
-
-# v0.6 — Expiration, memory limits and eviction policies
-
-## Why this version exists
-
-v0.1 demonstrates expiration semantics but intentionally hides production-grade memory lifecycle policy. Once memory structures and persistence are mature, the project can reason about what happens under memory pressure.
-
-## Primary questions
-
-- why not scan every TTL key continuously?
-- how does Redis approximate LRU/LFU cheaply?
-- what is the difference between expiration and eviction?
-
-## Required implementation
-
-### Active expiry refinement
-
-- sampled expiry cycle
-- time budget
-- continue scanning when stale density is high
-- metrics for expired vs sampled keys
-
-### Memory accounting
-
-- educational approximate object memory accounting
-- configurable `maxmemory`
-
-### Eviction policies
-
-At minimum:
-
-- no-eviction
-- allkeys-random
-- volatile-random
-- allkeys-LRU approximation
-- allkeys-LFU approximation
-
-Optional volatile variants may follow.
-
-### LRU/LFU metadata
-
-- bounded metadata cost;
-- sampled victim selection;
-- tests showing approximation rather than pretending exactness.
-
-## Critical distinction
-
-```text
-expiration: key becomes invalid because time passed
-
-eviction:   valid key is removed because memory policy requires space
-```
-
----
-
-# v0.7 — Transactions, optimistic locking and Pub/Sub
-
-## Why this follows the execution model
-
-Transactions only make sense once command execution ordering is explicit. Pub/Sub is a useful server-side fan-out feature that exercises client state without yet requiring distributed topology.
-
-## Transactions
 
 Required:
 
-- `MULTI`
-- command queueing
-- `EXEC`
-- `DISCARD`
-- `WATCH` / `UNWATCH`
-- per-key versioning or equivalent optimistic-lock mechanism
+- explicit buckets;
+- documented collision strategy;
+- hash-function boundary;
+- insert/find/delete;
+- load-factor tracking;
+- grow/shrink triggers;
+- two-table rehash state;
+- bounded rehash steps;
+- lookup/update/delete correctness while migrating;
+- explicit iterator policy;
+- event-loop timer/opportunistic rehash steps;
+- Redis-like object metadata separating logical type and encoding;
+- optional SDS-inspired string representation if it clarifies length/capacity/binary safety.
 
-Learning target:
+Invariant tests must prove:
 
-Redis transactions queue commands and execute them as one uninterrupted batch; they are not SQL-style rollback transactions.
+- no key disappears during rehash;
+- one logical key never exists as conflicting duplicates in two tables;
+- updates find the correct owner;
+- deletes work in either table;
+- each rehash step has bounded work;
+- existing string command behavior remains unchanged.
 
-## Pub/Sub
+Non-goals:
 
-Required subset:
+- no collection commands yet;
+- no compact collection encodings;
+- no persistence redesign.
 
-- `SUBSCRIBE`
-- `UNSUBSCRIBE`
-- `PUBLISH`
-- subscribed-client mode constraints
+## 6. v0.4 — Core data types and internal encodings
 
-Later RESP3 behavior may relax some RESP2 subscribed-client restrictions.
+Primary question:
 
----
+> Why can one Redis logical type use multiple physical representations?
 
-# v0.8 — Replication and partial resynchronization
+Implement:
 
-## Why replication comes before HA and Cluster
+- List: `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LLEN`, `LRANGE`;
+- Hash: `HSET`, `HGET`, `HDEL`, `HLEN`, `HGETALL`;
+- Set: `SADD`, `SREM`, `SISMEMBER`, `SMEMBERS`, `SCARD`;
+- ZSet: `ZADD`, `ZSCORE`, `ZRANK`, `ZRANGE`, `ZREM`;
+- `WRONGTYPE` semantics;
+- explicit type/encoding conversion thresholds;
+- same logical results before/after representation conversion;
+- ZSet educational model: member→score dict + ordered skip list.
 
-Sentinel and Cluster both depend on nodes already being able to replicate state and reason about replication progress.
+## 7. v0.5 — Persistence depth: RDB + AOF rewrite
 
-## Primary question
+Primary question:
 
-**How does a replica become and remain an equivalent copy of a primary?**
+> How does an in-memory database trade write cost, restart speed and durability?
 
-## Target flow
+Implement:
+
+- deterministic educational RDB format;
+- type + absolute-expiry metadata;
+- checksum/corruption detection;
+- blocking snapshot reference path;
+- atomic temp-file replacement;
+- AOF rewrite from current logical state;
+- mutations captured during rewrite;
+- atomic AOF replacement;
+- startup precedence and corruption policy;
+- fork/COW as an isolated experiment/documented production concept after correctness is clear.
+
+## 8. v0.6 — Expiration, maxmemory and eviction
+
+Primary questions:
+
+- why not scan all TTL keys continuously?
+- what differs between expiration and eviction?
+- how can LRU/LFU be approximated cheaply?
+
+Implement:
+
+- time-budgeted adaptive active-expire cycle;
+- approximate memory accounting;
+- `maxmemory`;
+- no-eviction;
+- random policies;
+- sampled LRU approximation;
+- sampled LFU approximation;
+- metrics showing approximation/cost.
+
+## 9. v0.7 — Transactions + Pub/Sub
+
+Transactions:
+
+- `MULTI`, `EXEC`, `DISCARD`;
+- `WATCH`, `UNWATCH`;
+- queued execution;
+- optimistic key versioning.
+
+Learning target: Redis transactions execute an uninterrupted queued batch; they are not SQL rollback transactions.
+
+Pub/Sub:
+
+- `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH`;
+- subscribed-client state;
+- output-buffer/backpressure interaction.
+
+## 10. v0.8 — Replication + partial resynchronization
+
+Primary question:
+
+> What state lets a replica catch up without receiving the whole dataset again?
+
+Implement:
+
+- primary/replica roles;
+- full initial synchronization;
+- replication offset;
+- backlog ring buffer;
+- command propagation;
+- reconnect + partial resync when backlog still covers the gap;
+- fallback to full sync otherwise;
+- convergence tests.
+
+## 11. v0.9 — Sentinel-inspired high availability
+
+Implement educational versions of:
+
+- health monitoring;
+- subjective vs objective failure;
+- quorum;
+- leader/election decision;
+- replica promotion;
+- topology reconfiguration;
+- split-brain limitations documented explicitly.
+
+## 12. v0.10 — Cluster / hash slots
+
+Implement:
+
+- 16384-slot model;
+- deterministic key→slot mapping;
+- slot ownership;
+- `MOVED`;
+- migration/importing state;
+- `ASK` semantics;
+- basic node gossip/topology exchange;
+- resharding experiment.
+
+## 13. v0.11 — RESP3 and richer client semantics
+
+Add RESP3 only after server/runtime/data/distributed concepts are stable:
+
+- richer scalar/container types;
+- push-style messages where useful;
+- protocol negotiation;
+- compatibility tests.
+
+## 14. v0.12 — Observability and performance engineering
+
+Add:
+
+- command latency stats;
+- connection/event-loop counters;
+- expiration/eviction metrics;
+- AOF/RDB timing;
+- replication lag/offset metrics;
+- CPU/memory profiling examples;
+- repeatable benchmark methodology;
+- explicit comparison against prior reference implementations.
+
+Performance is a learning result only when the mechanism causing the change is explained.
+
+## 15. Version sequencing invariant
+
+The intended dependency chain is:
 
 ```text
-replica connect
-     ↓
-handshake
-     ↓
-full sync snapshot + offset
-     ↓
-stream mutations
-     ↓
-track replication offset
-     ↓ disconnect/reconnect
-backlog contains missing range?
-     ├── yes -> partial resync
-     └── no  -> full resync
+request semantics
+   ↓
+event-loop scheduling
+   ↓
+dictionary internals
+   ↓
+objects/collections/encodings
+   ↓
+persistence depth
+   ↓
+memory policy
+   ↓
+transactions/client fan-out
+   ↓
+replication
+   ↓
+failover
+   ↓
+sharding
+   ↓
+protocol/observability refinement
 ```
 
-## Required implementation
+Do not skip ahead simply because a later feature is more visible. The learning value comes from being able to explain why each later subsystem needs the earlier one.
 
-- primary/replica role
-- replication ID
-- global replication offset
-- backlog ring buffer
-- full synchronization
-- ongoing command propagation
-- partial resynchronization
-- replica read behavior documented
+## 16. Current directive
 
-## Critical invariants
+Current integrated version: **v0.2**.
 
-- replica eventually matches primary after successful sync;
-- mutation order is preserved;
-- offsets monotonically advance;
-- partial resync is accepted only when the backlog covers the requested range.
+Next active version should be **v0.3** and must be created from latest validated `main`.
 
----
-
-# v0.9 — Sentinel-inspired high availability
-
-## Primary question
-
-**Replication copies data, but who decides that a failed primary should be replaced?**
-
-## Required educational mechanisms
-
-- monitoring/ping state
-- subjective down vs quorum-confirmed down distinction
-- leader election for a failover round
-- replica candidate ranking
-- promotion
-- remaining replicas reconfigured to the new primary
-- epoch/term-like monotonic configuration version
-
-## Scope rule
-
-The goal is to expose failure-detection and failover coordination concepts, not implement every Sentinel command or timing edge case.
-
----
-
-# v0.10 — Cluster, hash slots and redirection
-
-## Primary question
-
-**How can Redis shard keys across nodes while clients still address one logical key space?**
-
-## Required implementation
-
-### Hash slots
-
-- 16384-slot model or a documented smaller educational constant;
-- CRC16-compatible or explicitly educational hash function;
-- hash tags `{...}`;
-- deterministic key -> slot mapping.
-
-### Routing
-
-- node owns slot ranges;
-- `MOVED` redirection;
-- `ASK` during migration;
-- client test harness that follows redirects.
-
-### Slot migration
-
-- migrating/importing states;
-- key transfer;
-- no silent dual ownership.
-
-### Cluster metadata/gossip
-
-- node IDs;
-- topology view;
-- heartbeat/gossip-like exchange;
-- configuration epoch conflict resolution.
-
-## Non-goal
-
-Do not hide networking/distributed-state complexity behind a centralized coordinator; the learning target is distributed slot ownership.
-
----
-
-# v0.11 — RESP3 and richer client semantics
-
-## Goal
-
-Teach how protocol evolution can add richer server push and typed responses without rewriting storage semantics.
-
-Potential scope:
-
-- RESP3 map/set/push/null/boolean/double subset;
-- `HELLO` protocol negotiation;
-- server-push representation;
-- Pub/Sub integration using push messages;
-- protocol compatibility tests for RESP2 vs RESP3.
-
----
-
-# v0.12 — Observability and performance engineering
-
-## Goal
-
-Turn the completed architecture into something that can explain its own performance.
-
-Potential mechanisms:
-
-- command latency histogram;
-- slowlog;
-- per-command counters;
-- client buffer metrics;
-- memory/expiry/eviction counters;
-- replication lag metrics;
-- `INFO`-like output;
-- benchmark harness;
-- CPU/memory profiling exercises;
-- optional I/O-thread experiment after the single-reactor model is understood.
-
-## Performance rule
-
-Every optimization must state:
-
-1. bottleneck;
-2. mechanism;
-3. expected trade-off;
-4. benchmark method;
-5. correctness invariants that must remain unchanged.
-
----
-
-# 6. Cross-version invariants
-
-These should remain stable unless a version explicitly documents a justified change.
-
-## Protocol boundary
-
-RESP framing is transport/protocol code, not command semantics.
-
-## Command boundary
-
-Command metadata/dispatch is separate from storage representation.
-
-## Store semantics
-
-Handlers request logical state operations; they should not know whether the backing dictionary is Go `map`, a custom incremental-rehash table, snapshot-aware storage, or a cluster-local shard.
-
-## Persistence semantics
-
-Persistence records logical state transitions or snapshots, not accidental in-memory pointers/implementation details.
-
-## Expiry semantics
-
-An expired key is logically missing even if physical reclamation has not happened yet.
-
-## Version discipline
-
-Later optimizations must preserve a readable explanation of the simpler mechanism they replace.
-
----
-
-# 7. Core test matrix by subsystem
-
-| Subsystem | Must prove |
-|---|---|
-| RESP | framing, truncation/error handling, partial reads, encoding |
-| Command registry | lookup, arity, metadata, unknown commands |
-| Store | logical CRUD invariants and type safety |
-| TTL | lazy invisibility + active reclamation + deadline correctness |
-| Event loop | isolation, partial I/O, pipelining, backpressure |
-| Dict | collision correctness, resize, incremental rehash invariants |
-| Encodings | representation conversion preserves logical result |
-| AOF | replay, fsync policy behavior, truncated tail, rewrite |
-| RDB | save/load identity, checksum/corruption, atomic replacement |
-| Eviction | policy-specific victim eligibility and bounded behavior |
-| Transactions | queueing, uninterrupted EXEC, WATCH invalidation |
-| Replication | convergence, ordered propagation, offsets, partial sync |
-| Sentinel | quorum/election/failover state transitions |
-| Cluster | slot mapping, MOVED/ASK, migration ownership |
-
----
-
-# 8. Suggested learning order inside each version
-
-For every version:
-
-```text
-1. read version.md
-2. read architecture boundary
-3. run baseline tests
-4. trace one request end-to-end
-5. implement smallest reference mechanism
-6. add invariant/error tests
-7. integrate with redis-cli or node harness
-8. measure only after correctness is visible
-9. document production Redis differences
-10. freeze snapshot when Definition of Done is satisfied
-```
-
----
-
-# 9. Current roadmap priority
-
-The repository currently integrates **v0.1**.
-
-Next priority:
-
-```text
-v0.2
-nonblocking sockets
-      ↓
-epoll Poller
-      ↓
-per-client buffers
-      ↓
-partial RESP frames
-      ↓
-ordered pipelining
-      ↓
-backpressure
-      ↓
-comparison with v0.1 goroutine server
-```
-
-Do not jump directly to List/Hash/ZSet merely because those commands are familiar. The educational sequence intentionally exposes Redis' execution model before adding broader data-type surface area.
+Do not begin v0.4 collection encodings until v0.3 can demonstrate correct bounded incremental rehash under the existing event loop.

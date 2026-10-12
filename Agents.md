@@ -1,497 +1,298 @@
 # Agents.md — mini-redis Development Contract
 
-> **Mandatory instruction for every future iteration:** before changing code, tests, docs, branches, version scope, persistence semantics, protocol behavior, or architecture, read this file first.
->
-> This file is an engineering contract. It is not optional guidance.
+> Mandatory for every future iteration: read this file before changing code, tests, docs, branch scope, protocol behavior, persistence semantics or architecture.
 
----
+## 1. Mission
 
-# 1. Repository mission
+mini-redis is an educational Redis implementation in Go. It exists to expose one Redis mechanism at a time in dependency order.
 
-mini-redis is an educational Redis implementation in Go for understanding the mechanisms behind real Redis by building them in dependency order.
-
-The project optimizes for:
+Optimize for:
 
 1. architectural clarity;
 2. correctness and explicit invariants;
-3. protocol behavior that can be inspected end-to-end;
-4. readable reference implementations;
-5. tests that prove mechanisms rather than only outputs;
-6. conceptual mapping to Redis internals;
-7. version-to-version diffs that each teach one major mental model.
+3. readable reference implementations;
+4. tests that prove mechanisms, not only outputs;
+5. end-to-end observability from TCP bytes to state;
+6. version-to-version diffs that teach one dominant mental model.
 
-It does **not** optimize for:
+Do not optimize for:
 
-- full Redis command compatibility;
-- production deployment or security hardening;
-- raw benchmark numbers before the mechanism is understandable;
-- copying Redis source code line-for-line;
-- adding features merely because Redis has them.
+- full Redis API compatibility;
+- production deployment/security hardening;
+- copying Redis source line-for-line;
+- benchmark numbers before the architecture is clear;
+- unrelated features merely because Redis has them.
 
-The guiding progression is:
+Guiding rule:
 
 ```text
 one version
    ↓
-one primary Redis mental model
+one primary mental model
    ↓
-small readable mechanism
+small explicit mechanism
    ↓
-explicit invariant tests
+invariant tests
    ↓
-redis-cli / integration demonstration
+end-to-end demonstration
 ```
 
----
+## 2. Mandatory reading order
 
-# 2. Mandatory reading order before any work
-
-Every agent must determine the current branch first.
-
-## If current branch is `main`
-
-Read in this order:
+### On `main`
 
 1. `Agents.md`
 2. `Plan.md`
-3. current `version.md` if present
+3. `version.md`
 4. `docs/ARCHITECTURE.md`
-5. architecture docs relevant to the subsystem being changed
-6. existing tests for that subsystem
+5. relevant source files
+6. relevant tests
 
-`Plan.md` is the canonical forward architecture and version-sequencing document.
+`Plan.md` is the canonical forward roadmap.
 
-## If current branch is `v0.x` / `v1.x`
-
-Read in this order:
+### On a version branch (`v0.x`, `v1.x`)
 
 1. `Agents.md`
 2. `version.md`
 3. relevant architecture docs
-4. relevant source files
+4. relevant source
 5. relevant tests
 
-Do not assume a historical version branch should contain mechanisms introduced by a later version.
+Never assume a historical branch should contain later-version mechanisms.
 
----
+## 3. Branch model
 
-# 3. Branch model
-
-## 3.1 `main` invariant
-
-**`main` must always be the newest integrated, validated version of mini-redis.**
-
-A version branch may be used for focused development, but validated desired behavior must be synchronized into `main` so `main` never intentionally trails the newest working state.
-
-Forbidden:
+`main` is always the newest integrated, validated state.
 
 ```text
-v0.3: validated newer implementation
-main: stale v0.2 implementation
+main ─────────────────────────────────────► newest validated state
+  │
+  ├── v0.1 request/state/persistence snapshot
+  ├── v0.2 event-loop snapshot
+  ├── v0.3 dictionary/rehash snapshot
+  └── ...
 ```
-
-Required:
-
-```text
-v0.3 validated increment ─────────► main
-                                    newest integrated state
-```
-
-## 3.2 Version branches
 
 Version branches are educational snapshots, not parallel products.
 
-Examples:
+A validated active branch must not remain newer than `main`.
 
-- `v0.1`: RESP2 -> command registry -> string store -> TTL -> AOF
-- `v0.2`: nonblocking I/O and event loop
-- `v0.3`: dictionary internals, incremental rehash, Redis-like object metadata
-- later versions follow `Plan.md`
-
-Every version branch must contain:
-
-- `version.md`
-- `Agents.md`
-- tests for the mechanisms promised by that version
-
-## 3.3 Historical branch freeze
-
-After a version reaches Definition of Done, treat the branch as a historical learning snapshot.
-
-Allowed after freeze:
+Historical branches may receive only:
 
 - documentation corrections;
 - test corrections that preserve scope;
-- narrowly scoped fixes required for the version's own promised behavior.
+- narrowly scoped fixes needed for that version's promised behavior.
 
-Not allowed:
+Do not backport later architecture into a frozen learning snapshot.
 
-- backporting future subsystems for convenience;
-- replacing the old architecture with a newer one;
-- changing the branch so it no longer demonstrates its original learning milestone.
+## 4. Version lifecycle
 
----
-
-# 4. Version lifecycle
-
-Every new version follows five phases.
-
-## Phase A — plan
+### Phase A — plan
 
 Before coding:
 
-1. state the single primary mental model;
-2. explain why it depends on the previous version;
+1. state the primary question;
+2. explain dependency on the previous version;
 3. define subsystem ownership and dependency direction;
-4. identify invariants that tests must prove;
-5. define explicit non-goals;
-6. define acceptance criteria;
-7. create or update `version.md`;
-8. verify the scope still matches `Plan.md`.
+4. state invariants that tests must prove;
+5. state non-goals;
+6. update `version.md`;
+7. verify scope against `Plan.md`.
 
-## Phase B — implement the reference mechanism
+### Phase B — reference mechanism
 
-Priority order:
+Priority:
 
 ```text
 correctness
-   ↓
+  ↓
 clarity
-   ↓
+  ↓
 testability
-   ↓
+  ↓
 architecture
-   ↓
+  ↓
 performance
 ```
 
-When a production Redis technique is too complex for the first implementation, keep the educational reference path and document the production difference.
+Keep a readable reference path when an optimized path would hide the idea.
 
-## Phase C — validate invariants
+### Phase C — validate
 
-Tests must prove mechanism-level behavior.
+Tests should prove architectural behavior, for example:
 
-Examples:
+- RESP partial frames remain buffered without corrupting parsing;
+- event loop: one partial/slow client does not block another;
+- dictionary: lookup remains correct during incremental rehash;
+- AOF: only successful mutations persist and TTL deadlines survive restart;
+- replication: offsets converge after synchronization;
+- cluster: a key maps deterministically to one slot.
 
-- RESP: partial/truncated frames fail predictably and binary-safe bulk strings round-trip;
-- command registry: arity and unknown-command errors are independent of handlers;
-- expiration: stale keys are invisible before physical cleanup and active expiration reclaims unread keys;
-- AOF: only successful mutations persist and relative TTL does not restart after reboot;
-- dictionary: lookups remain correct during incremental rehash;
-- event loop: one slow client does not block unrelated clients;
-- transactions: queued commands execute atomically with respect to the server execution loop;
-- replication: master and replica offsets converge after synchronization;
-- cluster: a key maps deterministically to exactly one hash slot.
-
-## Phase D — integrate
+### Phase D — integrate
 
 After validation:
 
-1. update docs and examples;
-2. update `version.md` status/delta;
-3. run the required validation suite on the exact commit;
-4. integrate the validated state into `main`;
-5. verify `main` is not behind the active version branch.
+1. update docs/examples;
+2. run the exact required validation suite;
+3. integrate the validated commit into `main`;
+4. verify `main` is not behind the active version branch.
 
-## Phase E — freeze
+### Phase E — freeze
 
-When Definition of Done is satisfied:
+When Definition of Done is satisfied, freeze the version branch and create the next version branch from latest `main`.
 
-- freeze the version branch as a learning snapshot;
-- create the next version branch from current `main`, never from a stale historical branch.
+## 5. `version.md` contract
 
----
+Every version snapshot must explain:
 
-# 5. New version branch procedure
-
-When starting `vX.Y`:
-
-1. verify `main` is the newest validated state;
-2. create `vX.Y` from current `main`;
-3. create/update `version.md` immediately;
-4. ensure `Agents.md` exists;
-5. describe the delta from the previous version;
-6. implement only that version's scope;
-7. synchronize validated increments back to `main`;
-8. freeze the branch after Definition of Done.
-
-Correct:
-
-```text
-latest main
-   └──► v0.4
-```
-
-Incorrect:
-
-```text
-v0.2
-  └──► v0.4
-```
-
-when `main` already contains v0.3.
-
----
-
-# 6. Required `version.md` contract
-
-Each version snapshot must include a root `version.md` describing:
-
-1. branch/version identity;
-2. previous version and base relationship;
-3. version theme;
-4. **what changed relative to the previous version, and why**;
+1. identity/status;
+2. previous version;
+3. version theme/primary question;
+4. what changed and why;
 5. mechanisms added;
 6. mechanisms intentionally unchanged;
-7. architecture/mental-model diagram;
+7. architecture diagram;
 8. important source files;
-9. tests and executable examples;
+9. tests/examples;
 10. learning goals;
 11. non-goals;
-12. remaining work if active;
+12. remaining work;
 13. next-version direction.
 
-A version document is not a changelog. It explains the learning boundary and architectural delta.
+The most important question is always:
 
----
+> What changed relative to the previous version, and why?
 
-# 7. Architecture rules
+## 6. Architecture dependency direction
 
-## 7.1 Preserve dependency direction
-
-Preferred high-level dependency flow:
+Preferred direction:
 
 ```text
 TCP / client lifecycle
-        │
-        ▼
-   RESP protocol
-        │
-        ▼
- command registry
-        │
-        ▼
- command semantics
-        │
-        ▼
-    Store API
-        │
-   ┌────┴─────┐
-   ▼          ▼
-objects      TTL
-   │
-   ▼
-Dict / encodings
-
-successful mutation
-        │
-        ▼
- persistence
- AOF / RDB
+        ↓
+RESP protocol
+        ↓
+command registry
+        ↓
+command semantics
+        ↓
+Store contract
+   ┌────┼────┐
+   ↓    ↓    ↓
+Object TTL  Dict
+        ↓
+memory state
+        ↓
+AOF / RDB
 ```
 
-Later distributed layers sit above the same command/state semantics:
+Distributed layers are later consumers of the same state/command semantics:
 
 ```text
-Replication -> command propagation / offsets
-Sentinel    -> topology and failover control
-Cluster     -> key-slot ownership and redirection
+Replication → offsets/backlog
+     ↓
+Sentinel / Cluster
 ```
 
-Avoid cycles such as storage importing network/server packages or RESP depending on command handlers.
+Rules:
 
-## 7.2 Separate policy from mechanism
-
-Examples:
-
-- RESP parser decodes frames; command registry decides command metadata.
-- command handler defines semantic mutation; store owns state invariants.
-- store decides whether a key exists; expiration policy decides when stale memory is physically reclaimed.
-- AOF encodes mutation history; fsync policy decides durability timing.
-- poller reports readiness; event loop decides client lifecycle and command execution order.
+- storage must not import network/server packages;
+- RESP must not depend on command handlers;
+- poller reports readiness; event loop owns lifecycle/policy;
+- persistence records state history; fsync policy decides durability timing;
 - dictionary stores entries; eviction policy chooses victims.
-- replication transports state changes; failover logic chooses a new primary.
 
-Do not merge independent responsibilities merely to reduce file count.
+Separate policy from mechanism even when combining them would reduce file count.
 
-## 7.3 Stable boundaries before optimization
+## 7. Version scope discipline
 
-Before optimizing a subsystem, make the boundary explicit.
+Before adding a feature ask:
 
-Preferred progression:
-
-```text
-reference implementation
-      ↓
-invariant tests
-      ↓
-profile / identify pressure
-      ↓
-optimized educational implementation
-      ↓
-comparison test / benchmark
-```
-
-Examples:
-
-- Go map before custom Redis-like dictionary;
-- goroutine-per-client before epoll reactor;
-- direct AOF before AOF rewrite;
-- simple expiry sampling before adaptive expiry cycle;
-- straightforward list/hash/set before compact encodings.
-
-## 7.4 Conceptual Redis compatibility
-
-Map mechanisms to Redis concepts when pedagogically useful, but do not copy upstream internals blindly.
-
-Important conceptual anchors include:
-
-- RESP2/RESP3 framing;
-- command table metadata;
-- `dict` and incremental rehash;
-- SDS-like dynamic strings;
-- Redis object type/encoding separation;
-- listpack/quicklist-style compact collection storage;
-- skip list + hash table for sorted sets;
-- event loop/file events/time events;
-- lazy + active expiration;
-- approximate LRU/LFU eviction;
-- AOF + fsync + rewrite;
-- RDB snapshot and fork/COW concepts;
-- replication offsets/backlog/partial resync;
-- Sentinel-style monitoring/election/failover;
-- Cluster hash slots, MOVED/ASK, migration and gossip.
-
----
-
-# 8. Scope discipline
-
-Each version should introduce one dominant architectural idea.
-
-Before adding a feature, ask:
-
-1. Does it explain the current version's mental model?
+1. Does it explain this version's mental model?
 2. Is it required by an acceptance criterion?
 3. Is it a dependency of the current mechanism?
-4. Would adding it now hide a more fundamental mechanism that should be taught first?
+4. Would it hide a more fundamental subsystem that belongs first?
 
-If it belongs later, record it in `Plan.md` or `version.md`; do not smuggle it into the current version.
+If it belongs later, record it in `Plan.md` instead of implementing it now.
 
 Examples:
 
-- Do not add Cluster before standalone command/state semantics and replication exist.
-- Do not add compact list encodings before object/type boundaries are explicit.
-- Do not add I/O threading before a single-threaded/nonblocking event-loop model is observable.
-- Do not add RDB fork/COW behavior before basic snapshot semantics are testable.
+- no List/Hash/Set/ZSet before dictionary/object boundaries;
+- no RDB fork/COW before snapshot correctness is explicit;
+- no replication before standalone state/persistence are stable;
+- no I/O thread pool before the single reactor model is understood.
 
----
+## 8. Protocol rules
 
-# 9. Protocol and command compatibility rules
+Protocol code remains isolated from command semantics.
 
-## 9.1 RESP behavior
-
-Protocol code must remain isolated from command semantics.
-
-For supported RESP features, test:
+For supported RESP features test:
 
 - valid frames;
-- empty strings/arrays where applicable;
-- binary-safe bulk payloads when the API supports bytes;
+- empty/binary-safe payloads where applicable;
 - partial reads;
-- malformed length fields;
+- malformed length/type fields;
 - truncated input;
-- response encoding.
+- response encoding;
+- pipeline boundaries.
 
 Do not claim complete RESP compatibility unless tested.
 
-## 9.2 Redis command behavior
+## 9. Concurrency and event-loop rules
 
-When a command intentionally follows Redis semantics, document edge cases and test them. If mini-redis deliberately simplifies behavior, say so in README/version docs.
+### v0.1 historical model
 
-Do not silently return a plausible but Redis-incompatible result merely to keep code short.
+- one goroutine per client;
+- blocking network API;
+- mutex-protected Store;
+- Store-operation atomicity only.
 
----
+### v0.2 current model
 
-# 10. Concurrency and atomicity rules
+- Linux reactor uses nonblocking sockets + epoll;
+- client parsing/output state belongs to the event-loop owner;
+- command handlers execute serially on the reactor goroutine;
+- partial reads/writes must never block the loop;
+- writable readiness is enabled only while output exists;
+- client buffers must have explicit limits;
+- one slow or malformed client must not stall unrelated clients;
+- active expiration runs as an event-loop timer;
+- AOF append remains synchronous and is explicitly outside the networking-isolation claim;
+- legacy engine exists only as a reference/comparison path.
 
-Concurrency model is version-specific and must be explicit.
+Never describe something as atomic without naming the boundary that makes it atomic.
 
-For v0.1:
+## 10. Persistence rules
 
-- transport uses one goroutine per connection;
-- `store.Store` operations are mutex-protected;
-- atomicity is at store-operation granularity, not a claim of full Redis single-thread execution semantics.
-
-For the event-loop version:
-
-- command execution order and blocking behavior must be documented;
-- nonblocking I/O must handle partial reads/writes;
-- a slow client must not stall unrelated clients;
-- background tasks must not mutate state without an explicit synchronization model.
-
-Never describe an operation as atomic without stating the boundary that makes it atomic.
-
----
-
-# 11. Persistence and durability rules
-
-Persistence bugs can look correct during normal execution, so durability invariants require dedicated tests.
-
-For AOF/RDB changes, reason about:
+Persistence needs dedicated failure/restart reasoning:
 
 - crash before write;
 - write without fsync;
-- crash during final record;
-- restart/replay;
-- relative vs absolute expiry time;
-- failed mutation vs successful mutation;
-- rewrite/snapshot atomic replacement;
-- corrupted input;
-- startup source precedence.
+- truncated final record;
+- replay after restart;
+- relative vs absolute expiration;
+- failed vs successful mutation;
+- snapshot/rewrite atomic replacement;
+- corrupted input.
 
-Critical invariant already established in v0.1:
+Established invariant:
 
-> A relative TTL persisted to AOF must not restart from its original duration after process downtime.
+> A relative TTL persisted to AOF must not restart from its original duration after downtime.
 
-Relative expiry commands may therefore be rewritten to absolute deadlines for persistence.
+Do not equate `write()` with durable storage; distinguish page cache, fsync and disk durability.
 
-Do not claim an OS `write()` is equivalent to durable storage; distinguish write, page cache, fsync and disk persistence.
+## 11. Testing baseline
 
----
+New subsystems should include:
 
-# 12. Testing requirements
+- happy path;
+- invariant/property tests;
+- error-path tests;
+- integration tests;
+- compatibility/reference checks where useful;
+- race validation for concurrent/shared state.
 
-Every new subsystem should include, where applicable:
-
-## A. Happy-path tests
-
-Expected behavior for normal inputs.
-
-## B. Invariant/property tests
-
-Tests for the mechanism itself.
-
-## C. Error-path tests
-
-Malformed protocol, wrong arity/type, overflow, invalid persistence state and unsupported combinations should fail clearly.
-
-## D. Compatibility/reference tests
-
-Where useful, compare selected behavior with `redis-server` / `redis-cli` or documented Redis semantics. Keep the supported surface explicit.
-
-## E. Integration tests
-
-Exercise multiple layers together: protocol -> command -> store -> persistence, or server restart -> replay -> observable state.
-
-## F. Concurrency/race validation
-
-For code that uses goroutines or shared state:
-
-```bash
-go test -race ./...
-```
-
-Required baseline validation before reporting a version as clean:
+Before reporting a version clean, run on the exact code:
 
 ```bash
 gofmt -d .
@@ -499,156 +300,125 @@ go vet ./...
 go test ./...
 go test -race ./...
 go build ./cmd/mini-redis-server
-```
-
-When `redis-cli` is available, also run:
-
-```bash
 make smoke
 ```
 
-Do not claim a command passed unless it was actually run on the exact code being reported.
+For v0.2 also validate both network engines:
 
----
+```bash
+NETWORK_ENGINE=reactor make smoke
+NETWORK_ENGINE=legacy PORT=16380 make smoke
+```
 
-# 13. Documentation requirements
+Do not claim a command passed unless it actually ran successfully.
 
-Update docs whenever a change modifies:
+## 12. Documentation rules
+
+Update docs when changing:
 
 - protocol behavior;
 - public command behavior;
-- store contracts;
-- persistence format or recovery behavior;
+- Store contracts;
+- persistence format/recovery;
 - concurrency/atomicity model;
 - version scope;
 - branch policy;
-- learning sequence;
 - major invariants;
-- setup or example usage.
+- setup/examples.
 
-For a version change, review at minimum:
+For each version review at least:
 
-- `version.md`
-- `Agents.md`
-- `Plan.md` on `main` if sequencing changed
-- `docs/ARCHITECTURE.md`
-- README when user-facing behavior changed
+- `version.md`;
+- `Agents.md`;
+- `Plan.md` when sequencing/status changes;
+- `docs/ARCHITECTURE.md`;
+- README when user-facing behavior changes.
 
-`docs/ROADMAP.md` is only a short navigator. `Plan.md` is canonical.
+`docs/ROADMAP.md` is only a navigator. `Plan.md` is canonical.
 
----
+## 13. Commit rules
 
-# 14. Commit rules
-
-Prefer commits that express architectural intent.
-
-Examples:
+Prefer architectural commits, e.g.:
 
 ```text
-feat(resp): parse RESP2 bulk arrays
-feat(expire): add lazy and active expiration
-feat(aof): persist relative TTL as absolute deadline
-feat(net): introduce poller abstraction
-test(dict): preserve lookup correctness during rehash
-docs: define v0.3 dictionary invariants
+feat(net): add epoll poller and incremental RESP buffering
+feat(server): add reactor networking engine and backpressure
+test(net): add dual-engine smoke and comparison harness
+docs: document v0.2 event-loop learning boundary
 ```
 
-Avoid mixing unrelated subsystems in a single opaque commit when normal development allows smaller coherent commits.
+Avoid opaque commits that mix unrelated subsystems.
 
-Repository bootstrap may be one coherent commit because the files collectively establish the initial v0.1 learning snapshot.
+## 14. Generated artifacts and dependencies
 
----
+Do not commit:
 
-# 15. Generated artifacts and dependencies
-
-Do not commit runtime artifacts such as:
-
-- `appendonly.aof`;
-- RDB snapshots;
-- benchmark profiles;
-- coverage output;
 - binaries;
-- temporary client captures;
-- generated test databases.
+- `appendonly.aof`;
+- RDB files;
+- benchmark profiles/results as universal claims;
+- coverage output;
+- temporary captures/databases.
 
-Tiny deterministic fixtures are allowed when required by tests.
+Keep dependencies minimal. Prefer the Go standard library until a dependency directly supports the current learning goal.
 
-Keep dependencies minimal. Prefer Go's standard library until a dependency is directly justified by the current version's learning goal.
+## 15. Performance rule
 
----
+Performance work must explain the mechanism.
 
-# 16. Performance rule
+Preferred sequence:
 
-Performance work must explain *why* the speedup exists.
+```text
+reference path
+   ↓
+correctness tests
+   ↓
+benchmark/profile
+   ↓
+optimized educational path
+   ↓
+compare trade-offs
+```
 
-A benchmark without a mechanism is not a learning milestone.
+Benchmark output is machine/kernel dependent. Never present one run as a universal Redis performance claim.
 
-When adding an optimization:
-
-1. preserve or document the reference path;
-2. benchmark before and after;
-3. state complexity and memory trade-offs;
-4. add correctness tests that both paths satisfy;
-5. document where production Redis differs.
-
-Examples:
-
-- goroutine-per-client vs epoll reactor;
-- stop-the-world rehash vs incremental rehash;
-- linked representation vs compact encoding;
-- full expiry scan vs sampling;
-- append-only growth vs rewrite/compaction.
-
----
-
-# 17. Redis reference policy
+## 16. Redis reference policy
 
 When behavior depends on Redis internals, prefer authoritative sources:
 
 - Redis source repository;
-- redis.io command/protocol/docs;
-- official Redis architecture or persistence documentation.
+- redis.io command/protocol documentation;
+- official Redis persistence/architecture documentation.
 
-Use upstream sources to verify concepts and behavior. Implement original educational equivalents; do not reproduce large source passages or mechanically port implementation code.
+Use upstream sources to verify concepts, then implement original educational equivalents. Do not mechanically port Redis source.
 
-When Redis versions differ materially, document which conceptual behavior mini-redis is modeling.
+## 17. Definition of Done
 
----
+A version may be frozen only when applicable items are true:
 
-# 18. Definition of Done for any version
-
-A version may be frozen only when all applicable items are true:
-
-- [ ] primary mental model is clearly stated;
-- [ ] implementation is complete for promised scope;
-- [ ] unit tests pass;
-- [ ] invariant tests pass;
-- [ ] error-path tests exist;
+- [ ] primary mental model is explicit;
+- [ ] promised mechanism is implemented;
+- [ ] unit/invariant/error-path tests exist;
 - [ ] integration example works;
-- [ ] race tests pass for concurrent code;
-- [ ] protocol/reference checks exist where relevant;
+- [ ] race tests pass;
 - [ ] persistence recovery is tested where relevant;
-- [ ] `version.md` accurately describes the delta;
+- [ ] `version.md` describes the delta accurately;
 - [ ] `Agents.md` exists;
 - [ ] architecture docs are synchronized;
 - [ ] generated artifacts are ignored;
 - [ ] `main` contains the newest validated state;
-- [ ] next version's dependency rationale is documented.
+- [ ] next-version dependency rationale is documented.
 
----
+## 18. Current directive
 
-# 19. Current branch directive: `main`
+Current integrated milestone: **v0.2 — nonblocking networking and an epoll reactor**.
 
-`main` is the integration branch and canonical newest state.
+Next milestone: **v0.3 — Redis-like Dict, incremental rehash and object metadata**.
 
-Current integrated milestone: **v0.1 — core request/storage/persistence loop**.
+For new work:
 
-The next planned architectural milestone is **v0.2 — nonblocking networking and an event loop**.
-
-For work on `main`:
-
-1. read `Plan.md` before choosing a subsystem;
-2. do not bypass the version dependency sequence;
-3. keep tests/docs synchronized with code;
-4. keep v0.1's stable protocol/command/store boundaries unless a later version explicitly documents why they evolve;
-5. do not begin collection encodings or replication work before the v0.2 event-loop learning milestone is explicit and validated.
+1. create v0.3 from latest validated `main`;
+2. keep v0.2's RESP/command/reactor behavior stable;
+3. replace hidden Go-map behavior behind the Store boundary rather than mixing hash-table logic into command handlers;
+4. prove lookup/update/delete correctness during rehash;
+5. do not begin collection encodings or distributed features until the dictionary milestone is explicit and validated.

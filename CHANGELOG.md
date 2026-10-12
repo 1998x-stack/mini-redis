@@ -1,14 +1,39 @@
 # Changelog
 
-## v0.1.0 — Core Redis learning loop
+## v0.2.0 — 2026-10-12
 
-- RESP2 request parser and response encoder.
-- Extensible command registry with metadata.
-- In-memory string store behind a stable `store.Store` interface.
-- `PING`, `ECHO`, `SET`, `GET`, `DEL`, `EXISTS`, `INCR`, `INCRBY`, `EXPIRE`, `TTL`, `KEYS`, `DBSIZE`, `FLUSHDB`.
-- Lazy expiration plus periodic active expiration.
-- RESP-encoded AOF with `always`, `everysec`, and `no` fsync policies.
-- AOF replay on startup.
-- Relative TTL commands are persisted with absolute deadlines to avoid TTL extension across restart.
-- TCP server compatible with `redis-cli` for the implemented command subset.
-- Unit tests, smoke test, Makefile, Dockerfile, architecture and roadmap docs.
+### Added
+
+- `Poller` abstraction and Linux epoll implementation;
+- nonblocking listener and accepted sockets;
+- single reactor command/event loop;
+- per-client input and output buffers;
+- incremental RESP command parsing for partial reads;
+- command pipelining with ordered replies;
+- partial-write handling and dynamic writable interest;
+- input/output client buffer limits;
+- event-loop active-expiration timer hook;
+- idle-client cleanup in the reactor;
+- explicit `legacy` networking engine for v0.1/v0.2 comparison;
+- reactor invariant/integration tests;
+- networking comparison benchmark harness.
+
+### Preserved
+
+- command behavior and registry;
+- Store interface and current memory engine;
+- TTL semantics;
+- AOF format, relative-TTL rewrite and replay behavior.
+
+## v0.1.0 — 2026-10-12
+
+Initial educational Redis vertical slice:
+
+- RESP2 command parsing and response encoding;
+- command registry and metadata;
+- string key/value store;
+- lazy and active expiration;
+- `SET`, `GET`, `DEL`, `EXISTS`, `INCR`, `INCRBY`, `EXPIRE`, `PEXPIREAT`, `TTL`, `KEYS`, `DBSIZE`, `FLUSHDB`;
+- RESP-formatted AOF with `always`, `everysec`, `no` fsync policies;
+- AOF replay and absolute-deadline TTL persistence;
+- goroutine-per-client TCP server baseline.
