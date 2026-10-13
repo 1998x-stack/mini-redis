@@ -149,6 +149,7 @@ type Controller struct {
 	epoch         uint64
 	objectiveDown map[string]bool
 	lastDecision  Decision
+	metrics       *controllerMetrics
 }
 
 var ErrNoEligibleReplica = errors.New("sentinel: no eligible replica for failover")
@@ -211,6 +212,7 @@ func NewController(cfg Config, primaryID string, nodes []Node, probe ProbeFunc) 
 		probe:         probe,
 		primaryID:     primaryID,
 		objectiveDown: make(map[string]bool),
+		metrics:       newControllerMetrics(),
 	}, nil
 }
 
@@ -249,22 +251,59 @@ func (c *Controller) MonitorState(monitorID, nodeID string) (MonitorState, bool)
 	return state, state.NodeID != ""
 }
 
-func (c *Controller) Tick(ctx context.Context, now time.Time) ([]Event, error) {
+func (c *Controller) Tick(ctx context.Context, now time.Time) (events []Event, err error) {
 	c.tickMu.Lock()
 	defer c.tickMu.Unlock()
+
+	metrics := c.metrics
+	started := time.Now()
+	epochBefore := c.Epoch()
+	if metrics != nil {
+		metrics.ticks.Inc()
+		defer func() {
+			elapsed := time.Since(started)
+			metrics.tickLatency.ObserveDuration(elapsed)
+			if err != nil {
+				metrics.tickErrors.Inc()
+			}
+			if c.Epoch() > epochBefore {
+				metrics.failoverAttempts.Inc()
+				metrics.failoverLatency.ObserveDuration(elapsed)
+			}
+			for _, event := range events {
+				switch event.Kind {
+				case EventPromotion:
+					metrics.promotions.Inc()
+				case EventReconfigured, EventRejoined:
+					metrics.reconfigurations.Inc()
+				}
+			}
+		}()
+	}
+
 	if now.IsZero() {
 		now = time.Now()
 	}
 
 	results := make(map[string]map[string]probeResult, len(c.monitorIDs))
-	events := make([]Event, 0)
+	events = make([]Event, 0)
 	for _, monitorID := range c.monitorIDs {
 		monitor := c.monitors[monitorID]
 		results[monitorID] = make(map[string]probeResult, len(c.nodeIDs))
 		for _, nodeID := range c.nodeIDs {
-			status, err := c.probe(ctx, monitorID, c.nodes[nodeID])
-			results[monitorID][nodeID] = probeResult{status: status, err: err}
-			before, after := monitor.observe(now, nodeID, status, err)
+			probeStarted := time.Now()
+			if metrics != nil {
+				metrics.probes.Inc()
+			}
+			status, probeErr := c.probe(ctx, monitorID, c.nodes[nodeID])
+			if metrics != nil {
+				metrics.probeLatency.ObserveDuration(time.Since(probeStarted))
+				if probeErr != nil {
+					metrics.probeFailures.Inc()
+				}
+			}
+			results[monitorID][nodeID] = probeResult{status: status, err: probeErr}
+			before, after := monitor.observe(now, nodeID, status, probeErr)
 			if !before.SubjectiveDown && after.SubjectiveDown {
 				events = append(events, Event{Kind: EventSubjectiveDown, MonitorID: monitorID, NodeID: nodeID})
 			}
@@ -278,9 +317,9 @@ func (c *Controller) Tick(ctx context.Context, now time.Time) ([]Event, error) {
 	downVoters := c.subjectiveDownVoters(primaryID)
 	if len(downVoters) < c.cfg.Quorum {
 		c.setObjectiveDown(primaryID, false)
-		repairEvents, err := c.repairTopology(ctx, results, primaryID)
+		repairEvents, repairErr := c.repairTopology(ctx, results, primaryID)
 		events = append(events, repairEvents...)
-		return events, err
+		return events, repairErr
 	}
 
 	if c.setObjectiveDown(primaryID, true) {
@@ -291,21 +330,31 @@ func (c *Controller) Tick(ctx context.Context, now time.Time) ([]Event, error) {
 		})
 	}
 
-	candidateID, err := c.chooseCandidate(results, primaryID)
-	if err != nil {
-		return events, err
+	candidateID, candidateErr := c.chooseCandidate(results, primaryID)
+	if candidateErr != nil {
+		return events, candidateErr
 	}
 	leaderID := downVoters[0]
 	epoch := c.nextEpoch()
 	events = append(events, Event{Kind: EventElection, MonitorID: leaderID, NodeID: candidateID, Epoch: epoch})
 
 	candidate := c.nodes[candidateID]
-	if err := candidate.Promote(ctx); err != nil {
-		return events, fmt.Errorf("sentinel: epoch %d promotion of %s failed: %w", epoch, candidateID, err)
+	if promoteErr := candidate.Promote(ctx); promoteErr != nil {
+		return events, fmt.Errorf("sentinel: epoch %d promotion of %s failed: %w", epoch, candidateID, promoteErr)
 	}
-	promoted, err := candidate.Probe(ctx)
-	if err != nil {
-		return events, fmt.Errorf("sentinel: promoted node %s could not be probed: %w", candidateID, err)
+	probeStarted := time.Now()
+	if metrics != nil {
+		metrics.probes.Inc()
+	}
+	promoted, probeErr := candidate.Probe(ctx)
+	if metrics != nil {
+		metrics.probeLatency.ObserveDuration(time.Since(probeStarted))
+		if probeErr != nil {
+			metrics.probeFailures.Inc()
+		}
+	}
+	if probeErr != nil {
+		return events, fmt.Errorf("sentinel: promoted node %s could not be probed: %w", candidateID, probeErr)
 	}
 	if promoted.Role != RolePrimary || promoted.ReplicationAddr == "" {
 		return events, fmt.Errorf("sentinel: promoted node %s did not expose primary replication endpoint", candidateID)
@@ -320,8 +369,8 @@ func (c *Controller) Tick(ctx context.Context, now time.Time) ([]Event, error) {
 		if c.currentUpVotes(results, nodeID) < c.cfg.Quorum {
 			continue
 		}
-		if err := c.nodes[nodeID].Follow(ctx, promoted.ReplicationAddr); err != nil {
-			reconfigureErrs = append(reconfigureErrs, fmt.Errorf("%s follow %s: %w", nodeID, candidateID, err))
+		if followErr := c.nodes[nodeID].Follow(ctx, promoted.ReplicationAddr); followErr != nil {
+			reconfigureErrs = append(reconfigureErrs, fmt.Errorf("%s follow %s: %w", nodeID, candidateID, followErr))
 			continue
 		}
 		events = append(events, Event{Kind: EventReconfigured, NodeID: nodeID, Epoch: epoch, Detail: "follow " + candidateID})
