@@ -21,25 +21,21 @@ import (
 )
 
 func (s *Server) startReplication(ctx context.Context) error {
-	switch s.cfg.ReplicationRole {
+	s.replControlMu.Lock()
+	s.replRootCtx = ctx
+	role := s.replRole
+	upstream := s.replUpstream
+	s.replControlMu.Unlock()
+
+	switch role {
 	case config.ReplicationStandalone:
 		return nil
 	case config.ReplicationPrimary:
-		listener, err := net.Listen("tcp", s.cfg.ReplicationAddr)
-		if err != nil {
-			return fmt.Errorf("listen replication: %w", err)
-		}
-		s.stateMu.Lock()
-		s.replListener = listener
-		s.replAddr = listener.Addr()
-		s.stateMu.Unlock()
-		go s.serveReplicationPrimary(ctx, listener)
-		return nil
+		return s.activatePrimary(ctx)
 	case config.ReplicationReplica:
-		go s.runReplicaLoop(ctx)
-		return nil
+		return s.activateReplica(ctx, upstream)
 	default:
-		return fmt.Errorf("unsupported replication role %q", s.cfg.ReplicationRole)
+		return fmt.Errorf("unsupported replication role %q", role)
 	}
 }
 
@@ -50,9 +46,11 @@ func (s *Server) ReplicationAddr() net.Addr {
 }
 
 func (s *Server) ReplicationState() (role config.ReplicationRole, id string, offset int64) {
-	role = s.cfg.ReplicationRole
-	if role == config.ReplicationPrimary && s.replPrimary != nil {
-		return role, s.replPrimary.ID(), s.replPrimary.Offset()
+	role = s.currentReplicationRole()
+	if role == config.ReplicationPrimary {
+		if primary := s.currentReplicationPrimary(); primary != nil {
+			return role, primary.ID(), primary.Offset()
+		}
 	}
 	s.replStateMu.Lock()
 	defer s.replStateMu.Unlock()
@@ -60,10 +58,11 @@ func (s *Server) ReplicationState() (role config.ReplicationRole, id string, off
 }
 
 func (s *Server) ReplicationStats() replication.Stats {
-	if s.replPrimary == nil {
+	primary := s.currentReplicationPrimary()
+	if primary == nil || s.currentReplicationRole() != config.ReplicationPrimary {
 		return replication.Stats{}
 	}
-	return s.replPrimary.Stats()
+	return primary.Stats()
 }
 
 // DisconnectReplicationLink is an educational diagnostic hook used by the
@@ -79,7 +78,7 @@ func (s *Server) DisconnectReplicationLink() error {
 	return conn.Close()
 }
 
-func (s *Server) serveReplicationPrimary(ctx context.Context, listener net.Listener) {
+func (s *Server) serveReplicationPrimary(ctx context.Context, listener net.Listener, primary *replication.Primary) {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -89,11 +88,11 @@ func (s *Server) serveReplicationPrimary(ctx context.Context, listener net.Liste
 			s.logger.Warn("replication accept failed", "error", err)
 			continue
 		}
-		go s.handleReplicaConnection(ctx, conn)
+		go s.handleReplicaConnection(ctx, conn, primary)
 	}
 }
 
-func (s *Server) handleReplicaConnection(ctx context.Context, conn net.Conn) {
+func (s *Server) handleReplicaConnection(ctx context.Context, conn net.Conn, primary *replication.Primary) {
 	defer conn.Close()
 	closed := make(chan struct{})
 	defer close(closed)
@@ -121,10 +120,10 @@ func (s *Server) handleReplicaConnection(ctx context.Context, conn net.Conn) {
 	}
 
 	writer := resp.NewWriter(conn)
-	if frames, current, sub, ok := s.replPrimary.SubscribeFrom(argv[1], requestedOffset); ok {
-		defer s.replPrimary.Unsubscribe(sub)
-		s.replPrimary.RecordPartialSync()
-		if err := writer.WriteValue(resp.SimpleString(fmt.Sprintf("CONTINUE %s %d", s.replPrimary.ID(), current))); err != nil {
+	if frames, current, sub, ok := primary.SubscribeFrom(argv[1], requestedOffset); ok {
+		defer primary.Unsubscribe(sub)
+		primary.RecordPartialSync()
+		if err := writer.WriteValue(resp.SimpleString(fmt.Sprintf("CONTINUE %s %d", primary.ID(), current))); err != nil {
 			return
 		}
 		for _, frame := range frames {
@@ -145,20 +144,20 @@ func (s *Server) handleReplicaConnection(ctx context.Context, conn net.Conn) {
 	// Establish snapshot + stream boundary while ordinary writes/EXEC are blocked.
 	s.persistenceMu.Lock()
 	entries, snapshotErr := snapshotter.Snapshot()
-	id, baseOffset, sub := s.replPrimary.SubscribeAtCurrent()
+	id, baseOffset, sub := primary.SubscribeAtCurrent()
 	s.persistenceMu.Unlock()
 	if snapshotErr != nil {
-		s.replPrimary.Unsubscribe(sub)
+		primary.Unsubscribe(sub)
 		_ = writer.WriteValue(resp.Error("ERR snapshot failed"))
 		return
 	}
-	defer s.replPrimary.Unsubscribe(sub)
+	defer primary.Unsubscribe(sub)
 
 	payload, err := json.Marshal(entries)
 	if err != nil {
 		return
 	}
-	s.replPrimary.RecordFullSync()
+	primary.RecordFullSync()
 	if err := writer.WriteValue(resp.SimpleString(fmt.Sprintf("FULLRESYNC %s %d", id, baseOffset))); err != nil {
 		return
 	}
@@ -184,10 +183,10 @@ func (s *Server) streamReplicationFrames(ctx context.Context, writer *resp.Write
 	}
 }
 
-func (s *Server) runReplicaLoop(ctx context.Context) {
+func (s *Server) runReplicaLoop(ctx context.Context, upstream string) {
 	for ctx.Err() == nil {
-		if err := s.followPrimaryOnce(ctx); err != nil && ctx.Err() == nil {
-			s.logger.Warn("replication link lost", "error", err)
+		if err := s.followPrimaryOnce(ctx, upstream); err != nil && ctx.Err() == nil {
+			s.logger.Warn("replication link lost", "upstream", upstream, "error", err)
 		}
 		timer := time.NewTimer(s.cfg.ReplicationReconnectDelay)
 		select {
@@ -199,9 +198,9 @@ func (s *Server) runReplicaLoop(ctx context.Context) {
 	}
 }
 
-func (s *Server) followPrimaryOnce(ctx context.Context) error {
+func (s *Server) followPrimaryOnce(ctx context.Context, upstream string) error {
 	dialer := net.Dialer{}
-	conn, err := dialer.DialContext(ctx, "tcp", s.cfg.ReplicaOf)
+	conn, err := dialer.DialContext(ctx, "tcp", upstream)
 	if err != nil {
 		return err
 	}
@@ -314,6 +313,9 @@ func (s *Server) applyReplicationPayload(payload []byte) error {
 
 	s.persistenceMu.Lock()
 	defer s.persistenceMu.Unlock()
+	if s.currentReplicationRole() != config.ReplicationReplica {
+		return errors.New("replication payload received after node stopped being a replica")
+	}
 
 	transaction := strings.ToUpper(commands[0][0]) == "MULTI"
 	if transaction {
@@ -362,7 +364,11 @@ func decodeReplicationCommands(payload []byte) ([][]string, error) {
 }
 
 func (s *Server) replicateCommandsLocked(commands [][]string, transaction bool) {
-	if s.replPrimary == nil || len(commands) == 0 {
+	if s.currentReplicationRole() != config.ReplicationPrimary || len(commands) == 0 {
+		return
+	}
+	primary := s.currentReplicationPrimary()
+	if primary == nil {
 		return
 	}
 	var payload []byte
@@ -375,7 +381,7 @@ func (s *Server) replicateCommandsLocked(commands [][]string, transaction bool) 
 	if transaction {
 		payload = append(payload, resp.EncodeCommand([]string{"EXEC"})...)
 	}
-	s.replPrimary.Append(payload)
+	primary.Append(payload)
 }
 
 func readReplicationSimpleString(reader *bufio.Reader) (string, error) {
