@@ -232,6 +232,9 @@ func (s *Server) executeClientCommand(session *clientSession, argv []string) []r
 		session.queue = nil
 		return []resp.Value{resp.SimpleString("OK")}
 	case "EXEC":
+		if len(argv) != 1 {
+			return []resp.Value{resp.Error("ERR wrong number of arguments for 'exec' command")}
+		}
 		return []resp.Value{s.execTransaction(session)}
 	case "DISCARD":
 		if len(argv) != 1 {
