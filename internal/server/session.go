@@ -274,7 +274,7 @@ func (s *Server) executeClientCommand(session *clientSession, argv []string) []r
 		if _, err := s.registry.Validate(argv); err != nil {
 			session.dirty = true
 			session.mu.Unlock()
-			return []resp.Value{resp.Error(strings.TrimPrefix(err.Error(), "ERR "))}
+			return []resp.Value{resp.Error(err.Error())}
 		}
 		queued := append([]string(nil), argv...)
 		session.queue = append(session.queue, queued)
