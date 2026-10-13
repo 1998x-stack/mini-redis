@@ -44,10 +44,10 @@ func NullBulkString() Value       { return Value{Type: NullBulkStringType} }
 func Array(values []Value) Value  { return Value{Type: ArrayType, Array: values} }
 func NullArray() Value            { return Value{Type: NullArrayType} }
 
-func Null() Value                   { return Value{Type: NullType} }
-func Boolean(v bool) Value          { return Value{Type: BooleanType, Bool: v} }
-func Double(v float64) Value        { return Value{Type: DoubleType, Float: v} }
-func BigNumber(v string) Value      { return Value{Type: BigNumberType, Str: v} }
+func Null() Value              { return Value{Type: NullType} }
+func Boolean(v bool) Value     { return Value{Type: BooleanType, Bool: v} }
+func Double(v float64) Value   { return Value{Type: DoubleType, Float: v} }
+func BigNumber(v string) Value { return Value{Type: BigNumberType, Str: v} }
 func Verbatim(format, text string) Value {
 	return Value{Type: VerbatimStringType, Format: format, Str: text}
 }
