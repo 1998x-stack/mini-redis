@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/1998x-stack/mini-redis/internal/command"
+	corecommand "github.com/1998x-stack/mini-redis/internal/command"
 	"github.com/1998x-stack/mini-redis/internal/config"
 	"github.com/1998x-stack/mini-redis/internal/resp"
 	"github.com/1998x-stack/mini-redis/internal/server"
@@ -42,14 +42,14 @@ func main() {
 	defer replica.close()
 
 	wait("FULLRESYNC convergence", func() bool {
-		return command(replica.srv.Addr().String(), "GET", "seed") == "1"
+		return sendCommand(replica.srv.Addr().String(), "GET", "seed") == "1"
 	})
 	printState("after initial sync", primary.srv, replica.srv)
 	fmt.Printf("sync counters: %+v  <- FULLRESYNC happened\n", primary.srv.ReplicationStats())
 
 	mustCommand(primary.srv.Addr().String(), "SET", "live", "2")
 	wait("live propagation", func() bool {
-		return command(replica.srv.Addr().String(), "GET", "live") == "2"
+		return sendCommand(replica.srv.Addr().String(), "GET", "live") == "2"
 	})
 	fmt.Println("live SET propagated without another snapshot")
 
@@ -59,12 +59,12 @@ func main() {
 	mustCommand(primary.srv.Addr().String(), "SET", "during-gap", "3")
 	wait("CONTINUE partial resync", func() bool {
 		return primary.srv.ReplicationStats().PartialSyncs >= 1 &&
-			command(replica.srv.Addr().String(), "GET", "during-gap") == "3"
+			sendCommand(replica.srv.Addr().String(), "GET", "during-gap") == "3"
 	})
 	printState("after reconnect", primary.srv, replica.srv)
 	fmt.Printf("sync counters: %+v  <- CONTINUE used retained backlog\n", primary.srv.ReplicationStats())
 
-	readonly := command(replica.srv.Addr().String(), "SET", "local-write", "blocked")
+	readonly := sendCommand(replica.srv.Addr().String(), "SET", "local-write", "blocked")
 	fmt.Printf("replica direct write -> %s\n", readonly)
 }
 
@@ -82,8 +82,8 @@ func baseConfig() config.Config {
 }
 
 func start(cfg config.Config) *runningServer {
-	registry := command.NewRegistry()
-	command.RegisterCore(registry)
+	registry := corecommand.NewRegistry()
+	corecommand.RegisterCore(registry)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv, err := server.New(cfg, versionedmemory.New(store.RealClock{}), registry, logger)
 	if err != nil {
@@ -131,13 +131,13 @@ func shortID(id string) string {
 }
 
 func mustCommand(addr string, args ...string) {
-	result := command(addr, args...)
+	result := sendCommand(addr, args...)
 	if strings.HasPrefix(result, "error(") {
 		panic(result)
 	}
 }
 
-func command(addr string, args ...string) string {
+func sendCommand(addr string, args ...string) string {
 	conn, err := net.DialTimeout("tcp", addr, time.Second)
 	if err != nil {
 		return "error(" + err.Error() + ")"
