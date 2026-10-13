@@ -11,9 +11,9 @@ v0.5  logical snapshots / RDB / AOF rewrite
 v0.6  maxmemory / expiration vs eviction / sampled LRU-LFU
 v0.7  WATCH / MULTI-EXEC / PubSub
 v0.8  replication / full sync / repl-id+offset / backlog / partial resync
-v0.9  SDOWN / ODOWN / epoch / promotion / topology repair              ← current
-v0.10 Cluster / 16384 hash slots / MOVED / ASK / migration             ← next
-v0.11 RESP3
+v0.9  SDOWN / ODOWN / epoch / promotion / topology repair
+v0.10 16384 slots / MOVED / ASK / ASKING / migration / bounded gossip ← current
+v0.11 RESP3 / negotiation / richer types / push                            ← next
 v0.12 observability / profiling
 ```
 
