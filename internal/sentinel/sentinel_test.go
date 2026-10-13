@@ -63,8 +63,8 @@ func (n *fakeNode) snapshot() NodeStatus {
 }
 
 type faultMatrix struct {
-	mu    sync.RWMutex
-	down  map[string]map[string]bool
+	mu   sync.RWMutex
+	down map[string]map[string]bool
 }
 
 func newFaultMatrix() *faultMatrix {
