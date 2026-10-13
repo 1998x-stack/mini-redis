@@ -29,5 +29,6 @@ jobs:
       - run: make sentinel-demo
       - run: make cluster-demo
       - run: make resp3-demo
+      - run: make observability-demo
       - run: make smoke
       - run: NETWORK_ENGINE=legacy PORT=16380 make smoke
