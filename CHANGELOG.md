@@ -1,47 +1,46 @@
 # Changelog
 
+## v0.4.0
+
+Architecture milestone: make Redis logical data types and adaptive physical encodings explicit.
+
+- add List, Hash, Set and Sorted Set logical object types;
+- add `listpack`, `quicklist`, `hashtable`, `intset` and `skiplist` teaching encodings;
+- add a span-aware probabilistic SkipList with deterministic `(score, member)` ordering;
+- add List commands: `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LLEN`, `LRANGE`;
+- add Hash commands: `HSET`, `HGET`, `HDEL`, `HLEN`, `HGETALL`;
+- add Set commands: `SADD`, `SREM`, `SISMEMBER`, `SMEMBERS`, `SCARD`;
+- add ZSet commands: `ZADD`, `ZSCORE`, `ZRANK`, `ZRANGE`, `ZREM`;
+- add Redis-style `WRONGTYPE` checks;
+- keep collection mutations atomic inside Store and preserve TTL metadata;
+- delete key + expiry when a collection becomes empty;
+- add one-way compact→general encoding conversions with an educational threshold of eight entries;
+- add `make encodings-demo` and collection-aware smoke tests for both reactor and legacy engines;
+- keep AOF representation command-oriented and independent of physical encodings.
+
 ## v0.3.0
 
 Architecture milestone: make Redis' central dictionary and object encoding visible.
 
-- add generic educational `internal/dict` with explicit power-of-two buckets and separate chaining;
-- add injectable hash-function boundary and deterministic FNV-1a reference hasher;
-- add `ht[0]` / `ht[1]` resize state and explicit `rehashIndex`;
-- add bounded entry-level incremental rehash: one work unit moves at most one entry or skips one empty bucket;
-- add grow/shrink policy and load-factor tracking through dictionary stats;
+- add generic educational `internal/dict` with explicit buckets and separate chaining;
+- add `ht[0]` / `ht[1]`, load-factor resize policy and bounded entry-level incremental rehash;
 - replace keyspace and expiry Go maps with independent Dict instances;
-- add opportunistic rehash on dictionary operations and timer-driven rehash maintenance;
-- add `-rehash-work-per-cycle` policy;
-- evolve `store.Object` into logical `Type` + physical `Encoding` + payload;
-- add raw and canonical-int String encodings;
-- add `OBJECT ENCODING` teaching command;
-- add forced-collision `make rehash-demo`;
-- add dictionary benchmarks and randomized reference-model tests;
-- verify AOF replay across multiple dictionary resizes;
-- preserve v0.2 reactor/legacy networking and v0.1 TTL/AOF semantics.
+- add timer-driven + opportunistic rehash;
+- evolve Object into logical `Type` + physical `Encoding` + payload;
+- add raw/canonical-int String encodings and `OBJECT ENCODING`;
+- add forced-collision rehash demo and randomized reference-model tests.
 
 ## v0.2.0
 
-Architecture milestone: replace one blocking execution context per client with a readiness-driven event loop.
-
-- add Poller abstraction + Linux epoll implementation;
-- add nonblocking listener/client fds;
-- add per-client input/output buffers;
-- add incremental RESP parsing, pipelining and partial writes;
-- add output/input buffer ceilings and slow-client isolation;
-- move active expiry into reactor time events;
-- add idle cleanup and wake-pipe shutdown;
-- retain `legacy` network engine for controlled comparison;
-- add dual-engine smoke tests and comparison benchmark harness.
+- add Poller abstraction + Linux epoll reactor;
+- add nonblocking client buffers, pipelines, partial writes and backpressure;
+- add event-loop timers and wake-pipe shutdown;
+- retain legacy transport for controlled comparison.
 
 ## v0.1.0
 
-Initial educational Redis vertical slice.
-
-- RESP2 request parsing and response encoding;
-- table-driven command registry;
-- String commands and TTL;
-- lazy + active expiration;
-- RESP-formatted AOF with replay and fsync policies;
-- relative TTL persisted as absolute deadline;
-- goroutine-per-client reference server.
+- RESP2 request/response path;
+- table-driven commands and String Store;
+- TTL lazy + active expiration;
+- RESP-formatted AOF, replay and fsync policies;
+- goroutine-per-client reference transport.

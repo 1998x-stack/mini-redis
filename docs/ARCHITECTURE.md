@@ -1,199 +1,145 @@
-# Architecture — v0.3
+# Architecture — v0.4
 
-## 1. Architectural goal
-
-v0.3 keeps the v0.2 event loop and public String/TTL/AOF behavior, but replaces the memory engine's opaque Go maps with a visible Redis-like dictionary.
+## 1. Current stack
 
 ```text
-redis-cli
-   ↓
-RESP / reactor
-   ↓
+redis-cli / client
+      ↓
+RESP2 + reactor/legacy transport
+      ↓
 command.Registry
-   ↓
+      ↓
 store.Store
-   ↓
+      ↓
 versionedmemory.Memory
-   ├── data    Dict[Object]
-   └── expires Dict[time.Time]
-   ↓
-successful mutation
-   ↓
-AOF
+      ├── keyspace Dict[string → Object]
+      └── expires  Dict[string → deadline]
+                    │
+                    ▼
+            Object{Type, Encoding, payload}
 ```
 
-Command code still knows only the Store interface. Dictionary mechanics remain a storage implementation detail.
+v0.4 adds complexity below the Object boundary without coupling protocol or networking to concrete representations.
 
-## 2. Dict structure
+## 2. Logical type vs physical encoding
 
-Each table is an array of bucket-chain heads:
+A Redis-style object has two separate questions:
 
 ```text
-buckets
- [0] ─► entry(key,value) ─► entry ─► nil
- [1] ─► nil
- [2] ─► entry ─► nil
+What operations are legal?      → Type
+How is the value represented?   → Encoding
 ```
 
-Separate chaining makes collisions explicit without introducing open-addressing tombstones as a second lesson. A `Hasher` boundary keeps the algorithm replaceable; deterministic FNV-1a is the educational default, not an attempt to match Redis' exact hash implementation.
-
-Power-of-two sizes make bucket selection visible:
+Current matrix:
 
 ```text
-bucket = hash & (size - 1)
+String : int | raw
+List   : listpack → quicklist
+Hash   : listpack → hashtable
+Set    : intset   → hashtable
+ZSet   : listpack → skiplist (+ member-score Dict)
 ```
 
-## 3. Two hash tables during rehash
+A command checks logical type; internal methods choose representation-specific algorithms.
 
-A Dict owns `ht[0]`, `ht[1]` and `rehashIndex`.
+## 3. List
 
-Stable:
+Small lists use a contiguous slice. It has excellent conceptual locality and makes compact storage visible. Above the educational threshold it becomes a chunked doubly-linked quicklist:
 
 ```text
-ht[0] = live table
-ht[1] = empty
-rehashIndex = -1
+node [a b c d] ⇄ node [e f g h] ⇄ node [i ...]
 ```
 
-Rehashing:
+Each node stores a small contiguous chunk rather than one heap node per element. This demonstrates why Redis moved beyond a naive linked list.
+
+## 4. Hash
+
+Small hashes use a field/value array. Lookup is linear but memory structure is compact and simple. Above the threshold fields are copied into v0.3's custom incremental `Dict`.
 
 ```text
-              old/current                       target
-              ht[0]                             ht[1]
-       ┌────────────────┐                ┌────────────────────┐
-       │ bucket 0       │                │ bucket 0           │
-       │ bucket 1       │    migrate     │ bucket 1           │
-       │ ...            │ ─────────────► │ ...                │
-       └────────────────┘                └────────────────────┘
-                 ▲
-           rehashIndex
+small: [f1,v1,f2,v2,...]
+              ↓ upgrade
+large: Dict[field → value]
 ```
 
-Lookups search both. New keys go to `ht[1]`. Existing keys update the table that already owns them. That owner rule prevents duplicate logical keys during migration.
+The public `HGET/HSET` behavior is unchanged across the transition.
 
-## 4. Entry-level incremental migration
+## 5. Set
 
-Moving one whole bucket is not strongly bounded when a collision chain is long. v0.3 defines one work unit as:
+If every member is canonical integer text, the compact representation stores sorted `int64` values:
 
 ```text
-non-empty source bucket -> move ONE head entry
-empty source bucket     -> advance rehashIndex once
+[1, 2, 7, 19]
 ```
 
-Thus `RehashStep(N)` consumes at most `N` migration/scan units. A chain `A -> B -> C -> D` requires four entry-migration units. This makes the event-loop maintenance budget directly inspectable.
+A non-canonical member such as `"01"` cannot be collapsed to integer `1` without changing identity, so the Set upgrades to a string-key Dict. Size can also trigger the upgrade.
 
-## 5. Rehash scheduling
+## 6. Sorted Set
 
-Two mechanisms make progress.
-
-### Opportunistic
-
-`Dict.Get`, `Set` and `Delete` each attempt one work unit before the normal operation.
-
-### Time-event maintenance
-
-The existing maintenance point becomes:
+Small ZSets use a sorted slice. Large ZSets combine:
 
 ```text
-maintenance timer
-   ├── ExpireDue(sample)
-   └── RehashStep(work budget)
+Dict[member → score]
+        +
+SkipList[(score, member) ordered]
 ```
 
-The server depends only on optional `store.RehashStepper`; Store depends on Dict; Dict never imports server/runtime code.
+The Dict answers membership/score lookup efficiently. The SkipList answers order/rank traversal. Updating a member's score deletes the old ordered node and inserts the new one.
 
-## 6. Grow / shrink policy
+### SkipList spans
 
-Reference policy:
+Each forward link stores a span. Traversing upper levels accumulates skipped element counts, allowing rank calculation without scanning level 0 from the beginning.
+
+Tie-break order is `(score, member)` so every member has a deterministic rank.
+
+## 7. Encoding transition policy
+
+v0.4 uses `CompactMaxEntries = 8` to make conversions easy to observe:
 
 ```text
-grow:   used >= size
-         target = size * 2
-
-shrink: used / size < 10%
-         keep headroom
-         never below initial size
+compact encoding
+     │
+     ├── size > 8
+     └── content incompatible with compact form
+              ↓
+        general encoding
 ```
 
-Mechanism and policy are separate: policy determines *when/what size*; rehash determines *how migration happens*.
+Transitions are one-way. Downgrade/hysteresis is a later policy question.
 
-## 7. Iteration during migration
+## 8. Store atomicity and TTL
 
-A rehashing dictionary has live entries in two tables. `Range` visits both; its callback must not mutate that Dict. Memory paths that may delete expired keys first snapshot names with `Keys()` and mutate afterward.
+Command handlers never pull an Object out, mutate it independently and write it back. Collection mutations are Store operations performed while Memory owns its mutex.
 
-## 8. Keyspace and expiry metadata
+This preserves:
 
-The two conceptual dictionaries are preserved:
+- operation-level atomicity in the legacy shared-store engine;
+- serial command semantics in the reactor;
+- existing TTL metadata during collection mutations;
+- coordinated deletion of value and TTL when a collection becomes empty.
+
+## 9. WRONGTYPE
+
+A key has one logical type. Therefore:
 
 ```text
-keyspace Dict: key -> Object
-expires Dict:  key -> absolute deadline
+SET k hello
+LPUSH k x
 ```
 
-A persistent key exists only in the first; a volatile key exists in both. They may resize independently.
+returns `WRONGTYPE` rather than interpreting a String payload as a List. The error belongs to logical type validation, not physical encoding.
 
-## 9. Object type and encoding
+## 10. Persistence stays logical
 
-The keyspace value is now:
+AOF remains above physical encoding. It records commands and never serializes quicklist nodes, Dict buckets or SkipList levels. A restart may rebuild a physically different representation with the same logical state.
 
-```text
-Object
-  Type
-  Encoding
-  payload
-```
+v0.5 will add an RDB-like state snapshot and AOF rewrite, which will force the project to define a stable logical serialization boundary for every type.
 
-Current String representations:
-
-```text
-raw  -> string payload
-int  -> int64 payload
-```
-
-`NewString` uses `int` only for byte-for-byte canonical integer text. Therefore `"42"` may be encoded as int, while `"001"`, `"+1"` and `"-0"` remain raw. Commands use accessors rather than switching directly on Go payload types.
-
-This is the architectural bridge to v0.4, where one logical List/Hash/Set/ZSet can use multiple physical encodings.
-
-## 10. Atomicity and concurrency
-
-Memory still owns a mutex; Dict is deliberately not concurrency-safe. This keeps hashing/rehash separate from synchronization policy. Reactor commands remain serial as in v0.2, while the legacy goroutine engine safely shares the Store through the mutex.
-
-Because even `Get` may progress rehash or lazily expire a key, Memory uses its write lock for key access in v0.3.
-
-## 11. Persistence remains above representation
-
-AOF records logical commands, not buckets, object payload layout or `rehashIndex`.
-
-```text
-AOF SET key value
-      ↓ replay
-NewString(value)
-      ↓
-current encoding
-      ↓
-current Dict layout
-```
-
-Restart may reconstruct a different physical layout while preserving logical state. Integration tests replay enough keys to cross multiple resizes and verify the restored state.
-
-## 12. Reference demo
+## 11. Demos
 
 ```bash
 make rehash-demo
+make encodings-demo
 ```
 
-The example forces every key into one bucket and prints the state after each `RehashStep(1)`, making the bounded-work invariant visible.
-
-## 13. Next layer
-
-v0.4 uses the Object/Encoding boundary for collections:
-
-```text
-logical object
-      ↓
-encoding choice
-      ↓
-compact representation OR general representation
-```
-
-Only after this boundary exists does it make sense to teach listpack/quicklist-like structures, integer sets, hash representation conversion and ZSet's dictionary + skip-list pairing.
+The first exposes v0.3 dictionary migration; the second shows each v0.4 encoding transition.
