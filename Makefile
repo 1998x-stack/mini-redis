@@ -1,7 +1,7 @@
 APP := mini-redis-server
 PKG := ./...
 
-.PHONY: all build test fmt vet run clean smoke benchmark benchmark-dict rehash-demo encodings-demo persistence-demo eviction-demo session-demo replication-demo sentinel-demo cluster-demo resp3-demo
+.PHONY: all build test fmt vet run clean smoke benchmark benchmark-dict benchmark-observability rehash-demo encodings-demo persistence-demo eviction-demo session-demo replication-demo sentinel-demo cluster-demo resp3-demo observability-demo
 
 all: fmt vet test build
 
@@ -30,6 +30,9 @@ benchmark: build
 benchmark-dict:
 	go test -run '^$$' -bench 'Benchmark(Dict|GoMap)' ./internal/dict
 
+benchmark-observability:
+	go test -run '^$$' -bench 'Benchmark(Counter|Histogram)' -benchmem ./internal/observability
+
 rehash-demo:
 	go run ./examples/rehash
 
@@ -57,5 +60,8 @@ cluster-demo:
 resp3-demo:
 	go run ./examples/resp3
 
+observability-demo:
+	go run ./examples/observability
+
 clean:
-	rm -rf bin coverage.out *.aof *.mrdb
+	rm -rf bin coverage.out *.aof *.mrdb cpu.pprof mem.pprof
