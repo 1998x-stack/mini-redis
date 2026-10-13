@@ -2,174 +2,268 @@
 
 ## 1. Identity
 
-- Active development branch: `v0.8`
+- Branch: `v0.8`
 - Previous snapshot: `v0.7`
-- Target version label: `v0.8.0`
-- Theme: full sync, ordered mutation propagation, replication offsets/backlog, partial resynchronization
+- Version label: `v0.8.0`
+- Theme: full sync, canonical mutation propagation, replication identity/offset, bounded backlog and partial resynchronization
 
-## 2. Primary question
+## 2. Delta from v0.7
 
-**How can a replica establish one consistent base state, follow exactly the primary's accepted logical mutation order, and reconnect using only the missing suffix when that suffix is still retained?**
+v0.7 made one client connection stateful. v0.8 makes one Redis process part of a **multi-process state topology**.
 
-v0.8 adds a replication plane beside the existing client plane:
-
-```text
-client RESP connections
-        ↓
-server command/session semantics
-        ↓
-Server.persistenceMu
-        ├── AOF ordering
-        └── canonical replication feed
-                 ↓
-          replication.Primary
-          ├── repl-id
-          ├── byte offset
-          ├── bounded frame backlog
-          └── live subscribers
-                 ↓
-         replication transport
-                 ↓
-               replica
-```
-
-The replication stream contains logical RESP reconstruction commands, not private Dict/Object memory layout.
-
-## 3. Roles
-
-v0.8 exposes three explicit roles:
-
-- `standalone`: no replication listener or upstream;
-- `primary`: accepts replica synchronization connections;
-- `replica`: connects to one configured primary and rejects client-side mutating commands.
-
-Replica persistence and local eviction policy are deliberately constrained in the first teaching version so the primary remains the source of mutation policy.
-
-## 4. Canonical replication stream
-
-The stream reuses the same logical mutation commands already produced for AOF reconstruction:
-
-- relative TTL becomes absolute `PEXPIREAT`;
-- eviction-generated `DEL` is included;
-- read-only / failed commands emit no replication bytes;
-- one normal accepted logical mutation becomes one replication frame;
-- one successful `EXEC` becomes one frame containing `MULTI ... EXEC`.
-
-Offsets count canonical RESP payload bytes. They do not count TCP framing bytes.
-
-## 5. Backlog invariant
-
-The backlog is bounded in bytes but evicts **whole replication frames** rather than arbitrary byte prefixes. Therefore a resumable offset always begins at a valid frame boundary.
+Before:
 
 ```text
-frame A     frame B      frame C
-[1..40]     [41..90]     [91..140]
-
-replica offset=90
-        ↓
-resume with frame C
+client → one server → one logical database
 ```
 
-If capacity pressure removes frame B, an offset inside/behind the removed history cannot partial-resync and must full-sync.
-
-## 6. Full synchronization boundary
-
-Primary full sync must establish:
+Now:
 
 ```text
-lock persistenceMu
-    ↓
-logical SnapshotEntry snapshot
-    ↓
-capture replication base offset
-    ↓
-attach live subscriber at that exact offset
-    ↓
-unlock
-    ↓
-transfer snapshot
-    ↓
-drain buffered post-snapshot frames
-    ↓
-continue live
+clients → primary
+            │
+            ├── logical snapshot base
+            └── ordered mutation frames
+                       ↓
+                    replica
 ```
 
-The subscriber is attached while the mutation-ordering lock is still held, so writes after the snapshot boundary cannot fall into a gap.
+The new problem is not networking alone. It is defining exactly where the base snapshot ends, where the suffix starts, how that suffix is named by offsets, and when a reconnect may safely avoid another full snapshot.
 
-The snapshot wire representation is logical `SnapshotEntry` data, never physical encodings.
+## 3. Implemented mechanism
 
-## 7. Partial resynchronization
+### Roles
 
-Replica reconnect request carries its known replication identity and last completely applied stream offset.
+- `standalone`
+- `primary`
+- `replica`
 
-Primary returns partial continuation only when:
+Primary has a replication listener. Replica follows one configured upstream and rejects direct mutating client commands.
 
-1. replication identity still matches;
-2. requested offset is a retained frame boundary;
-3. backlog contains every byte after that offset.
+### Canonical mutation feed
 
-Otherwise it falls back to full sync.
+The existing reconstruction form is reused:
 
-A new primary process generates a new replication identity, intentionally forcing full sync after primary restart in v0.8.
+- relative TTL → absolute `PEXPIREAT`;
+- eviction victims → `DEL`;
+- failed/read-only commands → no feed frame;
+- normal accepted mutation → one frame;
+- successful EXEC mutation set → one `MULTI ... EXEC` frame.
 
-## 8. Replica apply rules
+### Identity and offset
 
-- full snapshot is restored before any suffix frame is applied;
-- a frame is applied while holding `persistenceMu`;
-- `MULTI ... EXEC` feed frames apply as one non-interleaved unit;
-- replica offset advances only after a complete frame applies successfully;
-- replicated commands bypass the client READONLY gate but do not execute local eviction decisions;
-- absolute expiry deadlines preserve the primary's logical lifetime semantics;
-- client mutating commands on replicas return READONLY.
+- primary creates a fresh random repl-id on process creation;
+- byte offset counts canonical RESP mutation payload bytes only;
+- replica stores current repl-id and last completely applied byte offset in memory.
 
-## 9. Transport scope
+### Frame-aware backlog
 
-Client traffic keeps the v0.2 reactor/legacy engines. Replication uses a separate educational TCP connection so client event-loop mechanics do not obscure synchronization semantics.
+The backlog has a byte budget but drops complete oldest frames. Partial resync therefore starts only at valid logical frame boundaries.
 
-Handshake is Redis-inspired:
+An evicted frame does **not** automatically make its end offset unusable: a replica that already applied that frame may resume at its end if the next frame remains retained.
+
+### Full sync
+
+Under `Server.persistenceMu` the primary atomically:
+
+1. captures logical `SnapshotEntry[]`;
+2. records current replication offset;
+3. attaches a live subscriber at that offset.
+
+Only then does snapshot transfer begin. Post-boundary writes accumulate in/live through the attached subscriber, preventing a snapshot→stream gap.
+
+### Partial sync
+
+Replica sends:
 
 ```text
 PSYNC <repl-id-or-?> <offset>
-
-FULLRESYNC <new-id> <base-offset>
-  + logical snapshot payload
-  + live mutation frames
-
-or
-
-CONTINUE <id> <current-offset>
-  + retained backlog suffix
-  + live mutation frames
 ```
 
-Transport frames carry canonical RESP mutation payloads; replication offsets count the payload bytes only.
+Primary chooses:
 
-## 10. Required validation
+```text
+FULLRESYNC <id> <base-offset>
+```
 
-- backlog append/whole-frame eviction/boundary lookup;
-- matching identity + retained suffix → partial resync;
-- stale identity or wrapped backlog → full sync;
-- writes during snapshot transfer are delivered after the base snapshot;
-- replica converges after full sync;
-- disconnect/reconnect converges through partial resync;
-- transaction order/framing survives replication;
-- replica rejects direct mutating client commands;
-- primary/replica tests run under `go test -race`;
-- deterministic replication demo distinguishes FULLRESYNC from CONTINUE.
+when identity/history cannot resume, or:
 
-## 11. Non-goals
+```text
+CONTINUE <id> <current-offset>
+```
+
+when the requested suffix is retained.
+
+Retained catch-up frames remain separate transport frames; they are not flattened into one byte blob, so transaction boundaries and offset commits remain explicit.
+
+### Replica apply
+
+Replica:
+
+1. installs full base snapshot before suffix frames;
+2. decodes canonical RESP payloads;
+3. applies each complete frame under `persistenceMu`;
+4. strips and validates `MULTI ... EXEC` transaction markers;
+5. updates key-version runtime metadata;
+6. advances offset only after complete frame success.
+
+Replication apply bypasses client READONLY, but replica client mutation requests do not.
+
+## 4. Critical invariants
+
+```text
+snapshot(baseOffset) + frames(baseOffset+1...) = primary logical order
+```
+
+And:
+
+- no primary mutation can occur between snapshot capture and subscriber attachment;
+- one canonical stream order drives both live replication and backlog history;
+- byte offsets never refer to transport envelope bytes;
+- resume happens only at complete-frame boundaries;
+- backlog wrap may force full sync but cannot create partial/corrupt apply;
+- stale repl-id forces full sync;
+- a replica never applies suffix before base state;
+- offset commits after frame success, not before;
+- EXEC is one replication frame;
+- private physical encodings never cross the replication boundary;
+- replicas do not independently evict keys in v0.8.
+
+## 5. Intentional simplifications
+
+- replica repl-id/offset is not durable across replica restart;
+- new primary process means new repl-id and therefore full sync;
+- replica local AOF is disabled;
+- replica maxmemory policy is disabled;
+- replication uses a separate teaching TCP listener instead of sharing reactor internals;
+- slow live subscribers are disconnected/recovered through reconnect rather than production-grade replication output-buffer management;
+- no ACK quorum / WAIT semantics;
+- no chained-replica or multi-primary model.
+
+## 6. Files that define the version
+
+Read in this order:
+
+```text
+internal/replication/backlog.go
+  ↓
+internal/replication/primary.go
+  ↓
+internal/server/replication.go
+  ↓
+internal/server/server.go
+  ↓
+internal/server/session.go
+  ↓
+internal/replication/*_test.go
+internal/server/replication_test.go
+examples/replication/main.go
+```
+
+## 7. Mechanism tests
+
+The version includes focused tests for:
+
+- frame offsets and complete-frame eviction;
+- earliest valid resume boundary;
+- oversized/non-retained frame behavior;
+- stale identity rejection;
+- atomic catch-up + live subscriber handoff;
+- full-sync convergence;
+- live propagation;
+- primary/replica repl-id and offset convergence;
+- replica READONLY behavior;
+- forced disconnect followed by CONTINUE catch-up;
+- backlog loss followed by FULLRESYNC fallback;
+- MULTI/EXEC replication framing.
+
+All server replication tests participate in `go test -race ./...`.
+
+## 8. Observable demo
+
+```bash
+make replication-demo
+```
+
+The demo starts an in-process primary and replica and visibly walks:
+
+```text
+initial FULLRESYNC
+       ↓
+live SET propagation
+       ↓
+forced replication-link disconnect
+       ↓
+primary write during gap
+       ↓
+CONTINUE from retained backlog
+       ↓
+matching repl-id/offset
+       ↓
+replica client write → READONLY
+```
+
+## 9. Validation gate
+
+Required exact-SHA validation:
+
+```bash
+gofmt -d .
+go vet ./...
+go test -race ./...
+go build ./cmd/mini-redis-server
+make rehash-demo
+make encodings-demo
+make persistence-demo
+make eviction-demo
+make session-demo
+make replication-demo
+make smoke
+NETWORK_ENGINE=legacy PORT=16380 make smoke
+```
+
+Before documentation freeze, the implemented replication code already passed this mechanism/race/demo stack. The final documentation/version SHA must pass the same complete CI again before `main` advances.
+
+## 10. Non-goals
 
 - no Sentinel health/quorum/election;
-- no automatic replica promotion;
-- no multi-primary;
-- no Cluster slots/MOVED/ASK;
-- no diskless production tuning claim;
-- no cross-process persistence of replication offset in v0.8.
+- no automatic primary promotion;
+- no Cluster/hash slots/MOVED/ASK;
+- no production protocol-compatibility claim;
+- no persistent replication metadata;
+- no diskless production tuning claim.
 
-## 12. Definition of Done
+## 11. Learning goal
 
-The exact v0.8 SHA must pass repository baseline validation plus replication-specific unit/integration/demo tests. Only then may `main` fast-forward to the same SHA.
+After v0.8 the reader should be able to explain why replication correctness requires all of these concepts together:
 
-## 13. Next version
+```text
+consistent base snapshot
++ ordered mutation stream
++ explicit stream identity
++ committed offset
++ retained reconnect history
++ full-sync fallback
+```
 
-v0.9 will build Sentinel-inspired failover on top of the replication topology established here: health observation, subjective/objective failure, quorum/election, promotion, and reconfiguration.
+Removing any one creates a different failure mode.
+
+## 12. Next version
+
+v0.9 builds Sentinel-inspired failover on top of this replication topology:
+
+```text
+health probes
+  ↓
+subjective down
+  ↓
+quorum-backed objective down
+  ↓
+election epoch
+  ↓
+replica selection / promotion
+  ↓
+replica reconfiguration
+```
+
+Sentinel must coordinate the v0.8 replication model, not replace it.
