@@ -62,93 +62,88 @@ Full sync from logical state, canonical mutation stream, repl-id/offset, frame-a
 Monitor-local SDOWN, quorum-backed ODOWN, failover epoch, deterministic candidate ranking, runtime promotion/demotion and topology repair.
 
 ### v0.10 — Cluster / hash slots
+16384 CRC16/XMODEM slots, hash tags, CROSSSLOT, MOVED, ASK/ASKING, logical SnapshotEntry migration, resumable partial migration and bounded topology dissemination.
+
+### v0.11 — RESP3
 
 Primary question:
 
-> How can multiple writable primaries partition one logical keyspace so every key has a deterministic slot/owner and clients receive explicit stable or migration-time routing information?
+> How can a connection negotiate richer response types and asynchronous Push frames without changing the storage, persistence, replication, failover or Cluster mechanisms underneath it?
 
 Implemented:
 
-- Redis-style 16384 logical slots;
-- CRC-16/XMODEM key hashing;
-- non-empty `{...}` hash-tag semantics;
-- slot ownership table separate from Store values;
-- node identity/address metadata;
-- routing gate before Store execution;
-- CROSSSLOT rejection for multi-key commands spanning slots;
-- stable wrong-owner `MOVED` responses;
-- explicit slot migration target state;
-- source-side existing-key execution during migration;
-- source-side missing-key `ASK` redirection;
-- target-side one-request `ASKING` authorization;
-- per-connection ASKING state on the cluster RESP endpoint;
-- resumable slot migration;
-- key transfer through logical `SnapshotEntry` rather than private Object encodings;
-- source `persistenceMu` held from export through target acknowledgement and source delete;
-- target reconstruction through existing command/AOF/replication publication path;
-- absolute TTL preservation across migration;
-- stable ownership switch only after all remaining source keys transfer;
-- bounded `GossipPage(start, limit)` topology dissemination;
-- explicit topology epochs with deterministic last-writer-wins merge policy;
-- real RESP/TCP cluster-aware endpoint via `Server.ServeCluster`;
-- unit, real-server and wire-level tests under `go test -race`;
-- deterministic `make cluster-demo`.
+- connection-local `Protocol2` / `Protocol3` state;
+- default RESP2 compatibility;
+- `HELLO 3` / `HELLO 2` negotiation;
+- HELLO metadata as logical Map with RESP2 flat-array downgrade;
+- richer `resp.Value` variants for Null, Boolean, Double, Big Number, Verbatim String, Map, Set and Push;
+- protocol-aware encoding shared by legacy and reactor transports;
+- explicit RESP2 downgrade for richer logical values;
+- response-view adaptation after command execution for HGETALL/SMEMBERS/SISMEMBER/ZSCORE;
+- Pub/Sub Push frames in RESP3 while retaining RESP2 array behavior;
+- ordinary commands while subscribed in RESP3 mode;
+- incremental nested RESP2/RESP3 value parser with bounded depth;
+- byte-boundary fragmentation tests;
+- Cluster endpoint HELLO negotiation while retaining MOVED/ASK/CROSSSLOT authorization order;
+- deterministic `make resp3-demo` using a real TCP session;
+- regression validation for every prior demo and both network engines.
 
 Critical invariants:
 
-- every routed key maps to exactly one slot;
-- non-empty equal hash tags map related keys to the same slot;
-- multi-key requests cannot cross slot boundaries silently;
-- stable wrong-owner routing uses MOVED;
-- migration-time temporary routing uses ASK;
-- ASKING grants exactly one subsequent request on one connection;
-- migration state is topology metadata, never Store payload state;
-- source does not delete before target import succeeds;
-- partial migration remains visibly in migration state and is resumable;
-- stable owner changes only after source has no remaining slot keys;
-- physical encodings never cross the migration boundary;
-- routing existence check and authorized execution share `Server.persistenceMu`;
-- bounded gossip does not imply consensus.
+- each connection starts RESP2;
+- HELLO changes only the current connection;
+- command requests and canonical mutation frames remain independent of client response protocol;
+- Store/SnapshotEntry/AOF/replication/topology never contain negotiated protocol state;
+- protocol adaptation occurs after command and Cluster semantics;
+- RESP3 cannot bypass wrong-owner routing;
+- asynchronous Pub/Sub delivery remains one mechanism; only its representation changes;
+- RESP2 wire behavior remains backward compatible;
+- incomplete nested RESP frames are never partially consumed.
 
 Intentional teaching simplifications:
 
-- cluster routing is exposed through an explicit v0.10 cluster endpoint/facade rather than silently changing the historical standalone endpoint;
-- topology epochs are memory-only;
-- merge is deterministic LWW, not distributed consensus;
-- no automatic coupling between Sentinel failover and cluster slot ownership;
-- no production Redis Cluster bus/protocol compatibility;
-- no fencing against conflicting topology writers;
-- no cluster MULTI/EXEC support in this version;
-- no production anti-entropy/failure detector.
+- not every RESP3 type or streamed aggregate is implemented;
+- no complete Redis HELLO AUTH/SETNAME option set;
+- no client tracking/invalidation Push subsystem;
+- no claim of edge-case production Redis protocol compatibility.
 
-## 3. v0.11 — RESP3
+## 3. v0.12 — Observability / performance
 
 ### Primary question
 
-**How can protocol negotiation and richer response types evolve without disturbing the command/storage/replication/cluster mechanism boundaries already established?**
+**Once every major Redis mechanism is explicit, how can we measure where latency, memory, queueing, durability cost, replication lag and topology work are actually spent?**
 
 ### Required implementation
 
-- HELLO-style protocol negotiation;
-- RESP3 scalar types useful to the current command subset;
-- map/set/container replies where they improve semantics;
-- push messages for Pub/Sub and future async notifications;
-- one connection protocol mode owned by session state;
-- backward-compatible RESP2 path;
-- parser/writer tests for fragmented inputs and nested containers;
-- both network engines validated;
-- deterministic RESP2-vs-RESP3 demo.
+- command counters and latency histograms;
+- per-network-engine connection/read/write/backpressure counters;
+- key expiration and eviction counters;
+- AOF/RDB operation duration/bytes/failure metrics;
+- replication full/partial sync counts, backlog state and replica lag;
+- Sentinel probe/failover timing and decisions;
+- Cluster redirect/migration/gossip counters and migration duration;
+- protocol-mode / RESP3 Push counters where useful;
+- an inspectable `INFO`/metrics-style snapshot that does not leak mutable internals;
+- repeatable benchmarks for command path, reactor vs legacy, Dict and selected end-to-end workloads;
+- pprof/profiling workflow and documentation;
+- explicit separation of measurement overhead from measured mechanisms;
+- deterministic observability/performance demo.
+
+### Critical invariants
+
+- instrumentation must not become business/database state;
+- metrics observation must not alter command semantics or mutation ordering;
+- counters must name their synchronization boundary;
+- benchmarks must report workload/configuration, not context-free numbers;
+- performance claims require repeatable evidence rather than anecdotes.
 
 ### Non-goals
 
-- no attempt to implement every Redis RESP3 command;
-- no protocol change that bypasses existing command semantics or cluster routing.
+- no production monitoring stack;
+- no promise that this educational implementation competes with Redis performance;
+- no optimization that hides or removes the mechanisms the project exists to teach.
 
-## 4. v0.12 — Observability / performance
-
-Command/session latency, reactor counters, expiration/eviction metrics, persistence/replication/failover/cluster migration timing, lag and repeatable profiling.
-
-## 5. Version completion rule
+## 4. Version completion rule
 
 ```text
 mechanism implemented
@@ -168,8 +163,8 @@ fast-forward main
 same SHA passes CI on main
 ```
 
-## 6. Current directive
+## 5. Current directive
 
-Freeze candidate: **v0.10 — 16384 slots, MOVED/ASK/ASKING, resumable logical key migration and bounded topology dissemination**.
+Freeze candidate: **v0.11 — RESP3 negotiation, richer views, RESP2 downgrade and Push messages**.
 
-Next milestone after exact-SHA validation: **v0.11 — RESP3**.
+Next milestone after exact-SHA validation: **v0.12 — Observability / Performance**.
