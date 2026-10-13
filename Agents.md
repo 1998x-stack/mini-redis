@@ -34,7 +34,7 @@ On `v0.x`: read `Agents.md`, then `version.md`, then subsystem docs/source/tests
 
 ## 3. Branch model
 
-`main` is always the newest validated integrated state. Version branches are educational snapshots.
+`main` is always the newest validated integrated state. Version branches are frozen educational snapshots.
 
 ```text
 main ───────────────────────────────► newest validated
@@ -45,7 +45,8 @@ main ─────────────────────────
  ├── v0.5 RDB/AOF rewrite
  ├── v0.6 maxmemory/eviction
  ├── v0.7 transactions/PubSub
- └── v0.8 replication
+ ├── v0.8 replication
+ └── v0.9 Sentinel-inspired HA
 ```
 
 Create a new version from current `main`. After Definition of Done, validate the exact version commit, fast-forward `main`, validate that same SHA on `main`, then freeze the version branch.
@@ -61,168 +62,150 @@ server coordination / persistenceMu
       ↓
 command registry / memory policy / Store
       ↓
-Object + Dict + TTL + collection encodings
-      ↓
-logical SnapshotEntry / canonical mutation commands
+logical state + canonical mutation commands
       ├── RDB/AOF
-      └── replication feed
+      └── v0.8 replication data plane
              ↓
-       repl-id / offset / backlog
+       primary / replicas
+             ↑
+             │ topology control only
+             │
+       v0.9 Sentinel plane
+       SDOWN → ODOWN → epoch
+       → promote → reconfigure
              ↓
-            replica
-             ↓
-      future Sentinel topology
+       future Cluster slots
 ```
 
 Rules:
 
-- RESP never depends on handlers;
+- RESP never depends on command handlers;
 - storage never imports network/server;
 - command handlers do not inspect private encoding payloads;
 - per-client transaction/subscription state never lives in Store;
-- Store owns atomic value/TTL invariants;
-- Dict/SkipList implement mechanisms, not command policy;
 - persistence serializes logical state/history, never unstable Go memory layout;
-- eviction heat and WATCH/session metadata never become persistence-format state;
-- replication consumes canonical logical mutation order, never private Object/Dict memory layout;
-- Sentinel must later monitor/reconfigure replication topology, not create another data-copy path.
+- replication consumes canonical logical mutation order, never private Object/Dict layout;
+- Sentinel monitors and reconfigures replication topology; it never becomes a second data-copy path;
+- future Cluster slot ownership must remain separate from ordinary value payloads.
 
 ## 5. Concurrency / atomicity
 
-- v0.1 legacy transport: one goroutine/client, Memory mutex.
-- v0.2+ reactor: client I/O/parse/output state belongs to one event-loop owner.
-- Memory mutex remains the Store synchronization boundary because legacy engine still shares it.
-- Collection read-modify-write is one Store operation.
-- From v0.5, `Server.persistenceMu` names the logical mutation + durability ordering boundary.
-- v0.6 keeps memory-pressure decision and eviction persistence inside that boundary.
-- v0.7 holds `persistenceMu` across WATCH validation and a complete EXEC sequence; maintenance/RDB capture share that boundary.
-- v0.8 uses the **same** `persistenceMu` order to publish replication frames and to capture full-sync snapshot + base offset + live-subscriber handoff.
-- AOF `Log.mu` owns the live descriptor, rewrite buffer and final descriptor swap.
-- `replication.Primary.mu` owns replication identity/backlog subscription handoff; backlog has its own internal lock but is always reached through a stable primary ordering path for live publication.
-- Never claim atomicity without naming the lock/file-system/protocol boundary that enforces it.
+- Memory mutex remains the Store synchronization boundary because both network engines share it.
+- `Server.persistenceMu` is the logical mutation-order boundary from v0.5 onward.
+- v0.7 holds it across WATCH validation + a complete EXEC.
+- v0.8 uses it for mutation publication and full-sync snapshot/offset/subscriber handoff.
+- v0.9 also uses it across runtime replication role transitions so a logical mutation cannot cross promotion/demotion halfway through.
+- `replControlMu` owns runtime role/upstream/current-primary identity.
+- role-specific contexts cancel obsolete replica-follow or primary-listen goroutines after a topology switch.
+- `replication.Primary.mu` owns repl-id/backlog/live-subscriber ordering.
+- Sentinel `Controller.tickMu` serializes one controller's failover/repair Tick operations.
+- monitor state has independent locks because SDOWN is monitor-local.
+- never claim atomicity without naming the lock, file-system or protocol boundary that enforces it.
 
 ## 6. Transaction/session rules
 
 - `MULTI` queues commands; it does not promise rollback;
-- queue-time command/arity errors dirty the transaction and cause `EXECABORT`;
-- execution-time errors remain individual EXEC result elements and do not undo successful siblings;
+- queue-time validation errors cause `EXECABORT`;
+- execution-time errors remain EXEC result elements without undoing successful siblings;
 - `WATCH` is optimistic conflict detection, not a lock;
-- write versions detect change-then-change-back conflicts;
-- existence recheck catches watched-key expiration;
-- `DISCARD` and successful/conflicted EXEC clear WATCH state;
-- transaction/session state is dropped on connection close;
-- AOF EXEC persistence uses `MULTI ... EXEC` framing;
-- v0.8 successful EXEC mutations also become one replication frame so live and catch-up replication cannot cut a transaction boundary.
+- successful EXEC mutations are one AOF transaction frame and one replication frame;
+- transaction/session state dies with the connection;
+- Pub/Sub subscriptions/messages remain ephemeral runtime state.
 
-The teaching subset intentionally rejects `PUBLISH`, subscription changes and `UNWATCH` inside MULTI. Do not silently widen semantics without tests/docs.
-
-## 7. Pub/Sub rules
-
-- subscriptions belong to `clientSession`, never keyspace objects;
-- the hub routes live messages but never persists them;
-- subscribed mode is an explicit connection role;
-- disconnect removes every channel membership;
-- delivery count means matched subscribed sessions, not durable acknowledgement;
-- Pub/Sub backlog/history is not implied.
-
-Do not confuse Pub/Sub with the v0.8 **replication backlog** or future Streams.
-
-## 8. Dictionary/object rules
-
-The custom Dict remains the canonical keyspace mechanism. Lookup/update/delete must work while rehashing; no logical duplicate may exist across `ht[0]/ht[1]`; one `RehashStep(N)` has bounded work.
-
-Logical Type and physical Encoding remain distinct:
-
-```text
-String : int/raw
-List   : listpack/quicklist
-Hash   : listpack/hashtable
-Set    : intset/hashtable
-ZSet   : listpack/skiplist
-```
-
-Commands validate Type, not payload implementation. Representation conversion preserves logical results and TTL. Persistence and replication never serialize private encoding structures.
-
-## 9. Persistence rules
+## 7. Persistence / memory rules
 
 Established invariants:
 
-- only successful logical mutations are appended to AOF;
-- relative TTL persists as an absolute deadline;
-- restart/replay must not resurrect expired state;
-- `SnapshotEntry` is the stable logical persistence boundary;
-- RDB-like files validate magic/version/length/checksum;
-- publication uses same-directory temp → file fsync → atomic rename → directory fsync;
-- failure before rename leaves the old target valid;
-- AOF rewrite emits logical reconstruction commands;
-- writes after the rewrite snapshot boundary enter the rewrite buffer;
-- AOF is authoritative at startup when enabled;
-- truncated final ordinary AOF frames are ignored under the explicit crash-tail policy;
-- AOF MULTI/EXEC frames apply only when closing EXEC is complete;
-- corrupt/incompatible complete persistence input fails startup.
+- only successful logical mutations enter AOF;
+- relative TTL becomes absolute deadline across persistence/replication;
+- `SnapshotEntry` is the logical serialization boundary;
+- AOF rewrite buffers post-snapshot mutations;
+- truncated final transaction frame does not replay a prefix;
+- expiration and eviction are distinct;
+- noeviction rejection cannot leave a partial logical mutation;
+- eviction-generated DEL belongs to durability and replication order;
+- LRU/LFU heat is runtime policy state, never database state.
 
-## 10. Memory-pressure rules
+## 8. Replication rules
 
-- expiration is time validity; eviction is memory-pressure policy;
-- `noeviction` rejection cannot leave a partially applied logical mutation;
-- sampling work is bounded and observable;
-- eviction removes value + expiry together;
-- eviction-generated `DEL` belongs to AOF **and** primary replication reconstruction order;
-- LRU/LFU heat is runtime policy state and never persisted or replicated as database state.
+v0.8 remains the only database-copy mechanism.
 
-## 11. Replication rules
+### Primary stream
 
-v0.8 establishes the data-copy topology layer.
+- one primary runtime owns one repl-id and byte offset;
+- offsets count canonical RESP mutation payload bytes;
+- ordinary accepted mutation = one frame;
+- successful EXEC = one `MULTI ... EXEC` frame;
+- backlog evicts complete frames only.
 
-### Stream identity and offset
+### Full/partial sync
 
-- one primary process owns one replication identity;
-- a fresh primary process gets a fresh identity in v0.8;
-- offsets count canonical RESP **mutation payload bytes**, not TCP envelope bytes;
-- replica offset advances only after a complete frame applies successfully.
-
-### Canonical feed
-
-- ordinary successful logical mutations become one replication frame;
-- relative expiry is rewritten to absolute `PEXPIREAT` before replication;
-- eviction-generated `DEL` is included;
-- failed/read-only commands emit no replication frame;
-- successful EXEC mutations are wrapped as one `MULTI ... EXEC` frame.
-
-### Full sync
-
-While holding `persistenceMu`, primary must:
+While holding `persistenceMu` the primary captures:
 
 ```text
-capture SnapshotEntry[]
+SnapshotEntry[]
       ↓
-capture current replication offset
+base offset
       ↓
-attach live subscriber
-      ↓
-release persistenceMu
+live subscriber attachment
 ```
 
-Only then may it transfer the snapshot. This prevents a write from falling between base snapshot and live suffix attachment.
-
-### Backlog / partial sync
-
-- backlog is bounded runtime state, never durable database state;
-- eviction happens in complete frame units;
-- resume accepts only current end or retained complete-frame boundaries;
-- matching repl-id + complete retained suffix → partial resync;
-- stale identity, missing suffix or wrapped history → full sync;
-- catch-up frames must preserve original frame boundaries.
+Then snapshot transfer may occur. Matching repl-id + retained frame boundary gives CONTINUE; otherwise FULLRESYNC.
 
 ### Replica
 
-- client-side mutating commands return READONLY;
-- replication apply bypasses that client gate;
-- v0.8 replicas intentionally disable local AOF and maxmemory eviction policy;
-- full base installs before suffix application;
-- private in-memory encodings never cross the replication protocol.
+- client writes return READONLY;
+- replication apply bypasses the client gate;
+- offset advances only after whole-frame application;
+- v0.8/v0.9 teaching replicas have no independent local AOF or maxmemory eviction policy.
 
-## 12. Testing baseline
+## 9. Sentinel rules
+
+v0.9 establishes topology control above replication.
+
+### Health
+
+- every monitor owns its own last-success/last-failure/failure-since state;
+- one monitor exceeding `down-after` marks only SDOWN;
+- ODOWN requires configured quorum of SDOWN monitor states;
+- recovery clears that monitor's SDOWN state.
+
+### Failover epoch
+
+- one failover attempt receives one monotonically increasing epoch;
+- the teaching leader is the lexicographically first SDOWN voter;
+- this deterministic rule is for observability and is **not** a distributed-consensus claim;
+- one controller serializes Tick calls so overlapping promotions cannot originate from the same controller instance.
+
+### Candidate selection
+
+Candidate must have quorum reachability and quorum observation as `replica`.
+
+Ranking:
+
+```text
+reachable votes DESC
+replication offset DESC
+node ID ASC
+```
+
+An unreachable/stale candidate must not win over an eligible healthier/fresher candidate under this policy.
+
+### Promotion / topology repair
+
+- `PromoteToPrimary` cancels upstream following, creates a fresh repl-id/backlog, opens a replication listener and becomes writable;
+- surviving replicas are told to follow the promoted primary;
+- following a different primary resets remembered repl-id/offset and re-enters safe FULLRESYNC;
+- a returning old primary is reconfigured as replica of the chosen primary;
+- dynamic demotion rejects local AOF or maxmemory policy in v0.9 rather than silently violating replica invariants.
+
+### Explicit limitation
+
+Sentinel observation does not fence an unreachable old primary. A partition can temporarily leave an old primary writable while a new primary is promoted. v0.9 therefore does **not** claim linearizability, split-brain prevention, leases, consensus, or production Redis Sentinel compatibility.
+
+Do not hide this limitation in docs/tests.
+
+## 10. Testing baseline
 
 Before reporting a version clean, run on the exact code:
 
@@ -237,27 +220,29 @@ make persistence-demo
 make eviction-demo
 make session-demo
 make replication-demo
+make sentinel-demo
 make smoke
 NETWORK_ENGINE=legacy PORT=16380 make smoke
 ```
 
-For v0.8 specifically prove:
+For v0.9 specifically prove:
 
-- frame-aware backlog wrap and boundary lookup;
-- full sync convergence;
-- write-after-snapshot live propagation;
-- disconnect/reconnect via CONTINUE when suffix is retained;
-- fallback FULLRESYNC after backlog loss;
-- repl-id/offset convergence;
-- transaction framing across replication;
-- replica READONLY behavior;
-- race cleanliness of reconnect/fan-out/state inspection.
+- one SDOWN vote cannot create ODOWN;
+- quorum ODOWN creates one epoch/failover;
+- candidate reachability and freshness ranking;
+- runtime replica promotion and fresh repl-id;
+- surviving replica reconfiguration and convergence;
+- old-primary return as replica;
+- repeated Tick after a healthy failover does not create another promotion;
+- real three-node failover under `go test -race`;
+- deterministic `sentinel-demo`;
+- previous v0.8 replication behavior remains green.
 
 Do not claim a check passed unless it ran on the exact reported SHA.
 
-## 13. Documentation contract
+## 11. Documentation contract
 
-Every version must keep synchronized:
+Every version keeps synchronized:
 
 - `Agents.md`
 - `Plan.md`
@@ -266,36 +251,31 @@ Every version must keep synchronized:
 - README when user-visible behavior changes
 - CHANGELOG / VERSION
 
-`version.md` must explain what changed relative to prior version, why, critical invariants, non-goals and the next dependency.
+`version.md` explains prior-version delta, mechanism, invariants, non-goals and next dependency.
 
-## 14. Commit discipline
-
-Prefer coherent architectural commits. Do not commit binaries, AOF/RDB runtime files, profiles or generated temporary data. Avoid mixing the next version's mechanism into a current-version fix.
-
-## 15. Definition of Done
+## 12. Definition of Done
 
 - [ ] primary mental model explicit;
 - [ ] promised mechanism implemented;
 - [ ] invariant/error-path tests exist;
 - [ ] race/build/smoke/demo validation passes;
-- [ ] persistence/recovery/replication boundaries tested when changed;
+- [ ] persistence/replication/topology boundaries tested when changed;
 - [ ] version/docs synchronized;
 - [ ] exact version SHA passes CI;
 - [ ] `main` fast-forwarded to same SHA;
 - [ ] same SHA passes CI on `main`;
 - [ ] next-version rationale documented.
 
-## 16. Current directive
+## 13. Current directive
 
-Freeze candidate: **v0.8 — full synchronization, canonical mutation propagation, repl-id/offset, bounded backlog and partial resynchronization**.
+Freeze candidate: **v0.9 — SDOWN/ODOWN, failover epoch, deterministic candidate promotion and topology repair**.
 
-After exact-SHA validation, next milestone is **v0.9 — Sentinel-inspired health monitoring and failover**.
+After exact-SHA validation, next milestone is **v0.10 — Cluster hash slots, MOVED/ASK and migration**.
 
-For v0.9:
+For v0.10:
 
-1. build on the v0.8 replication topology; do not add another copy mechanism;
-2. distinguish subjective-down from quorum-backed objective-down;
-3. make election/failover epochs explicit and testable;
-4. promote the healthiest sufficiently fresh replica under a documented teaching policy;
-5. reconfigure surviving replicas and handle old-primary return;
-6. do not begin Cluster slot ownership yet.
+1. keep slot ownership separate from Store value representation;
+2. implement deterministic key→slot routing before migration complexity;
+3. distinguish stable `MOVED` from temporary migration `ASK` semantics;
+4. reuse replication/failover mechanisms rather than creating a parallel copy/failure stack;
+5. do not claim production Redis Cluster consensus semantics.
