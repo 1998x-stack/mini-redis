@@ -32,7 +32,8 @@ type Server struct {
 	// persistenceMu names the v0.5 state/AOF boundary. v0.6 also keeps one
 	// command, its memory-pressure decision and eviction DEL persistence inside
 	// this boundary. v0.7 EXEC holds it across WATCH validation and the entire
-	// queued command sequence, so other clients cannot interleave mutations.
+	// queued command sequence, so other clients, maintenance and snapshots cannot
+	// observe/interleave a half-executed transaction.
 	persistenceMu sync.Mutex
 
 	versions   *keyVersionTable
@@ -146,7 +147,12 @@ func (s *Server) SaveRDB() error {
 	if err != nil {
 		return err
 	}
+
+	// A snapshot is a logical observer. Serialize snapshot capture with EXEC so
+	// no RDB can represent only a prefix of one transaction.
+	s.persistenceMu.Lock()
 	entries, err := snapshotter.Snapshot()
+	s.persistenceMu.Unlock()
 	if err != nil {
 		return err
 	}
@@ -309,6 +315,12 @@ func (s *Server) executeCommandCoreLocked(argv []string, persistNow bool) (resp.
 }
 
 func (s *Server) runMaintenance() {
+	// In legacy mode maintenance runs in another goroutine. Share the same
+	// logical-state boundary as commands/EXEC so expiration cannot occur between
+	// WATCH validation and the transaction body.
+	s.persistenceMu.Lock()
+	defer s.persistenceMu.Unlock()
+
 	s.store.ExpireDue(s.cfg.ActiveExpireSample)
 	if s.cfg.RehashWorkPerCycle <= 0 {
 		return
