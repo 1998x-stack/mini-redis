@@ -69,6 +69,7 @@ func (s *Server) serveReactor(ctx context.Context) error {
 	defer func() {
 		for fd, client := range clients {
 			s.closeClientSession(client.session)
+			s.metrics.ActiveConnections.Add("reactor", -1)
 			_ = poller.Del(fd)
 			_ = syscall.Close(fd)
 		}
@@ -95,7 +96,13 @@ func (s *Server) serveReactor(ctx context.Context) error {
 		}
 
 		timeout := untilNextTimer(time.Now(), nextExpire, nextIdleSweep)
+		waitStarted := time.Now()
+		s.metrics.ReactorPollCalls.Inc()
 		events, err := poller.Wait(timeout)
+		s.metrics.ReactorPollWait.ObserveDuration(time.Since(waitStarted))
+		if len(events) > 0 {
+			s.metrics.ReactorPollEvents.Add(uint64(len(events)))
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -193,19 +200,27 @@ func (s *Server) acceptReady(poller netpoll.Poller, listenerFD int, clients map[
 		}
 
 		_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+		s.metrics.Connections.Inc("reactor")
+		s.metrics.ActiveConnections.Add("reactor", 1)
 		client := &reactorClient{fd: fd, lastActive: now}
 		client.session = s.newClientSession(func(value resp.Value) error {
-			payload, err := resp.EncodeValueProtocol(value, client.session.protocolMode())
+			protocol := client.session.protocolMode()
+			payload, err := resp.EncodeValueProtocol(value, protocol)
 			if err != nil {
 				return err
 			}
 			if err := client.queue(payload, s.cfg.ClientOutputBufferLimit); err != nil {
+				if errors.Is(err, errOutputBufferLimit) {
+					s.metrics.Backpressure.Inc("reactor_output")
+				}
 				return err
 			}
+			s.observeReply(protocol, value)
 			return updateClientInterest(poller, client)
 		})
 		if err := poller.Add(fd, netpoll.Read); err != nil {
 			s.closeClientSession(client.session)
+			s.metrics.ActiveConnections.Add("reactor", -1)
 			_ = syscall.Close(fd)
 			return fmt.Errorf("register client: %w", err)
 		}
@@ -218,8 +233,10 @@ func (s *Server) readReady(client *reactorClient) (bool, error) {
 	for {
 		n, err := syscall.Read(client.fd, buf[:])
 		if n > 0 {
+			s.metrics.BytesRead.Add("reactor", uint64(n))
 			client.lastActive = time.Now()
 			if n > s.cfg.ClientInputBufferLimit-len(client.input) {
+				s.metrics.Backpressure.Inc("reactor_input")
 				return false, errInputBufferLimit
 			}
 			client.input = append(client.input, buf[:n]...)
@@ -251,13 +268,19 @@ func (s *Server) processClientInput(client *reactorClient) error {
 	for len(client.input) > 0 {
 		argv, consumed, complete, err := resp.ParseCommand(client.input)
 		if err != nil {
-			payload, encodeErr := resp.EncodeValueProtocol(resp.Error("ERR "+err.Error()), client.session.protocolMode())
+			protocol := client.session.protocolMode()
+			value := resp.Error("ERR " + err.Error())
+			payload, encodeErr := resp.EncodeValueProtocol(value, protocol)
 			if encodeErr != nil {
 				return encodeErr
 			}
 			if err := client.queue(payload, s.cfg.ClientOutputBufferLimit); err != nil {
+				if errors.Is(err, errOutputBufferLimit) {
+					s.metrics.Backpressure.Inc("reactor_output")
+				}
 				return err
 			}
+			s.observeReply(protocol, value)
 			client.input = nil
 			client.closeAfterWrite = true
 			return nil
@@ -272,14 +295,19 @@ func (s *Server) processClientInput(client *reactorClient) error {
 			client.input = client.input[consumed:]
 		}
 
-		for _, reply := range s.executeClientCommand(client.session, argv) {
-			payload, err := resp.EncodeValueProtocol(reply, client.session.protocolMode())
+		for _, reply := range s.executeObservedClientCommand(client.session, argv) {
+			protocol := client.session.protocolMode()
+			payload, err := resp.EncodeValueProtocol(reply, protocol)
 			if err != nil {
 				return err
 			}
 			if err := client.queue(payload, s.cfg.ClientOutputBufferLimit); err != nil {
+				if errors.Is(err, errOutputBufferLimit) {
+					s.metrics.Backpressure.Inc("reactor_output")
+				}
 				return err
 			}
+			s.observeReply(protocol, reply)
 		}
 	}
 	return nil
@@ -289,6 +317,7 @@ func (s *Server) writeReady(client *reactorClient) (bool, error) {
 	for len(client.output) > 0 {
 		n, err := syscall.Write(client.fd, client.output)
 		if n > 0 {
+			s.metrics.BytesWritten.Add("reactor", uint64(n))
 			client.output = client.output[n:]
 			client.lastActive = time.Now()
 		}
@@ -326,6 +355,7 @@ func (s *Server) closeReactorClient(poller netpoll.Poller, clients map[int]*reac
 		return
 	}
 	s.closeClientSession(client.session)
+	s.metrics.ActiveConnections.Add("reactor", -1)
 	_ = poller.Del(fd)
 	_ = syscall.Close(fd)
 	delete(clients, fd)
