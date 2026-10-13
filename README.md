@@ -1,8 +1,8 @@
 # mini-redis
 
-An architecture-driven Redis learning implementation in Go. Each version replaces one hidden mechanism with an explicit, testable implementation.
+An architecture-driven Redis learning implementation in Go. Each version makes one hidden Redis mechanism explicit, small and testable.
 
-## Current milestone: v0.10
+## Current milestone: v0.11
 
 ```text
 v0.1  request → command → state → TTL → AOF
@@ -21,142 +21,210 @@ v0.7  WATCH + MULTI/EXEC + Pub/Sub
   ↓
 v0.8  replication / PSYNC / backlog
   ↓
-v0.9  Sentinel-inspired SDOWN/ODOWN/failover
+v0.9  Sentinel-inspired failover
   ↓
-v0.10 16384 hash slots + MOVED/ASK + migration + bounded gossip  ← current
+v0.10 Cluster / 16384 slots / MOVED / ASK
+  ↓
+v0.11 HELLO 2/3 + richer RESP3 values + Push  ← current
+  ↓
+v0.12 observability / performance
 ```
 
-## v0.10 mental model
+## v0.11 mental model
 
 ```text
-key
- ↓ CRC16/XMODEM
-hash-tag {...} when non-empty
- ↓
-slot ∈ [0, 16383]
- ↓
-slot ownership table
- ├─ local stable owner  → execute
- ├─ remote stable owner → MOVED <slot> <addr>
- └─ migrating slot
-       ├─ source still has key → execute on source
-       ├─ source missing key   → ASK <slot> <target>
-       └─ importing target + ASKING → execute once
+TCP connection
+      ↓
+starts RESP2
+      ↓
+HELLO 3
+      ↓
+connection-local protocol = RESP3
+      ↓
+existing command / Store / Cluster semantics
+      ↓
+logical reply
+      ↓
+RESP3 representation
+
+HELLO 2
+      ↓
+back to RESP2 on that connection only
 ```
 
-The central lesson is that **key/value state and slot/topology state are different layers**. Slot ownership never lives inside Store objects or persistence payloads.
+The central lesson is:
 
-## Hash tags
+> **RESP3 changes representation, not database semantics.**
 
-Redis-style non-empty hash tags force related keys into the same slot:
+Protocol mode belongs to one client connection. It is never written into Store, AOF, SnapshotEntry, replication state, Sentinel state or Cluster topology.
+
+## HELLO negotiation
+
+Every connection starts in RESP2 mode.
 
 ```text
-user:{42}:name
-order:{42}:1
+HELLO 3
 ```
 
-Both hash only `42`, so both map to slot `8000` in this implementation.
-
-`CLUSTER KEYSLOT <key>` is supported by the cluster-aware facade.
-
-## Stable routing: MOVED
-
-If node `a` owns a slot and a client asks node `b`:
+switches that connection to RESP3 and returns server metadata as a Map.
 
 ```text
-client → b
-          ↓
--MOVED <slot> a-address
+HELLO 2
 ```
 
-`MOVED` means the stable ownership table says another node owns the slot.
+switches it back to RESP2. The same logical metadata is downgraded to a RESP2 flat array.
 
-## Migration routing: ASK / ASKING
+The server intentionally keeps command requests as arrays of blob strings, so the request/command path does not fork by protocol version.
 
-During an explicit migration `source → target`, stable ownership remains the source until commit.
+## Rich RESP3 views
+
+Selected existing commands expose better semantic types after `HELLO 3`:
+
+| Command | RESP2 | RESP3 |
+| --- | --- | --- |
+| `HGETALL` | Array | Map `%` |
+| `SMEMBERS` | Array | Set `~` |
+| `SISMEMBER` | Integer 0/1 | Boolean `#` |
+| `ZSCORE` | bulk text | Double `,` |
+| missing value | null bulk/array | Null `_` |
+
+The command handlers remain shared. A protocol-view adapter runs after command execution and, on the Cluster endpoint, after slot authorization.
+
+## RESP3 value model
+
+The protocol package now models and encodes:
 
 ```text
-source owns slot
-migrationTarget = target
+Simple String      +
+Error              -
+Integer            :
+Blob String         $
+Array              *
+Null               _
+Boolean            #
+Double             ,
+Big Number         (
+Verbatim String    =
+Map                %
+Set                ~
+Push               >
 ```
 
-Existing source keys continue to execute on the source. If the source no longer has a key in that slot, it returns:
+RESP2 remains first-class. Rich logical values have explicit downgrade rules, for example Map→flat Array, Set→Array, Boolean→0/1 and Push→Array.
+
+## Pub/Sub finally uses Push
+
+RESP2 has no dedicated asynchronous frame type, so historical subscribed-mode restrictions remain for RESP2 connections.
+
+RESP3 has Push:
 
 ```text
--ASK <slot> <target-address>
+>3
+$7
+message
+$4
+news
+$5
+hello
+
 ```
 
-The client connects to the target and sends:
+That makes asynchronous messages distinguishable from ordinary command replies. A RESP3 subscriber can therefore continue issuing ordinary commands while Pub/Sub messages arrive as Push frames.
+
+The Pub/Sub delivery mechanism itself is unchanged; only its wire representation improves.
+
+## Fragmented nested parser
+
+`resp.ParseValue` incrementally parses RESP2/RESP3 values including nested Map/Set/Push containers.
+
+Its key contract is:
 
 ```text
-ASKING
-<one routed command>
+incomplete valid frame → complete=false, consumed=0
+complete frame          → exact Value + byte count
+malformed frame         → protocol error
 ```
 
-`ASKING` is a one-request connection grant. The following routed command may execute on the importing target; the grant is then consumed. Without ASKING, the target still redirects to the stable owner until migration commit.
+Tests split a nested Push/Map/Set payload at every byte boundary.
 
-## Multi-key safety
+## Both network engines share protocol semantics
 
-Commands such as `DEL` and `EXISTS` may reference multiple keys, but all routed keys must hash to one slot.
+The legacy goroutine transport and Linux epoll reactor use the same session-level negotiation code.
 
 ```text
-DEL a:{same} b:{same}   → allowed
-DEL foo bar             → CROSSSLOT
+transport
+  ↓
+executeClientCommand
+  ↓
+logical resp.Value
+  ↓
+session.protocol
+  ↓
+EncodeValueProtocol
 ```
 
-The cluster facade intentionally does not support MULTI/EXEC in v0.10. Transparent cross-command transaction routing is a non-goal rather than a partially correct promise.
+The reactor remains about readiness/buffers/backpressure; RESP3 does not leak into its scheduling model.
 
-## Slot migration
+## RESP3 + Cluster
 
-`cluster.MigrateSlot` exposes the migration boundary explicitly:
+The explicit Cluster endpoint also accepts `HELLO 2/3`, but protocol negotiation cannot bypass routing:
 
 ```text
-BeginMigration(slot, source, target)
-        ↓
-source.KeysInSlot(slot)
-        ↓
-for each remaining key:
-    source lock persistenceMu
-        ↓
-    SnapshotEntry export
-        ↓
-    target ImportKey
-        ↓ success only
-    source DEL
-        ↓
-CommitMigration(slot)
-        ↓
-stable owner = target
+GET key
+  ↓
+slot authorization first
+  ├─ MOVED / ASK / CROSSSLOT
+  └─ execute
+       ↓
+    response adaptation
+       ↓
+    RESP2 / RESP3 bytes
 ```
 
-The source does not delete a key before target import succeeds. A partial migration keeps the migration marker visible and can be retried from the source's remaining keys.
+A real wire test negotiates RESP3 on a wrong-owner node and still requires `MOVED`.
 
-Target import reconstructs logical `SnapshotEntry` state using the existing command/persistence path, including absolute TTL deadlines. Physical Object encodings do not cross nodes.
+## Persistence and replication stay canonical
 
-## Cluster-aware RESP endpoint
+A RESP3 client mutation still produces the same canonical mutation commands used by previous versions:
 
-`Server.ServeCluster` exposes the routing layer over RESP2/TCP on a caller-supplied listener. Each TCP connection owns one cluster session, so ASKING has true one-request connection semantics.
+```text
+RESP3 client SET
+       ↓
+command semantics
+       ↓
+canonical mutation
+   ├── AOF
+   └── replication backlog
+```
 
-This endpoint is deliberately separate from the historical standalone listener. v0.10 is an educational Cluster layer, not a drop-in production Redis Cluster server.
+HELLO does not change AOF replay, replication offsets, backlog framing or full/partial synchronization.
 
-## Bounded topology exchange
+## Supported command subset
 
-`Topology.GossipPage(start, limit)` returns at most `limit` slot records at a time. Repeated pages can rebuild another node's topology view.
+```text
+PING ECHO
+SET GET DEL EXISTS
+INCR INCRBY
+EXPIRE PEXPIREAT TTL
+KEYS DBSIZE FLUSHDB
+OBJECT ENCODING
 
-Conflict resolution is explicit last-writer-wins by topology epoch with deterministic tie-breaking. This is a teaching mechanism for bounded dissemination, **not a consensus protocol**.
+LPUSH RPUSH LPOP RPOP LLEN LRANGE
+HSET HGET HDEL HLEN HGETALL
+SADD SREM SISMEMBER SMEMBERS SCARD
+ZADD ZSCORE ZRANK ZRANGE ZREM
 
-## Important limitations
+WATCH UNWATCH MULTI EXEC DISCARD
+SUBSCRIBE UNSUBSCRIBE PUBLISH
+```
 
-v0.10 does not claim:
+Connection-level teaching command:
 
-- production Redis Cluster wire/protocol completeness;
-- consensus or linearizable slot ownership changes;
-- automatic cluster failover coupling Sentinel to slot ownership;
-- fencing against conflicting topology writers;
-- transparent MULTI/EXEC across cluster routing;
-- production anti-entropy or gossip failure detection.
+```text
+HELLO [2|3]
+```
 
-v0.8 replication and v0.9 Sentinel remain independent lower layers. v0.10 adds the orthogonal question: **which primary owns this key's slot?**
+The v0.10 Cluster facade additionally exposes `ASKING` and `CLUSTER KEYSLOT` and intentionally rejects cluster MULTI/EXEC semantics.
 
 ## Learning demos
 
@@ -168,7 +236,8 @@ make eviction-demo
 make session-demo
 make replication-demo
 make sentinel-demo
-make cluster-demo      # v0.10 MOVED → ASK/ASKING → slot transfer → MOVED
+make cluster-demo
+make resp3-demo        # RESP2 → HELLO 3 → rich values/Push → HELLO 2
 ```
 
 ## Validation
@@ -186,32 +255,40 @@ make session-demo
 make replication-demo
 make sentinel-demo
 make cluster-demo
+make resp3-demo
 make smoke
 NETWORK_ENGINE=legacy PORT=16380 make smoke
 ```
 
-## Read v0.10 in this order
+## Read v0.11 in this order
 
 ```text
-internal/cluster/slot.go
-  ↓ CRC16 + hash tags
-internal/cluster/topology.go
-  ↓ owners / migration state / MOVED / ASK / bounded gossip
-internal/cluster/commands.go
-  ↓ command key extraction / CROSSSLOT / ASKING session
-internal/cluster/migration.go
-  ↓ resumable slot transfer contract
-internal/server/cluster.go
-  ↓ routing gate + SnapshotEntry transfer under persistenceMu
+internal/resp/protocol.go
+  ↓ protocol modes
+internal/resp/value.go
+  ↓ logical richer value model
+internal/resp/writer.go
+  ↓ RESP2 downgrade / RESP3 native encoding
+internal/resp/value_parser.go
+  ↓ incremental nested parsing
+internal/server/session.go
+  ↓ HELLO + response views + Pub/Sub Push
+internal/server/legacy.go
+internal/server/reactor_linux.go
+  ↓ shared transport integration
 internal/server/cluster_wire.go
-  ↓ RESP/TCP cluster endpoint
-internal/cluster/cluster_test.go
-internal/server/cluster_test.go
+  ↓ Cluster composition
+internal/resp/resp3_test.go
+internal/server/protocol_test.go
 internal/server/cluster_wire_test.go
-examples/cluster/main.go
+examples/resp3/main.go
 ```
 
-Compare historical branches `v0.1` through `v0.10` to see one dominant architecture change at a time.
+## Important limits
+
+v0.11 is not a complete production RESP3 implementation. It intentionally omits streamed aggregates/strings, full Attribute/Blob Error semantics, client tracking pushes and the complete Redis HELLO AUTH/SETNAME option surface.
+
+Compare historical branches `v0.1` through `v0.11` to see one dominant architectural change at a time.
 
 ## Repository contracts
 
