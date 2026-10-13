@@ -342,12 +342,14 @@ func (s *Server) executeCommandCoreLocked(argv []string, persistNow bool) (resp.
 				s.logger.Error("maxmemory enforcement failed", "error", err)
 				return resp.Error("ERR maxmemory enforcement failed"), nil
 			}
-			if pressure.ExpiredKeys > 0 {
+			if pressure.ExpiredKeys > 0 && s.metrics != nil {
 				s.metrics.ExpiredKeys.Add(uint64(pressure.ExpiredKeys))
 			}
 			if len(pressure.EvictedKeys) > 0 {
 				evicted = append(evicted, pressure.EvictedKeys...)
-				s.metrics.EvictedKeys.Add(uint64(len(pressure.EvictedKeys)))
+				if s.metrics != nil {
+					s.metrics.EvictedKeys.Add(uint64(len(pressure.EvictedKeys)))
+				}
 				del := append([]string{"DEL"}, pressure.EvictedKeys...)
 				persist = append(persist, del)
 			}
@@ -375,15 +377,17 @@ func (s *Server) runMaintenance() {
 	s.persistenceMu.Lock()
 	defer s.persistenceMu.Unlock()
 
-	s.metrics.MaintenanceRuns.Inc()
-	if expired := s.store.ExpireDue(s.cfg.ActiveExpireSample); expired > 0 {
+	if s.metrics != nil {
+		s.metrics.MaintenanceRuns.Inc()
+	}
+	if expired := s.store.ExpireDue(s.cfg.ActiveExpireSample); expired > 0 && s.metrics != nil {
 		s.metrics.ExpiredKeys.Add(uint64(expired))
 	}
 	if s.cfg.RehashWorkPerCycle <= 0 {
 		return
 	}
 	if stepper, ok := s.store.(store.RehashStepper); ok {
-		if steps := stepper.RehashStep(s.cfg.RehashWorkPerCycle); steps > 0 {
+		if steps := stepper.RehashStep(s.cfg.RehashWorkPerCycle); steps > 0 && s.metrics != nil {
 			s.metrics.RehashSteps.Add(uint64(steps))
 		}
 	}
