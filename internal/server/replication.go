@@ -59,6 +59,26 @@ func (s *Server) ReplicationState() (role config.ReplicationRole, id string, off
 	return role, s.replicaID, s.replicaOffset
 }
 
+func (s *Server) ReplicationStats() replication.Stats {
+	if s.replPrimary == nil {
+		return replication.Stats{}
+	}
+	return s.replPrimary.Stats()
+}
+
+// DisconnectReplicationLink is an educational diagnostic hook used by the
+// deterministic demo/tests to force the reconnect path without stopping the
+// replica process (and therefore without losing its in-memory repl-id/offset).
+func (s *Server) DisconnectReplicationLink() error {
+	s.stateMu.RLock()
+	conn := s.replicaConn
+	s.stateMu.RUnlock()
+	if conn == nil {
+		return errors.New("replication link is not connected")
+	}
+	return conn.Close()
+}
+
 func (s *Server) serveReplicationPrimary(ctx context.Context, listener net.Listener) {
 	for {
 		conn, err := listener.Accept()
@@ -101,13 +121,16 @@ func (s *Server) handleReplicaConnection(ctx context.Context, conn net.Conn) {
 	}
 
 	writer := resp.NewWriter(conn)
-	if suffix, current, sub, ok := s.replPrimary.SubscribeFrom(argv[1], requestedOffset); ok {
+	if frames, current, sub, ok := s.replPrimary.SubscribeFrom(argv[1], requestedOffset); ok {
 		defer s.replPrimary.Unsubscribe(sub)
+		s.replPrimary.RecordPartialSync()
 		if err := writer.WriteValue(resp.SimpleString(fmt.Sprintf("CONTINUE %s %d", s.replPrimary.ID(), current))); err != nil {
 			return
 		}
-		if err := writer.WriteValue(resp.BulkString(string(suffix))); err != nil {
-			return
+		for _, frame := range frames {
+			if err := writer.WriteValue(resp.BulkString(string(frame.Data))); err != nil {
+				return
+			}
 		}
 		s.streamReplicationFrames(ctx, writer, sub)
 		return
@@ -135,6 +158,7 @@ func (s *Server) handleReplicaConnection(ctx context.Context, conn net.Conn) {
 	if err != nil {
 		return
 	}
+	s.replPrimary.RecordFullSync()
 	if err := writer.WriteValue(resp.SimpleString(fmt.Sprintf("FULLRESYNC %s %d", id, baseOffset))); err != nil {
 		return
 	}
@@ -242,15 +266,6 @@ func (s *Server) followPrimaryOnce(ctx context.Context) error {
 		}
 		if parts[1] != id {
 			return fmt.Errorf("CONTINUE identity mismatch: got %q want %q", parts[1], id)
-		}
-		catchup, err := readReplicationBulk(reader)
-		if err != nil {
-			return err
-		}
-		if len(catchup) > 0 {
-			if err := s.applyReplicationPayload(catchup); err != nil {
-				return err
-			}
 		}
 	default:
 		return fmt.Errorf("unexpected replication handshake %q", header)
