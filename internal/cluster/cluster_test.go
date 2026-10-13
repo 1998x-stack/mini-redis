@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/1998x-stack/mini-redis/internal/store"
@@ -115,6 +116,34 @@ func TestGossipPagesAreBoundedAndMergeByEpoch(t *testing.T) {
 	}
 }
 
+func TestGossipEqualEpochTieBreakIsOrderIndependent(t *testing.T) {
+	const slot = 42
+	left := GossipPage{Slots: []SlotRecord{{Slot: slot, State: SlotState{OwnerID: "a", MigrationTarget: "b", Epoch: 7}}}}
+	right := GossipPage{Slots: []SlotRecord{{Slot: slot, State: SlotState{OwnerID: "a", MigrationTarget: "c", Epoch: 7}}}}
+
+	first := NewTopology()
+	if err := first.MergePage(left); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.MergePage(right); err != nil {
+		t.Fatal(err)
+	}
+	second := NewTopology()
+	if err := second.MergePage(right); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.MergePage(left); err != nil {
+		t.Fatal(err)
+	}
+
+	want := SlotState{OwnerID: "a", MigrationTarget: "c", Epoch: 7}
+	gotFirst, _ := first.Slot(slot)
+	gotSecond, _ := second.Slot(slot)
+	if !reflect.DeepEqual(gotFirst, want) || !reflect.DeepEqual(gotSecond, want) {
+		t.Fatalf("order-dependent merge first=%#v second=%#v want=%#v", gotFirst, gotSecond, want)
+	}
+}
+
 type fakeMigrationNode struct {
 	id      string
 	entries map[string]store.SnapshotEntry
@@ -129,6 +158,7 @@ func (n *fakeMigrationNode) KeysInSlot(_ context.Context, slot int) ([]string, e
 			out = append(out, key)
 		}
 	}
+	sort.Strings(out)
 	return out, nil
 }
 func (n *fakeMigrationNode) ImportKey(_ context.Context, entry store.SnapshotEntry) error {
@@ -172,5 +202,43 @@ func TestMigrateSlotDeletesOnlyAfterTargetImportAndCommitsOwner(t *testing.T) {
 	state, _ := topology.Slot(slot)
 	if state.OwnerID != "b" || state.MigrationTarget != "" {
 		t.Fatalf("slot=%#v", state)
+	}
+}
+
+func TestMigrateSlotFailureRemainsVisibleAndRetryResumes(t *testing.T) {
+	topology := testTopology(t)
+	key1 := "a:{resume}"
+	key2 := "b:{resume}"
+	slot := HashSlot(key1)
+	source := &fakeMigrationNode{id: "a", entries: map[string]store.SnapshotEntry{
+		key1: {Key: key1, Type: store.ObjectString, StringValue: "1"},
+		key2: {Key: key2, Type: store.ObjectString, StringValue: "2"},
+	}}
+	target := &fakeMigrationNode{id: "b", entries: map[string]store.SnapshotEntry{}, failKey: key2}
+
+	if err := MigrateSlot(context.Background(), topology, slot, source, target); err == nil {
+		t.Fatal("expected injected migration failure")
+	}
+	state, _ := topology.Slot(slot)
+	if state.OwnerID != "a" || state.MigrationTarget != "b" {
+		t.Fatalf("failure hid migration state: %#v", state)
+	}
+	if _, ok := source.entries[key1]; ok {
+		t.Fatal("successfully imported first key was not removed from source")
+	}
+	if _, ok := source.entries[key2]; !ok {
+		t.Fatal("failed key was deleted before target acknowledgement")
+	}
+	if _, ok := target.entries[key1]; !ok {
+		t.Fatal("successful partial transfer missing on target")
+	}
+
+	target.failKey = ""
+	if err := MigrateSlot(context.Background(), topology, slot, source, target); err != nil {
+		t.Fatal(err)
+	}
+	state, _ = topology.Slot(slot)
+	if state.OwnerID != "b" || state.MigrationTarget != "" || len(source.entries) != 0 || len(target.entries) != 2 {
+		t.Fatalf("retry did not converge state=%#v source=%v target=%v", state, source.entries, target.entries)
 	}
 }
