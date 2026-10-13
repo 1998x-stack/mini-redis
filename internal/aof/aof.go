@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/1998x-stack/mini-redis/internal/persistence"
 	"github.com/1998x-stack/mini-redis/internal/resp"
 )
 
@@ -21,13 +23,22 @@ const (
 	FsyncNo       FsyncPolicy = "no"
 )
 
+var (
+	ErrRewriteInProgress = errors.New("AOF rewrite already in progress")
+	ErrRewriteNotStarted = errors.New("AOF rewrite not started")
+)
+
 type Log struct {
 	mu     sync.Mutex
 	file   *os.File
+	path   string
 	policy FsyncPolicy
 	dirty  bool
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	rewriteActive bool
+	rewriteBuffer []byte
 }
 
 func Open(path string, policy FsyncPolicy) (*Log, error) {
@@ -41,7 +52,7 @@ func Open(path string, policy FsyncPolicy) (*Log, error) {
 	if err != nil {
 		return nil, err
 	}
-	l := &Log{file: file, policy: policy}
+	l := &Log{file: file, path: path, policy: policy}
 
 	if policy == FsyncEverySec {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -56,19 +67,28 @@ func (l *Log) Append(argv []string) error {
 	return l.AppendBatch([][]string{argv})
 }
 
-// AppendBatch writes a logical mutation as one OS write. This matters for AOF
-// rewrites such as SET ... EX, which persists as SET + PEXPIREAT.
-func (l *Log) AppendBatch(commands [][]string) error {
+func encodeCommands(commands [][]string) []byte {
 	var payload []byte
 	for _, argv := range commands {
 		payload = append(payload, resp.EncodeCommand(argv)...)
 	}
+	return payload
+}
+
+// AppendBatch writes a logical mutation to the current AOF. During rewrite it
+// also buffers the exact bytes so mutations after the snapshot boundary can be
+// appended to the replacement file before publication.
+func (l *Log) AppendBatch(commands [][]string) error {
+	payload := encodeCommands(commands)
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	if _, err := l.file.Write(payload); err != nil {
 		return err
+	}
+	if l.rewriteActive {
+		l.rewriteBuffer = append(l.rewriteBuffer, payload...)
 	}
 	l.dirty = true
 	if l.policy == FsyncAlways {
@@ -78,6 +98,118 @@ func (l *Log) AppendBatch(commands [][]string) error {
 		l.dirty = false
 	}
 	return nil
+}
+
+// BeginRewrite establishes the buffer boundary. The caller must coordinate its
+// state snapshot so no mutation can occur between taking that snapshot and
+// calling BeginRewrite.
+func (l *Log) BeginRewrite() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.rewriteActive {
+		return ErrRewriteInProgress
+	}
+	l.rewriteActive = true
+	l.rewriteBuffer = nil
+	return nil
+}
+
+func (l *Log) AbortRewrite() {
+	l.mu.Lock()
+	l.rewriteActive = false
+	l.rewriteBuffer = nil
+	l.mu.Unlock()
+}
+
+func (l *Log) FinishRewrite(commands [][]string) error {
+	return l.finishRewrite(commands, nil)
+}
+
+type beforeRewriteRenameHook func(tempPath, targetPath string) error
+
+// finishRewrite writes the compact base outside the AOF lock. The short commit
+// phase then appends buffered mutations, fsyncs, atomically renames the temp
+// file, and swaps the live descriptor while appends are blocked.
+func (l *Log) finishRewrite(commands [][]string, beforeRename beforeRewriteRenameHook) error {
+	base := encodeCommands(commands)
+	dir := filepath.Dir(l.path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		l.AbortRewrite()
+		return err
+	}
+	temp, err := os.CreateTemp(dir, "."+filepath.Base(l.path)+".rewrite-*")
+	if err != nil {
+		l.AbortRewrite()
+		return err
+	}
+	tempPath := temp.Name()
+	published := false
+	defer func() {
+		if !published {
+			_ = temp.Close()
+			_ = os.Remove(tempPath)
+		}
+	}()
+
+	if err := temp.Chmod(0o644); err != nil {
+		l.AbortRewrite()
+		return err
+	}
+	if _, err := temp.Write(base); err != nil {
+		l.AbortRewrite()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		l.AbortRewrite()
+		return err
+	}
+
+	l.mu.Lock()
+	if !l.rewriteActive {
+		l.mu.Unlock()
+		return ErrRewriteNotStarted
+	}
+	if len(l.rewriteBuffer) > 0 {
+		if _, err := temp.Write(l.rewriteBuffer); err != nil {
+			l.rewriteActive = false
+			l.rewriteBuffer = nil
+			l.mu.Unlock()
+			return err
+		}
+	}
+	if err := temp.Sync(); err != nil {
+		l.rewriteActive = false
+		l.rewriteBuffer = nil
+		l.mu.Unlock()
+		return err
+	}
+	if beforeRename != nil {
+		if err := beforeRename(tempPath, l.path); err != nil {
+			l.rewriteActive = false
+			l.rewriteBuffer = nil
+			l.mu.Unlock()
+			return err
+		}
+	}
+	if err := os.Rename(tempPath, l.path); err != nil {
+		l.rewriteActive = false
+		l.rewriteBuffer = nil
+		l.mu.Unlock()
+		return err
+	}
+	published = true
+	old := l.file
+	l.file = temp
+	l.dirty = false
+	l.rewriteActive = false
+	l.rewriteBuffer = nil
+	l.mu.Unlock()
+
+	if err := persistence.SyncDir(dir); err != nil {
+		_ = old.Close()
+		return err
+	}
+	return old.Close()
 }
 
 func (l *Log) syncLoop(ctx context.Context) {
@@ -116,13 +248,15 @@ func (l *Log) Close() error {
 	syncErr := l.Sync()
 
 	l.mu.Lock()
+	l.rewriteActive = false
+	l.rewriteBuffer = nil
 	closeErr := l.file.Close()
 	l.mu.Unlock()
 	return errors.Join(syncErr, closeErr)
 }
 
 // Replay reuses the normal RESP parser. A truncated final command is ignored,
-// which is a pragmatic v0.1 recovery rule for crash-damaged tails.
+// which remains the explicit v0.5 startup policy for crash-damaged AOF tails.
 func (l *Log) Replay(apply func([]string) error) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
