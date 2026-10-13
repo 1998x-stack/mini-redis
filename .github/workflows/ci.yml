@@ -25,5 +25,6 @@ jobs:
       - run: make persistence-demo
       - run: make eviction-demo
       - run: make session-demo
+      - run: make replication-demo
       - run: make smoke
       - run: NETWORK_ENGINE=legacy PORT=16380 make smoke
