@@ -1,274 +1,388 @@
-# Architecture — v0.10
+# Architecture — v0.11
 
 ## 1. Current stack
 
 ```text
-client / teaching cluster endpoint
-              ↓
-      key extraction + CROSSSLOT
-              ↓
-       CRC16 / hash tag
-              ↓
-       slot ∈ [0, 16383]
-              ↓
-       cluster.Topology
-       ├── stable owner
-       └── migration target
-              ↓
-      routing decision
-   ┌──────────┼───────────┐
-   ↓          ↓           ↓
- execute     MOVED        ASK
-   ↓                      ↓
-Server.persistenceMu     target + ASKING
-   ↓                      ↓
-existing command / persistence / replication path
+TCP connection
+      ↓
+command request parser
+      ↓
+clientSession
+  ├── protocol = RESP2 by default
+  ├── HELLO 2 / HELLO 3
+  ├── MULTI / WATCH state
+  └── Pub/Sub state
+      ↓
+cluster routing gate when applicable
+  ├── CROSSSLOT
+  ├── MOVED
+  └── ASK / ASKING
+      ↓
+Server.persistenceMu
+      ↓
+command registry / Store
+      ↓
+logical reply (resp.Value)
+      ↓
+protocol view adapter
+      ├── HGETALL → Map in RESP3
+      ├── SMEMBERS → Set in RESP3
+      ├── SISMEMBER → Boolean in RESP3
+      └── ZSCORE → Double in RESP3
+      ↓
+protocol-aware encoder
+      ├── RESP2 compatibility bytes
+      └── RESP3 richer bytes
 ```
 
-v0.10's central lesson is:
+v0.11's central lesson is:
 
-> **Store answers what a key contains. Cluster answers which primary is authoritative for that key's slot.**
+> **The database computes one logical result; the connection chooses how that result is represented on the wire.**
 
-The slot table is runtime topology state, not database state.
+## 2. Why protocol mode belongs to the connection
 
-## 2. Hash slots
-
-There are exactly 16384 logical slots. `HashSlot` uses CRC-16/XMODEM modulo 16384.
-
-For a key containing a non-empty `{...}` tag, only the first non-empty tagged substring is hashed. This lets applications place related keys together intentionally.
+Two clients can talk to the same server simultaneously:
 
 ```text
-user:{42}:name  ┐
-order:{42}:1    ├─ hash "42" → slot 8000
-cart:{42}       ┘
+client A → RESP2
+client B → HELLO 3 → RESP3
 ```
 
-Empty or malformed tags fall back to hashing the whole key.
+Neither should change the other's responses. Therefore protocol mode cannot be:
 
-## 3. Slot ownership is separate from Store
+- a Server-global flag;
+- Store metadata;
+- SnapshotEntry data;
+- AOF state;
+- replication state.
 
-`cluster.Topology` owns:
+It is stored in `clientSession`, protected by the session mutex.
+
+## 3. HELLO is session control, not a Store command
+
+HELLO is intercepted before the ordinary command registry because it changes connection interpretation rather than database state.
 
 ```text
-node ID → advertised cluster address
-slot    → stable owner ID
-slot    → optional migration target ID
-topology epoch
+new connection
+  protocol = 2
+
+HELLO 3
+  protocol = 3
+  reply = logical Map
+  encoder = RESP3
+
+HELLO 2
+  protocol = 2
+  same logical metadata
+  encoder = RESP2 downgrade
 ```
 
-It does not contain values, TTLs, Object encodings, AOF records or replication frames.
+HELLO is rejected inside MULTI so a queued database transaction cannot contain a mid-transaction wire-mode switch.
 
-That separation matters because changing slot ownership must not rewrite every key merely to annotate where it belongs.
+## 4. Requests stay canonical
 
-## 4. Routing gate
+The teaching server continues to accept command requests as arrays of blob strings.
 
-`Server.ClusterExecute` validates command arity, extracts routed keys and computes one common slot before touching Store.
+That grammar already works for both RESP2 and RESP3 command requests and is also the canonical format used by AOF/replication command frames.
 
-Multi-key requests whose keys map to different slots fail with:
+Keeping request parsing independent from response negotiation prevents protocol-version concerns from entering:
 
 ```text
-CROSSSLOT Keys in request don't hash to the same slot
+command validation
+Store
+AOF
+replication offset accounting
+Cluster key routing
 ```
 
-For routed commands, the server holds `Server.persistenceMu` across:
+## 5. Rich logical values
+
+`resp.Value` now models:
 
 ```text
-local key-existence observation
-        ↓
-Topology.Route(...)
-        ↓
-command execution when authorized
+Simple String
+Error
+Integer
+Blob String
+Array
+Null
+Boolean
+Double
+Big Number
+Verbatim String
+Map
+Set
+Push
 ```
 
-This is essential on a migrating source. A concurrent delete cannot slip between “this key still exists here” and the command that was authorized because of that fact.
+This is deliberately a logical intermediate representation.
 
-## 5. Stable ownership: MOVED
-
-When slot S has stable owner A:
+The same value can have two wire encodings. For example:
 
 ```text
-request on A → execute
-request on B → MOVED S A-address
+Boolean(true)
+   ├─ RESP2 → :1
+   └─ RESP3 → #t
 ```
 
-`MOVED` means stable routing metadata says the client should update its durable routing view.
-
-An unassigned slot returns `CLUSTERDOWN Hash slot not served`.
-
-## 6. Explicit migration state
-
-Migration does not immediately change the stable owner.
+and:
 
 ```text
-slot.owner           = source
-slot.migrationTarget = target
+Map{k:v}
+   ├─ RESP2 → *2 [k, v]
+   └─ RESP3 → %1 {k => v}
 ```
 
-While this state exists:
+## 6. Response adaptation sits above command semantics
 
-### Source
+The command implementation does not need a RESP2 branch and a RESP3 branch.
 
-- if the source still physically contains the requested key, it executes locally;
-- if the key is no longer present, it returns `ASK slot target-address`.
-
-### Target
-
-- without ASKING, it still returns MOVED to the stable source;
-- with a one-request ASKING grant, it may execute the routed request.
-
-This distinguishes temporary migration routing from stable ownership.
-
-## 7. ASKING is connection-local and one-shot
-
-`cluster.Session` owns one boolean grant.
+Example HGETALL:
 
 ```text
-ASKING
-  ↓ grant = true
-next command
-  ↓ consume grant
-following command
-  ↓ grant = false again
+Store / command handler
+      ↓
+logical field/value array
+      ↓
+protocol adapter
+  RESP2 → leave array
+  RESP3 → Map
 ```
 
-`Server.ServeCluster` creates one cluster Session per RESP/TCP connection, so ASKING is not global process state and cannot authorize unrelated clients.
+The current richer views are:
 
-## 8. Cluster-aware RESP endpoint
+| Logical command result | RESP2 | RESP3 |
+| --- | --- | --- |
+| `HGETALL` pairs | Array | Map |
+| `SMEMBERS` members | Array | Set |
+| `SISMEMBER` 0/1 | Integer | Boolean |
+| `ZSCORE` text score | Blob | Double |
+| missing value | null bulk/array | Null |
 
-`Server.ServeCluster(ctx, listener, topology, localID)` is a v0.10 teaching endpoint separate from the historical standalone listener.
+The adapter does not inspect physical Store encodings.
 
-It reuses the existing RESP2 reader/writer but routes every command through `ClusterExecute`. Wire tests prove actual RESP errors such as:
+## 7. RESP2 downgrade is a first-class path
+
+RESP3 support is not allowed to break historical clients.
+
+The protocol-aware writer maps richer logical values back to RESP2 forms:
 
 ```text
--MOVED 8000 node-b:6379
--ASK 8000 node-c:6379
+Map      → flat Array
+Set      → Array
+Push     → Array
+Boolean  → Integer 0/1
+Double   → Blob String
+BigNumber→ Blob String
+Null     → null bulk
+Verbatim → normal blob payload
 ```
 
-and prove that ASKING authorizes exactly one following request on the same connection.
+This lets internal code use richer semantic values without forcing every caller to understand RESP3.
 
-## 9. Slot migration and SnapshotEntry
+## 8. Incremental nested value parser
 
-Cluster migration never copies private Object payloads.
+`ParseValue` is separate from the command parser.
 
-`ClusterNode` exports logical `store.SnapshotEntry` values, the same stable boundary introduced for persistence/replication.
-
-For each key, source transfer holds the source `persistenceMu` across:
+Its contract is:
 
 ```text
-capture logical SnapshotEntry
-        ↓
-target ImportKey
-        ↓ success acknowledgement
-source DEL through ordinary mutation path
+valid but incomplete prefix
+  → complete=false
+  → consumed=0
+
+complete frame
+  → logical Value
+  → exact consumed byte count
+
+provably malformed frame
+  → protocol error
 ```
 
-Therefore a source-side write cannot occur after export but before delete.
+Nested Map/Set/Push parsing is recursion-bounded. Tests split a nested payload at every byte boundary.
 
-The target reconstructs the key using ordinary commands generated by `persistence.Commands`. It first logically deletes any stale target copy, reconstructs the value and absolute TTL, then publishes the import as one local AOF/replication transaction frame when those mechanisms are enabled.
+This parser is useful for demos/tests and provides a future foundation for clients consuming Push frames.
 
-## 10. Partial migration failure
+## 9. Pub/Sub: representation finally matches asynchronous semantics
 
-A failed key transfer does **not** pretend the slot became stable again.
+RESP2 represents Pub/Sub messages as ordinary arrays. A subscribed RESP2 connection therefore keeps the historical restricted command mode.
 
-Some earlier keys may already be present on the target. Therefore failure leaves:
+RESP3 has a dedicated Push marker:
 
 ```text
-owner = source
-migrationTarget = target
+>3
+$7
+message
+$4
+news
+$5
+hello
+
 ```
 
-A later `MigrateSlot` call recognizes the same source→target migration and resumes from the source's remaining keys.
-
-Stable ownership changes only after all remaining source keys transfer successfully.
-
-## 11. Commit
-
-After the source has no remaining keys for the slot:
+So the receiver can distinguish:
 
 ```text
-CommitMigration
-  ↓
-owner = target
-migrationTarget = ""
-new topology epoch
+normal command reply
 ```
 
-After commit:
-
-- old source returns MOVED to target;
-- target executes normally without ASKING.
-
-## 12. Bounded topology dissemination
-
-A full topology contains 16384 slot records, so v0.10 avoids pretending gossip is free.
-
-`GossipPage(start, limit)` emits at most `limit` slot records. A peer repeatedly consumes pages and calls `MergePage`.
-
-Merge policy is explicit:
+from:
 
 ```text
-higher topology epoch wins
-same epoch → deterministic stable-ID/address tie break
+unsolicited async message
 ```
 
-This makes dissemination bounded and testable, but it is not consensus. Independent writers can still conflict.
+without relying on array contents.
 
-## 13. Relationship to v0.8/v0.9
+The Pub/Sub hub is unchanged as a delivery mechanism. Only the frame representation changes.
 
-The layers now answer three different questions:
+## 10. Why RESP3 subscribers may issue ordinary commands
+
+Once asynchronous frames are visibly Push values, normal replies are no longer ambiguous.
+
+Therefore:
 
 ```text
-v0.8 replication:
-  how does a replica obtain one primary's data?
+RESP2 subscribed
+  → historical SUBSCRIBE / UNSUBSCRIBE / PING restriction
 
-v0.9 Sentinel:
-  which replica becomes primary for one replicated dataset?
-
-v0.10 Cluster:
-  which primary owns this key's slot?
+RESP3 subscribed
+  → ordinary commands allowed
+  → Pub/Sub arrives as Push
 ```
 
-Cluster migration reuses SnapshotEntry and ordinary mutation publication rather than creating a private value-copy representation.
+This demonstrates one of RESP3's architectural benefits rather than treating new markers as cosmetic syntax.
 
-v0.10 does not automatically combine Sentinel failover with slot-owner reassignment. That coupling is intentionally left outside this milestone.
+## 11. Legacy and reactor transports share semantics
 
-## 14. Validation model
+The goroutine-per-connection transport and epoll reactor do not contain separate HELLO state machines.
 
-Pure cluster tests prove:
+Both follow:
 
-- CRC16 known vectors;
-- non-empty hash-tag semantics;
-- CROSSSLOT rejection;
-- stable MOVED;
-- migration-time ASK;
-- ASKING target authorization;
-- migration commit;
-- bounded gossip reconstruction;
-- retry-safe partial migration contract.
+```text
+parse command
+   ↓
+execute shared session path
+   ↓
+read session.protocol
+   ↓
+EncodeValueProtocol
+```
 
-Real server tests prove:
+The reactor still owns nonblocking buffers/backpressure; the legacy engine still owns blocking goroutine scheduling. Protocol negotiation is orthogonal to both.
 
-- wrong-owner routing before Store execution;
-- one-shot ASKING behavior;
-- real logical key + TTL migration;
-- source key removal after target import;
-- post-commit MOVED/execute behavior;
-- RESP/TCP MOVED and ASKING semantics.
+## 12. Cluster composition
 
-`make cluster-demo` demonstrates the complete learning sequence.
+The explicit v0.10 Cluster endpoint now supports HELLO too, but the ordering is intentionally:
 
-## 15. Explicit limitations
+```text
+ordinary command
+   ↓
+ClusterExecute
+   ↓
+slot authorization / redirect
+   ↓
+logical reply
+   ↓
+RESP3 adaptation + encoding
+```
 
-v0.10 does not claim:
+not:
 
-- production Redis Cluster protocol compatibility;
-- distributed consensus for topology epochs;
-- fencing against concurrent/conflicting slot owners;
-- production gossip failure detection or anti-entropy;
-- automatic Sentinel-to-Cluster failover integration;
-- transparent MULTI/EXEC routing across cluster nodes;
-- atomic migration of multiple slots at once.
+```text
+RESP3
+   ↓
+bypass Cluster routing
+```
 
-## 16. Next architectural layer
+Wire tests prove a RESP3 client connected to the wrong owner still gets `MOVED`.
 
-v0.11 returns to protocol evolution: RESP3 negotiation, richer scalar/container replies and push messages while preserving all previous mechanism boundaries.
+HELLO itself is connection control and returns `mode=cluster` on the Cluster endpoint.
+
+## 13. Persistence and replication are protocol-independent
+
+A client may write using a RESP3 connection, but successful mutation publication still produces the same canonical command sequence used before v0.11.
+
+```text
+RESP3 client
+  SET k v
+     ↓
+command semantics
+     ↓
+canonical mutation
+   ├── AOF RESP command frame
+   └── replication RESP command frame
+```
+
+Thus changing HELLO mode cannot alter:
+
+- AOF replay meaning;
+- replication byte offsets;
+- backlog frame boundaries;
+- full/partial synchronization;
+- SnapshotEntry representation.
+
+## 14. Relationship to earlier topology layers
+
+```text
+v0.8 Replication
+  answers: how does another node receive data?
+
+v0.9 Sentinel
+  answers: which replica should become primary?
+
+v0.10 Cluster
+  answers: which primary owns this key's slot?
+
+v0.11 RESP3
+  answers: how does this connection represent replies and async events?
+```
+
+RESP3 is above these mechanisms rather than replacing any of them.
+
+## 15. Validation model
+
+### Codec
+
+- native RESP3 Map/Set/Boolean/Double/Null/Push encoding;
+- explicit RESP2 downgrade;
+- `inf`, `-inf`, `nan` doubles;
+- nested fragmented parser boundaries.
+
+### Network
+
+On both legacy and reactor:
+
+- HELLO 3 / HELLO 2;
+- richer command replies;
+- Pub/Sub Push;
+- normal commands while subscribed in RESP3;
+- unchanged RESP2 behavior.
+
+### Cluster
+
+- HELLO 3 reports cluster mode;
+- wrong owner remains MOVED;
+- rich views occur after successful slot authorization.
+
+### Demo
+
+```bash
+make resp3-demo
+```
+
+performs real TCP negotiation and prints RESP2 versus RESP3 value categories.
+
+## 16. Explicit limits
+
+v0.11 does not implement every RESP3 feature. In particular it does not claim complete support for streamed aggregates/strings, Attributes, full Blob Error semantics, client tracking pushes, or the production Redis HELLO option surface.
+
+Those omissions keep the learning boundary focused on negotiation, richer value representation and asynchronous Push.
+
+## 17. Next architectural layer
+
+v0.12 asks a different question:
+
+> **Can we observe and measure the cost/behavior of all these explicit mechanisms without changing their semantics?**
+
+The next layer is metrics, latency, lag, queueing, profiling and repeatable performance evidence.
