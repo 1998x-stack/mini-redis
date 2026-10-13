@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.10.0
+
+Architecture milestone: make Redis Cluster-style hash-slot routing, MOVED/ASK semantics, explicit slot migration and bounded topology dissemination visible as a separate layer above Store.
+
+- add exactly 16384 logical hash slots using CRC-16/XMODEM;
+- add first non-empty `{...}` hash-tag semantics;
+- add cluster node metadata and slot ownership table outside Store;
+- add routed command key extraction and CROSSSLOT rejection before mutation;
+- add stable wrong-owner `MOVED <slot> <addr>` responses;
+- add explicit source→target migration state;
+- add source-side `ASK <slot> <target>` for migrated/missing keys;
+- add one-request, connection-local `ASKING` authorization on the importing target;
+- add `CLUSTER KEYSLOT <key>` to the cluster facade;
+- add `Server.ClusterExecute` with migration-sensitive route+execute under `Server.persistenceMu`;
+- add logical `SnapshotEntry` key transfer without exposing private Object encodings;
+- preserve absolute TTL across migration;
+- require target import acknowledgement before source deletion;
+- leave partial migration state visible and support retry from source's remaining keys;
+- change stable owner only after the slot transfer completes;
+- add bounded `GossipPage(start, limit)` topology exchange;
+- add topology epochs and deterministic equal-epoch owner/migration-target tie-breaking;
+- add `Server.ServeCluster` as a cluster-aware RESP2/TCP teaching endpoint;
+- add direct, real-server and wire-level MOVED/ASKING/migration tests under `go test -race`;
+- add `make cluster-demo` showing MOVED → CROSSSLOT → ASK/ASKING → transfer → owner commit → bounded gossip;
+- explicitly keep cluster MULTI/EXEC, fencing, consensus, production Cluster bus semantics and automatic Sentinel/slot-failover coupling outside v0.10.
+
 ## v0.9.0
 
 Architecture milestone: make monitor-local failure detection, quorum-backed failover, runtime replica promotion and replication-topology repair explicit.
