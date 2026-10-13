@@ -264,7 +264,7 @@ func (s *Server) executeClientCommand(session *clientSession, argv []string) []r
 		}
 		session.mu.Unlock()
 		if inMulti {
-			return []resp.Value{resp.Error("ERR PUBLISH is not queued inside MULTI in mini-redis v0.7")}
+			return []resp.Value{resp.Error("ERR PUBLISH is not queued inside MULTI in mini-redis v0.8")}
 		}
 		if len(argv) != 3 {
 			return []resp.Value{resp.Error("ERR wrong number of arguments for 'publish' command")}
@@ -375,6 +375,9 @@ func (s *Server) execTransaction(session *clientSession) resp.Value {
 			session.resetTransaction(true)
 			return resp.Error("MISCONF AOF transaction persistence failed")
 		}
+	}
+	if len(persist) > 0 {
+		s.replicateCommandsLocked(persist, true)
 	}
 	s.persistenceMu.Unlock()
 	session.resetTransaction(true)
