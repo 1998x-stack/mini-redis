@@ -59,6 +59,7 @@ func (s *Server) serveLegacy(ctx context.Context) error {
 			}
 			return err
 		}
+		s.metrics.Connections.Inc("legacy")
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -68,9 +69,12 @@ func (s *Server) serveLegacy(ctx context.Context) error {
 }
 
 func (s *Server) handleBlockingConnection(ctx context.Context, conn net.Conn) {
-	defer conn.Close()
-	reader := resp.NewReader(conn)
-	writer := resp.NewWriter(conn)
+	s.metrics.ActiveConnections.Add("legacy", 1)
+	defer s.metrics.ActiveConnections.Add("legacy", -1)
+	observedConn := &metricConn{Conn: conn, metrics: s.metrics, engine: "legacy"}
+	defer observedConn.Close()
+	reader := resp.NewReader(observedConn)
+	writer := resp.NewWriter(observedConn)
 	var writeMu sync.Mutex
 	var session *clientSession
 	writeReply := func(value resp.Value) error {
@@ -80,7 +84,11 @@ func (s *Server) handleBlockingConnection(ctx context.Context, conn net.Conn) {
 		if session != nil {
 			protocol = session.protocolMode()
 		}
-		return writer.WriteValueProtocol(value, protocol)
+		if err := writer.WriteValueProtocol(value, protocol); err != nil {
+			return err
+		}
+		s.observeReply(protocol, value)
+		return nil
 	}
 	session = s.newClientSession(writeReply)
 	defer s.closeClientSession(session)
@@ -93,7 +101,7 @@ func (s *Server) handleBlockingConnection(ctx context.Context, conn net.Conn) {
 		}
 
 		if s.cfg.IdleTimeout > 0 {
-			_ = conn.SetReadDeadline(time.Now().Add(s.cfg.IdleTimeout))
+			_ = observedConn.SetReadDeadline(time.Now().Add(s.cfg.IdleTimeout))
 		}
 		argv, err := reader.ReadCommand()
 		if err != nil {
@@ -104,7 +112,7 @@ func (s *Server) handleBlockingConnection(ctx context.Context, conn net.Conn) {
 			return
 		}
 
-		for _, reply := range s.executeClientCommand(session, argv) {
+		for _, reply := range s.executeObservedClientCommand(session, argv) {
 			if err := writeReply(reply); err != nil {
 				return
 			}
