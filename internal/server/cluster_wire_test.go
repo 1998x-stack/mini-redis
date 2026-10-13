@@ -89,3 +89,52 @@ func TestClusterWireMovedAndAskingOneShot(t *testing.T) {
 
 	_ = a // source server intentionally need not be network-reached by this wire test.
 }
+
+func TestClusterWireRESP3NegotiationDoesNotBypassRouting(t *testing.T) {
+	b := clusterTestServer(t)
+	topology := cluster.NewTopology()
+	if err := topology.UpsertNode("a", "a-cluster:6379"); err != nil {
+		t.Fatal(err)
+	}
+	if err := topology.UpsertNode("b", "b-cluster:6379"); err != nil {
+		t.Fatal(err)
+	}
+	if err := topology.AssignRange(0, cluster.SlotCount-1, "a"); err != nil {
+		t.Fatal(err)
+	}
+	addr := startClusterWire(t, b, topology, "b")
+	conn, err := net.DialTimeout("tcp", addr.String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	writeCommand(t, conn, "HELLO", "3")
+	hello := readProtocolValue(t, conn)
+	if hello.Type != resp.MapType {
+		t.Fatalf("HELLO 3=%#v", hello)
+	}
+	mode, ok := mapLookup(hello, "mode")
+	if !ok || mode.Str != "cluster" {
+		t.Fatalf("mode=%#v ok=%v", mode, ok)
+	}
+
+	key := "cluster-resp3:{42}"
+	slot := cluster.HashSlot(key)
+	writeCommand(t, conn, "GET", key)
+	moved := readProtocolValue(t, conn)
+	want := fmt.Sprintf("MOVED %d a-cluster:6379", slot)
+	if moved.Type != resp.ErrorType || moved.Str != want {
+		t.Fatalf("routing bypassed: got=%#v want=%q", moved, want)
+	}
+
+	if err := topology.AssignSlot(slot, "b"); err != nil {
+		t.Fatal(err)
+	}
+	writeCommand(t, conn, "HSET", key, "field", "value")
+	_ = readProtocolValue(t, conn)
+	writeCommand(t, conn, "HGETALL", key)
+	if got := readProtocolValue(t, conn); got.Type != resp.MapType || len(got.Map) != 1 {
+		t.Fatalf("cluster RESP3 HGETALL=%#v", got)
+	}
+}
