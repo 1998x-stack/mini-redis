@@ -2,250 +2,173 @@
 
 An architecture-driven Redis learning implementation in Go. Each version replaces one hidden mechanism with an explicit, testable implementation.
 
-## Current milestone: v0.9
+## Current milestone: v0.10
 
 ```text
 v0.1  request → command → state → TTL → AOF
   ↓
-v0.2  nonblocking sockets + epoll event loop
+v0.2  epoll event loop
   ↓
-v0.3  Redis-like Dict + bounded incremental rehash
+v0.3  Redis-like Dict + incremental rehash
   ↓
 v0.4  List / Hash / Set / ZSet + adaptive encodings
   ↓
-v0.5  logical snapshots + RDB-like state + AOF rewrite
+v0.5  RDB-like snapshots + AOF rewrite
   ↓
-v0.6  maxmemory + sampled LRU/LFU eviction
+v0.6  maxmemory + sampled LRU/LFU
   ↓
-v0.7  WATCH + MULTI/EXEC + connection-mode Pub/Sub
+v0.7  WATCH + MULTI/EXEC + Pub/Sub
   ↓
-v0.8  full sync + repl-id/offset + backlog + partial resync
+v0.8  replication / PSYNC / backlog
   ↓
-v0.9  SDOWN/ODOWN + failover epoch + promotion + topology repair  ← current
+v0.9  Sentinel-inspired SDOWN/ODOWN/failover
   ↓
-v0.10 Cluster / hash slots
+v0.10 16384 hash slots + MOVED/ASK + migration + bounded gossip  ← current
 ```
 
-## Architecture
+## v0.10 mental model
 
 ```text
-clients
-  ↓ RESP2
-mini-redis data nodes
-  ├── primary
-  └── replicas
-        ↑
-        │ v0.8 replication
-        │ SnapshotEntry base + canonical RESP mutation frames
-        │
-Sentinel-inspired control plane
-  ├── monitor s1 ─┐
-  ├── monitor s2 ─┼─ health observations
-  └── monitor s3 ─┘
+key
+ ↓ CRC16/XMODEM
+hash-tag {...} when non-empty
+ ↓
+slot ∈ [0, 16383]
+ ↓
+slot ownership table
+ ├─ local stable owner  → execute
+ ├─ remote stable owner → MOVED <slot> <addr>
+ └─ migrating slot
+       ├─ source still has key → execute on source
+       ├─ source missing key   → ASK <slot> <target>
+       └─ importing target + ASKING → execute once
+```
+
+The central lesson is that **key/value state and slot/topology state are different layers**. Slot ownership never lives inside Store objects or persistence payloads.
+
+## Hash tags
+
+Redis-style non-empty hash tags force related keys into the same slot:
+
+```text
+user:{42}:name
+order:{42}:1
+```
+
+Both hash only `42`, so both map to slot `8000` in this implementation.
+
+`CLUSTER KEYSLOT <key>` is supported by the cluster-aware facade.
+
+## Stable routing: MOVED
+
+If node `a` owns a slot and a client asks node `b`:
+
+```text
+client → b
           ↓
-      SDOWN votes
-          ↓ quorum
-        ODOWN
-          ↓
-    failover epoch
-          ↓
-   candidate ranking
-          ↓
-      promotion
-          ↓
-  topology reconfiguration
+-MOVED <slot> a-address
 ```
 
-The central v0.9 lesson is that **data replication and failover coordination are different layers**. Sentinel never copies database state itself; it decides which v0.8 replication topology should be active.
+`MOVED` means the stable ownership table says another node owns the slot.
 
-## Supported command subset
+## Migration routing: ASK / ASKING
+
+During an explicit migration `source → target`, stable ownership remains the source until commit.
 
 ```text
-PING ECHO
-SET GET DEL EXISTS
-INCR INCRBY
-EXPIRE PEXPIREAT TTL
-KEYS DBSIZE FLUSHDB
-OBJECT ENCODING
-
-LPUSH RPUSH LPOP RPOP LLEN LRANGE
-HSET HGET HDEL HLEN HGETALL
-SADD SREM SISMEMBER SMEMBERS SCARD
-ZADD ZSCORE ZRANK ZRANGE ZREM
-
-WATCH UNWATCH MULTI EXEC DISCARD
-SUBSCRIBE UNSUBSCRIBE PUBLISH
+source owns slot
+migrationTarget = target
 ```
 
-This is an educational compatibility subset, not a production Redis replacement.
-
-## Run standalone
-
-```bash
-make all
-./bin/mini-redis-server -addr 127.0.0.1:6379
-redis-cli -p 6379
-```
-
-Linux `auto` selects the epoll reactor. The v0.1-style reference transport remains available with `-network-engine=legacy`.
-
-## v0.9 failover mental model
-
-### 1. Subjective failure: SDOWN
-
-Every monitor owns its own health history:
+Existing source keys continue to execute on the source. If the source no longer has a key in that slot, it returns:
 
 ```text
-s1 ──X──> primary      → s1 says SDOWN
-s2 ─────> primary      → healthy
-s3 ─────> primary      → healthy
+-ASK <slot> <target-address>
 ```
 
-One observer timing out is **not** enough to promote a replica.
-
-### 2. Objective failure: ODOWN
-
-With three monitors and quorum `2`:
+The client connects to the target and sends:
 
 ```text
-s1: SDOWN
-s2: SDOWN
-s3: healthy
-     ↓
-2 / 3 votes
-     ↓
-ODOWN
+ASKING
+<one routed command>
 ```
 
-Only then may failover start.
+`ASKING` is a one-request connection grant. The following routed command may execute on the importing target; the grant is then consumed. Without ASKING, the target still redirects to the stable owner until migration commit.
 
-### 3. Failover epoch and deterministic leader
+## Multi-key safety
 
-One failover attempt belongs to one monotonically increasing epoch. In this teaching implementation monitor IDs are sorted and the first SDOWN voter becomes the deterministic coordinator for that attempt.
+Commands such as `DEL` and `EXISTS` may reference multiple keys, but all routed keys must hash to one slot.
 
 ```text
-epoch 1
-  leader = s1
+DEL a:{same} b:{same}   → allowed
+DEL foo bar             → CROSSSLOT
 ```
 
-This is deliberately simpler than production Redis Sentinel election and is **not** a distributed-consensus claim.
+The cluster facade intentionally does not support MULTI/EXEC in v0.10. Transparent cross-command transaction routing is a non-goal rather than a partially correct promise.
 
-### 4. Candidate selection
+## Slot migration
 
-A replica is eligible only when a quorum can reach it and observes it as a replica. Candidates are ranked by:
-
-```text
-reachable monitor votes  ↓ descending
-replication offset       ↓ descending
-stable node ID           ↑ ascending tie-break
-```
-
-So an unreachable replica cannot win merely because its last known offset was high.
-
-### 5. Promotion
-
-Promotion changes a running replica into a primary at a `Server.persistenceMu` boundary:
+`cluster.MigrateSlot` exposes the migration boundary explicitly:
 
 ```text
-old replica
-   ↓ cancel upstream-follow role
-fresh repl-id + fresh backlog
-   ↓
-new replication listener
-   ↓
-role = primary
-   ↓
-client writes allowed
-```
-
-The promoted node already owns the replicated data. Promotion does not introduce a second copy protocol.
-
-### 6. Surviving replicas follow the promoted primary
-
-```text
-old primary P   X unreachable
-replica R1      → promoted primary
-replica R2      → FollowPrimary(R1)
-```
-
-Explicit topology changes intentionally reset remembered repl-id/offset, so following a different primary begins from a safe v0.8 `FULLRESYNC` boundary rather than accidentally reusing an offset from another replication identity.
-
-### 7. Old-primary return
-
-When the previous primary becomes observable again:
-
-```text
-old P returns as primary
+BeginMigration(slot, source, target)
         ↓
-Sentinel sees chosen primary = R1
+source.KeysInSlot(slot)
         ↓
-P.FollowPrimary(R1)
+for each remaining key:
+    source lock persistenceMu
         ↓
-P becomes READONLY replica
+    SnapshotEntry export
         ↓
-FULLRESYNC / later replication convergence
+    target ImportKey
+        ↓ success only
+    source DEL
+        ↓
+CommitMigration(slot)
+        ↓
+stable owner = target
 ```
 
-The teaching failover configuration requires dynamically demotable nodes to run with:
+The source does not delete a key before target import succeeds. A partial migration keeps the migration marker visible and can be retried from the source's remaining keys.
 
-```text
-appendonly = false
-maxmemory  = 0
-```
+Target import reconstructs logical `SnapshotEntry` state using the existing command/persistence path, including absolute TTL deadlines. Physical Object encodings do not cross nodes.
 
-v0.9 explicitly rejects dynamic demotion otherwise, rather than leaving a stale local AOF or independent eviction policy after the node becomes a replica.
+## Cluster-aware RESP endpoint
 
-## Important limitation: no fencing
+`Server.ServeCluster` exposes the routing layer over RESP2/TCP on a caller-supplied listener. Each TCP connection owns one cluster session, so ASKING has true one-request connection semantics.
 
-Sentinel-style observation cannot magically stop an unreachable old primary.
+This endpoint is deliberately separate from the historical standalone listener. v0.10 is an educational Cluster layer, not a drop-in production Redis Cluster server.
 
-During a partition this can exist temporarily:
+## Bounded topology exchange
 
-```text
-clients A → old primary P      (still alive, monitors cannot reach it)
-clients B → promoted primary R1
-```
+`Topology.GossipPage(start, limit)` returns at most `limit` slot records at a time. Repeated pages can rebuild another node's topology view.
 
-That is a split-brain risk. v0.9 does **not** implement fencing, leases, a consensus log, or production-grade Redis Sentinel protocol semantics. When the old primary becomes reachable again, the control plane reconfigures it as a replica of the chosen primary.
+Conflict resolution is explicit last-writer-wins by topology epoch with deterministic tie-breaking. This is a teaching mechanism for bounded dissemination, **not a consensus protocol**.
 
-This limitation is intentional and important to understand.
+## Important limitations
 
-## v0.8 replication remains the data plane
+v0.10 does not claim:
 
-Full synchronization still uses:
+- production Redis Cluster wire/protocol completeness;
+- consensus or linearizable slot ownership changes;
+- automatic cluster failover coupling Sentinel to slot ownership;
+- fencing against conflicting topology writers;
+- transparent MULTI/EXEC across cluster routing;
+- production anti-entropy or gossip failure detection.
 
-```text
-lock persistenceMu
-  ↓
-SnapshotEntry[] base
-  ↓
-capture repl-id / offset boundary
-  ↓
-attach live subscriber
-  ↓
-unlock
-  ↓
-base + ordered suffix
-```
-
-Reconnect still uses `PSYNC`, `CONTINUE`, frame-aware backlog and `FULLRESYNC` fallback. Successful EXEC mutations remain one replication frame.
-
-## Transactions and Pub/Sub
-
-`MULTI/EXEC` is ordered, non-interleaved execution rather than SQL rollback. WATCH is optimistic conflict detection. Pub/Sub remains ephemeral connection state and is unrelated to replication backlog or Sentinel health observations.
+v0.8 replication and v0.9 Sentinel remain independent lower layers. v0.10 adds the orthogonal question: **which primary owns this key's slot?**
 
 ## Learning demos
 
 ```bash
-make rehash-demo       # v0.3 Dict migration
-make encodings-demo    # v0.4 adaptive encodings
-make persistence-demo  # v0.5 RDB + AOF rewrite
-make eviction-demo     # v0.6 sampled eviction
-make session-demo      # v0.7 WATCH / MULTI / PubSub
-make replication-demo  # v0.8 FULLRESYNC → live → CONTINUE → READONLY
-make sentinel-demo     # v0.9 SDOWN → ODOWN → election → promotion → repair
-make benchmark         # reactor vs legacy transport
-make benchmark-dict    # educational Dict vs Go map
+make rehash-demo
+make encodings-demo
+make persistence-demo
+make eviction-demo
+make session-demo
+make replication-demo
+make sentinel-demo
+make cluster-demo      # v0.10 MOVED → ASK/ASKING → slot transfer → MOVED
 ```
 
 ## Validation
@@ -262,28 +185,33 @@ make eviction-demo
 make session-demo
 make replication-demo
 make sentinel-demo
+make cluster-demo
 make smoke
 NETWORK_ENGINE=legacy PORT=16380 make smoke
 ```
 
-## Read v0.9 in this order
+## Read v0.10 in this order
 
 ```text
-internal/sentinel/sentinel.go
-  ↓ monitor-local SDOWN / quorum ODOWN / epoch / ranking
-internal/sentinel/server_node.go
-  ↓ real TCP PING probe + topology adapter
-internal/server/topology.go
-  ↓ runtime PromoteToPrimary / FollowPrimary
-internal/server/replication.go
-  ↓ role-scoped replication transport
-internal/sentinel/sentinel_test.go
-internal/sentinel/integration_test.go
-internal/server/topology_test.go
-examples/sentinel/main.go
+internal/cluster/slot.go
+  ↓ CRC16 + hash tags
+internal/cluster/topology.go
+  ↓ owners / migration state / MOVED / ASK / bounded gossip
+internal/cluster/commands.go
+  ↓ command key extraction / CROSSSLOT / ASKING session
+internal/cluster/migration.go
+  ↓ resumable slot transfer contract
+internal/server/cluster.go
+  ↓ routing gate + SnapshotEntry transfer under persistenceMu
+internal/server/cluster_wire.go
+  ↓ RESP/TCP cluster endpoint
+internal/cluster/cluster_test.go
+internal/server/cluster_test.go
+internal/server/cluster_wire_test.go
+examples/cluster/main.go
 ```
 
-Compare historical branches `v0.1` through `v0.9` to see one dominant architecture change at a time.
+Compare historical branches `v0.1` through `v0.10` to see one dominant architecture change at a time.
 
 ## Repository contracts
 
