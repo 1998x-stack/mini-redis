@@ -75,12 +75,10 @@ func encodeCommands(commands [][]string) []byte {
 	return payload
 }
 
-// AppendBatch writes a logical mutation to the current AOF. During rewrite it
-// also buffers the exact bytes so mutations after the snapshot boundary can be
-// appended to the replacement file before publication.
-func (l *Log) AppendBatch(commands [][]string) error {
-	payload := encodeCommands(commands)
-
+func (l *Log) appendPayload(payload []byte) error {
+	if len(payload) == 0 {
+		return nil
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -98,6 +96,29 @@ func (l *Log) AppendBatch(commands [][]string) error {
 		l.dirty = false
 	}
 	return nil
+}
+
+// AppendBatch writes a logical mutation to the current AOF. During rewrite it
+// also buffers the exact bytes so mutations after the snapshot boundary can be
+// appended to the replacement file before publication.
+func (l *Log) AppendBatch(commands [][]string) error {
+	return l.appendPayload(encodeCommands(commands))
+}
+
+// AppendTransaction frames a complete EXEC mutation batch with MULTI/EXEC.
+// Replay does not expose the markers to command handlers; it buffers framed
+// commands and applies them only after the matching EXEC is present. Therefore
+// a crash-truncated transaction tail is discarded as a unit instead of
+// replaying a durable prefix of the transaction.
+func (l *Log) AppendTransaction(commands [][]string) error {
+	if len(commands) == 0 {
+		return nil
+	}
+	framed := make([][]string, 0, len(commands)+2)
+	framed = append(framed, []string{"MULTI"})
+	framed = append(framed, commands...)
+	framed = append(framed, []string{"EXEC"})
+	return l.appendPayload(encodeCommands(framed))
 }
 
 // BeginRewrite establishes the buffer boundary. The caller must coordinate its
@@ -255,8 +276,10 @@ func (l *Log) Close() error {
 	return errors.Join(syncErr, closeErr)
 }
 
-// Replay reuses the normal RESP parser. A truncated final command is ignored,
-// which remains the explicit v0.5 startup policy for crash-damaged AOF tails.
+// Replay reuses the normal RESP parser. A truncated final command is ignored.
+// v0.7 additionally recognizes AOF MULTI/EXEC framing: commands inside a frame
+// are not applied until EXEC is present, so a truncated final transaction is
+// discarded completely.
 func (l *Log) Replay(apply func([]string) error) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -266,6 +289,8 @@ func (l *Log) Replay(apply func([]string) error) error {
 	}
 
 	reader := resp.NewReader(l.file)
+	var transaction [][]string
+	inTransaction := false
 	for {
 		argv, err := reader.ReadCommand()
 		if err != nil {
@@ -274,8 +299,46 @@ func (l *Log) Replay(apply func([]string) error) error {
 			}
 			return fmt.Errorf("replay AOF: %w", err)
 		}
-		if err := apply(argv); err != nil {
-			return err
+		if len(argv) == 0 {
+			return errors.New("replay AOF: empty command")
+		}
+		name := strings.ToUpper(argv[0])
+
+		if inTransaction {
+			switch name {
+			case "MULTI":
+				return errors.New("replay AOF: nested MULTI")
+			case "EXEC":
+				if len(argv) != 1 {
+					return errors.New("replay AOF: invalid EXEC frame")
+				}
+				for _, command := range transaction {
+					if err := apply(command); err != nil {
+						return err
+					}
+				}
+				transaction = nil
+				inTransaction = false
+				continue
+			default:
+				transaction = append(transaction, append([]string(nil), argv...))
+				continue
+			}
+		}
+
+		switch name {
+		case "MULTI":
+			if len(argv) != 1 {
+				return errors.New("replay AOF: invalid MULTI frame")
+			}
+			inTransaction = true
+			transaction = nil
+		case "EXEC":
+			return errors.New("replay AOF: EXEC without MULTI")
+		default:
+			if err := apply(argv); err != nil {
+				return err
+			}
 		}
 	}
 
