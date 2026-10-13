@@ -18,8 +18,13 @@ func TestBacklogRetainsWholeFramesAndResumesAtBoundaries(t *testing.T) {
 	if got, ok := b.SuffixAfter(7); !ok || string(got) != "ccccc" {
 		t.Fatalf("suffix after 7=(%q,%v)", got, ok)
 	}
-	if _, ok := b.SuffixAfter(4); ok {
-		t.Fatal("offset 4 should be outside retained backlog")
+	// f1 itself no longer needs to be retained for a replica that already
+	// applied it: offset=f1.End resumes exactly at retained f2.Start.
+	if got, ok := b.SuffixAfter(4); !ok || string(got) != "bbbccccc" {
+		t.Fatalf("suffix after earliest resumable boundary=(%q,%v)", got, ok)
+	}
+	if _, ok := b.SuffixAfter(3); ok {
+		t.Fatal("offset before earliest retained frame boundary must require full sync")
 	}
 	if _, ok := b.SuffixAfter(9); ok {
 		t.Fatal("interior frame offset must not be resumable")
