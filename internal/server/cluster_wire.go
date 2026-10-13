@@ -5,15 +5,15 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 
 	"github.com/1998x-stack/mini-redis/internal/cluster"
 	"github.com/1998x-stack/mini-redis/internal/resp"
 )
 
-// ServeCluster serves a cluster-aware RESP2 endpoint on the supplied listener.
-// It is intentionally separate from the historical standalone listener so the
-// v0.10 routing layer stays explicit and version-local. Each TCP connection owns
-// one cluster.Session, which makes ASKING a true one-request connection grant.
+// ServeCluster serves the explicit cluster-aware endpoint introduced in v0.10.
+// v0.11 adds HELLO 2/3 negotiation here without changing the routing boundary:
+// every ordinary key command still passes through ClusterExecute before Store.
 func (s *Server) ServeCluster(ctx context.Context, listener net.Listener, topology *cluster.Topology, localID string) error {
 	if listener == nil || topology == nil || localID == "" {
 		return errors.New("cluster listener, topology and local node id are required")
@@ -41,7 +41,9 @@ func (s *Server) ServeCluster(ctx context.Context, listener net.Listener, topolo
 
 func (s *Server) serveClusterConn(ctx context.Context, conn net.Conn, topology *cluster.Topology, localID string) {
 	defer conn.Close()
-	session := &cluster.Session{}
+	clusterSession := &cluster.Session{}
+	protocolSession := s.newClientSession(nil)
+	defer s.closeClientSession(protocolSession)
 	reader := resp.NewReader(conn)
 	writer := resp.NewWriter(conn)
 	for {
@@ -53,11 +55,35 @@ func (s *Server) serveClusterConn(ctx context.Context, conn net.Conn, topology *
 			if errors.Is(err, io.EOF) {
 				return
 			}
-			_ = writer.WriteValue(resp.Error("ERR " + err.Error()))
+			_ = writer.WriteValueProtocol(resp.Error("ERR "+err.Error()), protocolSession.protocolMode())
 			return
 		}
-		if err := writer.WriteValue(s.ClusterExecute(topology, localID, session, argv)); err != nil {
+
+		if len(argv) > 0 && strings.EqualFold(argv[0], "HELLO") {
+			reply := setHelloMode(s.helloCommand(protocolSession, argv), "cluster")
+			if err := writer.WriteValueProtocol(reply, protocolSession.protocolMode()); err != nil {
+				return
+			}
+			continue
+		}
+
+		reply := s.ClusterExecute(topology, localID, clusterSession, argv)
+		reply = s.adaptReplyForProtocol(protocolSession, argv, reply)
+		if err := writer.WriteValueProtocol(reply, protocolSession.protocolMode()); err != nil {
 			return
 		}
 	}
+}
+
+func setHelloMode(reply resp.Value, mode string) resp.Value {
+	if reply.Type != resp.MapType {
+		return reply
+	}
+	for i := range reply.Map {
+		if reply.Map[i].Key.Type == resp.BulkStringType && reply.Map[i].Key.Str == "mode" {
+			reply.Map[i].Value = resp.BulkString(mode)
+			break
+		}
+	}
+	return reply
 }
