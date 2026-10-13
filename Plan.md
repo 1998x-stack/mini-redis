@@ -30,128 +30,146 @@ v0.11 RESP3
 v0.12 observability/performance
 ```
 
+The sequence follows dependency order, not command popularity.
+
 ## 2. Completed milestones
 
 ### v0.1 — Core vertical slice
-RESP2 → command registry → Store → String/TTL → AOF.
+RESP2 → command registry → Store → String/TTL → AOF. Goroutine-per-client reference transport.
 
 ### v0.2 — Nonblocking networking
-Linux epoll reactor, client buffers, partial frames/writes, pipelines, backpressure and timers.
+Linux epoll Poller, reactor, per-client buffers, incremental RESP parsing, pipelines, partial writes, backpressure and legacy comparison engine.
 
 ### v0.3 — Dictionary internals
-Explicit buckets/collisions, `ht[0]/ht[1]`, bounded incremental rehash and Object metadata.
+Explicit buckets, collision chains, `ht[0]/ht[1]`, load-factor resize and bounded incremental rehash.
 
-### v0.4 — Core types and adaptive encodings
-List/Hash/Set/ZSet, compact/general encodings, WRONGTYPE, atomic collection mutation and SkipList rank.
+### v0.4 — Core data types and adaptive encodings
+List/Hash/Set/ZSet, compact→general transitions, WRONGTYPE, TTL preservation and SkipList rank.
 
 ### v0.5 — Persistence depth
-Logical SnapshotEntry boundary, checksummed RDB-like snapshot, absolute TTL, crash-safe publication, buffered AOF rewrite and startup precedence.
+Stable logical `SnapshotEntry`, deterministic MRDB, crash-safe publication, AOF rewrite and post-snapshot mutation buffering.
 
 ### v0.6 — Memory pressure and sampled eviction
+Deterministic logical memory accounting, expiration/eviction separation, `noeviction`, random/LRU/LFU sampled policies, rollback boundary and eviction AOF persistence.
+
+### v0.7 — Transactions, WATCH and Pub/Sub
 
 Primary question:
 
-> Why are expiration and eviction separate, and why approximate LRU/LFU with samples instead of maintaining perfect global ordering?
+> How can Redis queue commands and detect optimistic conflicts while keeping transactions different from database rollback, and how does Pub/Sub turn a normal connection into a push-oriented session?
 
 Implemented:
 
-- deterministic logical-byte estimator distinct from Go heap/RSS;
-- runtime `memorypolicy.Manager` layered above the durable Store;
-- `maxmemory`, `noeviction`, `allkeys-random`, sampled `allkeys-lru` and sampled `allkeys-lfu`;
-- last-access metadata, probabilistic/sublinear LFU counters and time decay;
-- bounded candidate scoring per victim selection;
-- expiration cleanup counted separately from eviction;
-- logical snapshot rollback for rejected noeviction memory-growing writes;
-- removal-only commands remain usable while above noeviction limit;
-- eviction-generated logical `DEL` appended to AOF;
-- policy metadata excluded from RDB/AOF;
-- deterministic clock/RNG tests and `make eviction-demo`.
+- explicit `clientSession` state shared by reactor and legacy transports;
+- `MULTI`, ordered queueing, `EXEC`, `DISCARD`;
+- queue-time validation and dirty-transaction `EXECABORT`;
+- execution-time errors as EXEC array elements without rollback;
+- `WATCH` / `UNWATCH` with key versions, global epoch and existence checks;
+- WATCH invalidation on intervening writes, eviction and TTL disappearance;
+- RESP2 null-array conflict reply;
+- `persistenceMu` as EXEC non-interleaving boundary;
+- maintenance and RDB snapshot capture serialized with EXEC;
+- AOF `MULTI ... EXEC` framing for crash-truncated transaction-tail recovery;
+- `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH` live fan-out;
+- subscribed connection mode and disconnect cleanup;
+- Pub/Sub output integration with legacy writer mutex and reactor output buffers;
+- direct semantics tests, AOF restart/crash tests and both-engine network tests;
+- `make session-demo`.
 
 Critical invariants:
 
-- time expiry is not an eviction success;
-- rejected noeviction writes leave logical state and AOF unchanged;
-- eviction removes complete key + TTL metadata;
-- restart reconstructs eviction results without reconstructing access heat;
-- per-selection candidate scoring is bounded by configured samples.
+- MULTI queue state belongs to one client, not the Store;
+- EXEC commands cannot be interleaved with another logical mutation;
+- runtime command errors do not roll back successful siblings;
+- queue-time errors abort before execution;
+- WATCH detects intervening writes even if a value is later restored;
+- a watched key expiring before EXEC causes conflict;
+- RDB/AOF observers do not capture a half-EXEC state;
+- a truncated AOF transaction frame replays none of its commands;
+- Pub/Sub messages are ephemeral and never become persisted keyspace state;
+- disconnect removes subscriptions.
 
-## 3. v0.7 — Transactions + Pub/Sub
+## 3. v0.8 — Replication
 
 ### Primary question
 
-**How can Redis queue commands, detect optimistic conflicts, execute a transaction as one ordered unit, and support connections whose role changes into Pub/Sub delivery?**
+**How can a replica establish a consistent starting state, follow an ordered mutation stream, and reconnect using only the missing suffix when the primary still has it?**
 
 ### Required implementation
 
-#### MULTI / EXEC / DISCARD
-- per-client transaction state owned by the network/session layer;
-- `MULTI` enters queueing mode;
-- queue command syntax/arity errors before execution;
-- `EXEC` runs queued operations in original order inside one explicit server transaction boundary;
-- `DISCARD` clears transaction state;
-- define command errors inside EXEC without rolling back already executed Redis-style operations.
-
-#### WATCH / UNWATCH
-- Store-level logical key version counters independent of physical Dict layout;
-- mutations increment watched versions including deletion/expiration/eviction where appropriate;
-- `WATCH` captures versions before MULTI;
-- `EXEC` aborts when a watched key version changed;
-- `UNWATCH`, successful EXEC and DISCARD clear watch state.
-
-#### AOF / maxmemory interaction
-- define how EXEC's successful mutations are emitted as one ordered AOF batch;
-- keep noeviction/eviction semantics consistent inside transaction execution;
-- make the transaction boundary explicit rather than calling normal client execution recursively.
-
-#### Pub/Sub
-- basic `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH`;
-- broker/channel registry separated from durable Store state;
-- subscribed connection enters an explicit delivery mode;
-- message fan-out must not block unrelated reactor clients;
-- Pub/Sub messages are ephemeral and never enter RDB/AOF.
+- explicit primary/replica role configuration;
+- replication identity and monotonically increasing logical byte/stream offset;
+- primary replication feed coupled to acknowledged logical mutation order;
+- replica handshake and capability/state exchange;
+- full synchronization from one logical snapshot boundary;
+- buffering of primary mutations that occur after the full-sync snapshot boundary;
+- replica application path that does not re-append replicated commands as independent local client writes;
+- bounded backlog/ring buffer keyed by replication offset;
+- reconnect request containing replica's known identity + offset;
+- partial resynchronization when requested suffix remains in backlog;
+- fallback to full sync when identity/offset/backlog cannot satisfy request;
+- transaction framing preserved through replication as one ordered unit;
+- expiration semantics designed so replicas do not invent independent divergent lifetimes;
+- convergence tests under writes during full sync and disconnect/reconnect;
+- deterministic demo for full sync versus partial resync.
 
 ### Critical invariants
 
-- queued commands do not mutate state before EXEC;
-- transaction order matches queue order;
-- WATCH observes logical mutations, not physical rehash/encoding changes;
-- EXEC conflict abort performs no queued mutations;
-- Pub/Sub state is per connection/runtime only;
-- publishing does not become persistence state.
+- snapshot base + buffered suffix equals primary logical order;
+- replication offsets advance in exactly one canonical stream order;
+- replica never applies a suffix before its base state;
+- reconnect does not duplicate already-applied mutations;
+- backlog wrap only changes whether partial resync is possible, never correctness;
+- client writes are rejected on a read-only replica in the initial teaching model;
+- replication is not implemented by serializing private Object/Dict memory layout.
 
 ### Non-goals
 
-- no rollback transaction model;
-- no Lua scripting;
-- no Streams;
-- no replication yet.
+- no Sentinel/election yet;
+- no automatic promotion;
+- no Cluster/hash slots;
+- no diskless production optimization claims.
 
-## 4. v0.8 — Replication
-Primary/replica roles, full sync, replication offsets, backlog ring buffer, reconnect/partial resync and convergence tests.
+## 4. Later milestones
 
-## 5. v0.9 — Sentinel-inspired HA
-Health monitoring, subjective/objective failure, quorum/election, promotion and topology reconfiguration.
+### v0.9 — Sentinel-inspired HA
+Health monitoring, subjective/objective failure, quorum/election, replica promotion and topology reconfiguration.
 
-## 6. v0.10 — Cluster
-16384 hash slots, ownership, `MOVED`, migration/importing state, `ASK` and basic gossip.
+### v0.10 — Cluster
+16384 hash slots, key→slot mapping, ownership, `MOVED`, migration/importing state, `ASK` and basic topology gossip.
 
-## 7. v0.11 — RESP3
-Protocol negotiation, richer scalar/container types and push-style messages.
+### v0.11 — RESP3
+Protocol negotiation, richer scalar/container types and push-style messages where useful.
 
-## 8. v0.12 — Observability and performance
-Command latency, event-loop counters, expiration/eviction metrics, persistence timings, replication lag and repeatable profiling.
+### v0.12 — Observability and performance
+Command/session latency, event-loop counters, expiration/eviction metrics, persistence/replication timings, lag and repeatable profiling.
 
-## 9. Version completion rule
+## 5. Version completion rule
+
+A version is complete only after:
 
 ```text
-mechanism → invariant/error tests → integration/smoke → race/recovery
-→ docs/version → exact branch CI → fast-forward main → same-SHA main CI
+mechanism implemented
+      ↓
+invariant + error-path tests
+      ↓
+integration / smoke / demo
+      ↓
+race/recovery checks
+      ↓
+docs + version.md
+      ↓
+exact branch commit passes CI
+      ↓
+fast-forward into main
+      ↓
+main passes CI on same SHA
 ```
 
-## 10. Current directive
+## 6. Current directive
 
-Current integrated milestone after validation: **v0.6 — memory pressure and sampled eviction**.
+Current freeze candidate: **v0.7 — connection sessions, optimistic WATCH transactions and live Pub/Sub**.
 
-Next active version: **v0.7 — transactions, optimistic WATCH and basic Pub/Sub**.
+Next active version after v0.7 validation: **v0.8 — replication full sync, ordered propagation, offsets/backlog and partial resync**.
 
-Do not begin replication until transaction boundaries, key-version semantics and ephemeral Pub/Sub state are explicit.
+Do not begin Sentinel or Cluster work until replication convergence/reconnect semantics are explicit and tested.

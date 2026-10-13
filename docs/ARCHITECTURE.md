@@ -1,170 +1,293 @@
-# Architecture — v0.6
+# Architecture — v0.7
 
 ## 1. Current stack
 
 ```text
 redis-cli / client
       ↓
-RESP2 + reactor/legacy transport
+RESP2
+      ↓
+reactor client or legacy connection
+      ↓
+clientSession
+  ├── transaction queue
+  ├── WATCH tokens
+  └── channel subscriptions
+      ↓
+Server coordination
+  ├── persistenceMu
+  ├── keyVersionTable
+  └── pubSubHub
       ↓
 command.Registry
       ↓
-Server.persistenceMu
-      ↓
-memorypolicy.Manager
+memorypolicy.Manager (optional)
       ↓
 versionedmemory.Memory
-      ├── keyspace Dict[string → Object]
-      └── expires  Dict[string → deadline]
-                    │
-                    ▼
-            logical SnapshotEntry[]
-               ┌────┴────┐
-               ▼         ▼
-              RDB       AOF
+  ├── keyspace Dict
+  ├── expiry Dict
+  └── Object encodings
+      ↓
+SnapshotEntry logical state
+      ↓
+RDB / AOF
 ```
 
-v0.6 inserts runtime memory policy above the durable Store without changing the logical persistence representation.
+v0.7 adds connection semantics without moving them into the Store. This distinction is the main architecture lesson.
 
-## 2. Why not put LRU/LFU inside Object?
+## 2. Why transactions require client state
 
-Doing so would blur two layers:
+Before v0.7 every parsed command could be executed immediately:
 
 ```text
-logical durable state: key, type, value, expiry
-runtime policy state: last access, LFU heat, sampling counters
+RESP argv → executeCommand(argv) → reply
 ```
 
-`memorypolicy.Manager` wraps the Store, while `Snapshot()` simply delegates to the underlying logical store. `RestoreSnapshot()` deliberately clears access metadata.
-
-Therefore restart preserves data but not historical access heat.
-
-## 3. Approximate memory accounting
-
-v0.6 estimates bytes from logical `SnapshotEntry` values plus small fixed teaching overheads for key/object/expiry/access metadata.
-
-This yields deterministic tests and demos. It does **not** equal Go allocator bytes, heap profiles or process RSS. Exact allocator accounting is intentionally deferred.
-
-## 4. Expiration vs eviction
+MULTI breaks that assumption. After one connection sends MULTI, the same `SET` request means “validate and queue,” while another connection's identical request still means “execute now.” Therefore transaction state belongs to the connection:
 
 ```text
-expiration
-  cause: deadline passed
-  meaning: key is no longer valid
-
- eviction
-  cause: used estimate > maxmemory
-  meaning: a still-valid key is sacrificed by policy
+clientSession
+  inMulti
+  dirty
+  queue[][]string
+  watched map[key]token
 ```
 
-Pressure enforcement runs full expiry cleanup first. Expired keys are counted separately and are never reported as policy victims.
+This state is destroyed with the connection. It is not database content.
 
-## 5. Policy model
+## 3. Queue-time versus execution-time errors
 
-### noeviction
+The registry now exposes validation without executing handlers.
 
-Memory-growing commands execute behind `Server.persistenceMu` with a pre-command logical snapshot available for rollback. If the result remains over maxmemory, the snapshot is restored, OOM is returned, and the rejected command never reaches AOF.
+Queue-time failure:
 
-Removal-only mutations remain usable above the limit.
+```text
+MULTI
+NO_SUCH_COMMAND  → error now, mark dirty
+SET k v          → QUEUED
+EXEC             → EXECABORT, execute nothing
+```
 
-### allkeys-random
+Execution-time failure:
 
-Choose one live key uniformly from the current candidate set.
+```text
+SET n text
+MULTI
+INCR n           → QUEUED
+SET survivor yes → QUEUED
+EXEC             → [integer-error, OK]
+```
 
-### sampled LRU
+The second SET survives. Redis transactions give ordered, non-interleaved execution; they do not provide SQL-style rollback.
 
-Select at most `maxmemory-samples` candidates for one victim decision and choose the oldest `lastAccess` among them.
+## 4. WATCH as optimistic concurrency control
 
-No global exact LRU linked list/tree is maintained.
+WATCH does not lock a key. It records a token and lets other clients continue:
 
-### sampled LFU
+```text
+WATCH k records T0
+        ↓
+other clients run normally
+        ↓
+EXEC compares current token with T0
+```
 
-Use the same bounded candidate sample, but prefer the lowest decayed frequency. The counter is 8-bit and increments probabilistically: hotter values become harder to increment. Elapsed decay periods reduce stale heat.
+The token contains global epoch, per-key write version and whether the key existed.
 
-The exact constants are educational equivalents, not claims of production Redis tuning.
+Why version instead of only value comparison?
 
-## 6. Sampling boundary
+```text
+WATCH k   (value=A)
+other: SET k B
+other: SET k A
+EXEC
+```
 
-The implementation may enumerate logical keys to construct the educational candidate set, but **scoring/comparison work for one victim selection is bounded by the configured sample count**. This is the explicit v0.6 bounded-work claim.
+Final value equals the original, but an intervening mutation occurred. The version changed, so EXEC aborts.
 
-Later performance versions may make candidate discovery itself more incremental.
+Existence is also rechecked. This makes an already-watched key that expires before EXEC conflict even though expiration is not modeled as a client write-version event.
 
-## 7. Server / persistence ordering
+`FLUSHDB` advances a global epoch instead of enumerating every watched key version.
 
-For a successful memory-growing command under an eviction policy:
+## 5. The EXEC serialization boundary
+
+The sequence is:
 
 ```text
 lock persistenceMu
-   ↓
-execute logical mutation
-   ↓
-expire invalid keys
-   ↓
-if over limit: sample + evict complete live keys
-   ↓
-build AOF batch:
-  original mutation
-  DEL victim...
-   ↓
-append batch
-   ↓
-unlock / acknowledge
+    ↓
+validate every WATCH token
+    ↓
+execute queued command 1
+execute queued command 2
+...
+execute queued command N
+    ↓
+append one transaction AOF frame
+unlock persistenceMu
 ```
 
-For `noeviction`, an OOM path restores the pre-command logical snapshot before returning and does not append the rejected mutation.
+Normal commands already use this lock from earlier persistence work, so another client cannot insert a logical mutation between queued EXEC commands.
 
-This reference implementation favors a visible correctness boundary over efficient pre-admission byte deltas.
+The legacy engine also has a timer goroutine. v0.7 moves active-expiration maintenance through the same boundary so TTL cleanup cannot slip between WATCH validation and the transaction body. RDB snapshot capture also takes the boundary while extracting logical state, preventing a snapshot of only part of EXEC.
 
-## 8. Eviction and key metadata
+The Store mutex remains the lower-level data-structure safety boundary; these locks solve different problems.
 
-Eviction calls the normal Store delete path, so value and expiry dictionary entries disappear together. The wrapper also removes its access metadata for that key.
+## 6. Why AOF needs a transaction frame
 
-Incremental Dict rehash invariants therefore remain owned by the existing Store rather than being reimplemented by the policy layer.
-
-## 9. Persistence interaction
-
-AOF needs to persist eviction because eviction changes logical state. The server emits `DEL` for selected victims after the triggering mutation.
-
-RDB and AOF do not persist LRU/LFU metadata. On recovery, base logical state is restored/replayed first; only then is the memory-policy wrapper installed.
-
-That ordering prevents replaying historical commands from accidentally manufacturing access heat.
-
-## 10. Failure and edge cases
-
-- a rejected noeviction command restores logical state and does not change AOF;
-- reads never trigger eviction;
-- removal-only writes remain available above a noeviction limit;
-- if expiry alone frees enough memory, no live key is evicted;
-- restored keys without fresh access metadata are naturally considered cold when sampled after startup;
-- AOF failure after an already-applied acknowledged-path mutation remains the existing educational durability limitation and is not hidden by v0.6.
-
-## 11. Demo
-
-```bash
-make eviction-demo
-```
-
-It demonstrates:
-
-1. an expired key removed without counting as eviction;
-2. noeviction returning OOM while the live key remains;
-3. sampled LRU choosing the oldest candidate;
-4. sampled LFU protecting a repeatedly accessed key.
-
-## 12. Next architectural layer
-
-v0.7 introduces per-client state and optimistic transactions:
+Suppose EXEC runs:
 
 ```text
-WATCH versions
-      ↓
-MULTI queue
-      ↓
-EXEC ordered unit / DISCARD
-
-plus
-
-channel broker ↔ subscribed connections
+SET a 1
+SET b 2
 ```
 
-Transaction/watch state and Pub/Sub subscriptions are runtime/session state, not normal durable key values.
+If AOF writes them as unrelated records and the process crashes after the first durable write, restart exposes a state that never existed after a completed EXEC response.
+
+v0.7 writes:
+
+```text
+MULTI
+SET a 1
+SET b 2
+EXEC
+```
+
+AOF replay is a small state machine:
+
+```text
+outside frame
+  MULTI → start buffer
+  normal command → apply
+
+inside frame
+  normal command → buffer only
+  EXEC → apply buffered commands in order
+  EOF/truncated tail → drop buffer
+```
+
+The framing markers are persistence protocol, not normal Store commands. Server replay strips the markers before sending buffered commands through the existing command handlers.
+
+AOF rewrite still compacts database state. If an EXEC happens after rewrite buffering begins, the exact transaction frame is captured in the rewrite buffer.
+
+## 7. Memory pressure inside EXEC
+
+Each queued command still uses v0.6 memory-policy semantics. A command rejected by `noeviction` returns an error element and its own attempted mutation is rolled back. EXEC itself does not roll back successful sibling commands.
+
+If an eviction policy removes keys during a queued mutation, reconstruction `DEL` commands are collected into the same transaction AOF frame. WATCH versions for those victims are advanced as runtime coordination metadata.
+
+## 8. Pub/Sub is not a data type
+
+A tempting design is to store channels in the database Store. That would incorrectly imply persistence, TTL, snapshots and replication semantics for subscriptions.
+
+Instead:
+
+```text
+pubSubHub
+  channel → set(clientSession)
+```
+
+`SUBSCRIBE` adds the session to the hub and to its own subscription set. `PUBLISH` copies the current targets while holding the hub lock, releases the lock, then pushes the message to each session.
+
+The message is a live RESP2 array:
+
+```text
+[message, channel, payload]
+```
+
+There is no stored message history.
+
+## 9. Connection role transition
+
+A connection with at least one subscription is in subscribed mode.
+
+```text
+normal client
+    ↓ SUBSCRIBE
+subscribed client
+    ↓ UNSUBSCRIBE last channel
+normal client
+```
+
+In this version subscribed mode permits only SUBSCRIBE, UNSUBSCRIBE and PING. This makes the role transition explicit rather than hiding it in command handlers.
+
+Disconnect cleanup calls `unsubscribeAll`, preventing dead sessions from remaining channel members.
+
+## 10. Legacy versus reactor delivery
+
+### Legacy
+
+A connection goroutine normally writes request replies, while another publisher goroutine may push to it. A per-connection write mutex prevents the two RESP frames from interleaving bytes.
+
+### Reactor
+
+The event loop owns client buffers. A Pub/Sub push encodes the RESP value, appends it to the subscriber's output buffer and enables writable epoll interest. The same output/backpressure machinery as normal replies is reused.
+
+The session layer therefore stays transport-independent while each transport preserves its own I/O ownership rule.
+
+## 11. Persistence and runtime-state separation
+
+Persisted:
+
+```text
+keys
+logical values
+absolute expiry deadlines
+successful logical mutation history
+transaction frame boundaries needed for crash replay
+```
+
+Not persisted:
+
+```text
+MULTI queue before EXEC
+WATCH tokens/versions
+subscriptions
+Pub/Sub messages
+LRU/LFU access heat
+socket state
+```
+
+The distinction is essential before replication: v0.8 must replicate canonical database mutation order, not client-local control state.
+
+## 12. Testing model
+
+Direct session tests prove transaction semantics without sockets. Network tests then run transaction pipelines and Pub/Sub through both legacy and Linux reactor engines. Persistence tests prove complete transaction replay and truncated-frame discard. `make session-demo` gives an observable walkthrough.
+
+```bash
+make session-demo
+```
+
+Expected concepts:
+
+```text
+WATCH + intervening write → EXEC nil-array
+MULTI commands           → QUEUED
+EXEC                     → ordered result array
+SUBSCRIBE                 → connection role change
+PUBLISH                   → live message push
+```
+
+## 13. Non-goals
+
+- no SQL-style rollback;
+- no PUBLISH queueing inside MULTI in this teaching version;
+- no durable Pub/Sub history;
+- no Streams;
+- no replication yet;
+- no Sentinel/election;
+- no Cluster slots.
+
+## 14. Next architectural layer
+
+v0.8 uses the ordering boundaries built so far to teach replication:
+
+```text
+logical base snapshot S0
+       +
+ordered mutations after S0
+       =
+replica convergence
+```
+
+The next difficult boundary is reconnect: a replica presents identity + offset; the primary either serves the missing suffix from a bounded backlog or falls back to a new full synchronization.

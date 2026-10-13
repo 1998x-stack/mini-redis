@@ -9,12 +9,26 @@ mini-redis is an educational Redis implementation in Go. Optimize for architectu
 Do not optimize for full Redis compatibility, production hardening, source-code imitation or feature count.
 
 ```text
-one version → one primary mental model → explicit mechanism → invariant tests → demo
+one version
+   ↓
+one primary mental model
+   ↓
+small explicit mechanism
+   ↓
+invariant tests
+   ↓
+end-to-end demonstration
 ```
 
 ## 2. Mandatory reading order
 
-On `main`: `Agents.md` → `Plan.md` → `version.md` → `docs/ARCHITECTURE.md` → relevant source/tests.
+On `main`:
+
+1. `Agents.md`
+2. `Plan.md`
+3. `version.md`
+4. `docs/ARCHITECTURE.md`
+5. relevant source/tests
 
 On `v0.x`: read `Agents.md`, then `version.md`, then subsystem docs/source/tests. Historical branches must not absorb later mechanisms.
 
@@ -29,8 +43,8 @@ main ─────────────────────────
  ├── v0.3 Dict/rehash
  ├── v0.4 collections/encodings
  ├── v0.5 RDB/AOF rewrite
- ├── v0.6 memory pressure/eviction
- └── ...
+ ├── v0.6 maxmemory/eviction
+ └── v0.7 transactions/PubSub
 ```
 
 Create a new version from current `main`. After Definition of Done, validate the exact version commit, fast-forward `main`, validate that same SHA on `main`, then freeze the version branch.
@@ -42,17 +56,25 @@ TCP/client lifecycle
       ↓
 RESP
       ↓
+clientSession / connection mode
+      ↓
+server coordination
+      ↓
 command registry / semantics
       ↓
-server ordering + persistence boundary
+memory-pressure policy
       ↓
-memorypolicy.Manager          # runtime-only policy
+Store contract
       ↓
-Store / Object / TTL / Dict
+Object{Type,Encoding,payload}
+      ↓
+Dict / collection encodings / TTL
       ↓
 logical state / SnapshotEntry
       ↓
 AOF / RDB
+      ↓
+future replication stream
 ```
 
 Rules:
@@ -60,64 +82,100 @@ Rules:
 - RESP never depends on handlers;
 - storage never imports network/server;
 - command handlers do not inspect private encoding payloads;
+- per-client transaction/subscription state never lives in Store;
 - Store owns atomic value/TTL invariants;
 - Dict/SkipList implement mechanisms, not command policy;
 - persistence serializes logical state/history, never unstable Go memory layout;
-- eviction heat/counters are runtime policy state and never persistence-format state.
+- eviction heat and WATCH/session metadata never become persistence-format state;
+- replication must later consume canonical logical mutation order, not private memory layouts.
 
-## 5. Scope discipline
+## 5. Concurrency / atomicity
 
-Before adding anything ask whether it teaches the current mental model, is required by acceptance criteria, is a direct dependency, or hides a more fundamental lesson. Record later work in `Plan.md`; do not smuggle it into the current version.
+- v0.1 legacy transport: one goroutine/client, Memory mutex.
+- v0.2+ reactor: client I/O/parse/output state belongs to one event-loop owner.
+- Memory mutex remains the Store synchronization boundary because legacy engine still shares it.
+- Collection read-modify-write is one Store operation.
+- From v0.5, `Server.persistenceMu` names the logical command mutation + persistence ordering boundary.
+- v0.6 keeps memory-pressure decision and eviction persistence inside that boundary.
+- v0.7 holds `persistenceMu` across WATCH validation and an entire EXEC command sequence.
+- v0.7 maintenance expiration and RDB snapshot capture share that boundary so they cannot interleave/observe half of EXEC.
+- AOF `Log.mu` owns the live descriptor, rewrite buffer and final descriptor swap.
+- Never claim atomicity without naming the lock/file-system/protocol boundary that enforces it.
 
-## 6. Concurrency / atomicity
+## 6. Transaction/session rules
 
-- legacy transport: one goroutine/client with Memory mutex;
-- reactor: client I/O/parse/output state belongs to one event-loop owner;
-- collection read-modify-write is one Store operation;
-- `Server.persistenceMu` orders command mutation/AOF append against snapshot/rewrite start and v0.6 memory-pressure decisions;
-- AOF `Log.mu` owns the live descriptor, rewrite buffer and descriptor swap;
-- never claim atomicity without naming the lock/file-system boundary.
+v0.7 establishes a connection-state layer.
 
-## 7. Dictionary / object rules
+Requirements:
 
-- custom Dict remains the canonical top-level keyspace;
-- lookup/update/delete work during rehash;
-- no logical duplicate across `ht[0]/ht[1]`;
-- `RehashStep(N)` has bounded explicit work;
-- logical Type stays separate from physical Encoding;
-- representation changes preserve logical results and TTL.
+- `MULTI` queues commands; it does not promise rollback;
+- queue-time command/arity errors dirty the transaction and cause `EXECABORT`;
+- execution-time errors remain individual EXEC result elements and do not undo successful siblings;
+- `WATCH` is optimistic conflict detection, not a lock;
+- write versions detect change-then-change-back conflicts;
+- existence recheck catches watched-key expiration;
+- `DISCARD` and successful/conflicted EXEC clear WATCH state;
+- transaction/session state is dropped on connection close;
+- EXEC persistence uses AOF framing so a crash-truncated final transaction cannot replay a prefix.
 
-## 8. Persistence rules
+The current teaching subset intentionally rejects `PUBLISH`, subscription changes and `UNWATCH` inside MULTI. Do not silently widen semantics without tests/docs.
 
-Established through v0.5:
+## 7. Pub/Sub rules
 
-- only successful acknowledged mutations enter AOF;
-- relative TTL persists as absolute deadline;
-- `SnapshotEntry` is the stable logical state boundary;
-- RDB validates magic/version/length/checksum;
-- publication is temp → file fsync → atomic rename → directory fsync;
-- rewrite buffers every acknowledged mutation after the snapshot boundary;
+- subscriptions belong to `clientSession`, never keyspace objects;
+- the hub may route live messages but never persist them;
+- subscribed mode is an explicit connection role;
+- disconnect must remove every channel membership;
+- delivery count means matched subscribed sessions, not durable acknowledgement;
+- no message history/backlog is implied by Pub/Sub.
+
+Do not confuse Pub/Sub with future replication backlog or Streams.
+
+## 8. Dictionary/object rules
+
+The custom Dict remains the canonical keyspace mechanism. Lookup/update/delete must work while rehashing; no logical duplicate may exist across `ht[0]/ht[1]`; one `RehashStep(N)` has bounded work.
+
+From v0.4 onward logical Type and physical Encoding are distinct:
+
+```text
+String : int/raw
+List   : listpack/quicklist
+Hash   : listpack/hashtable
+Set    : intset/hashtable
+ZSet   : listpack/skiplist
+```
+
+Commands validate Type, not payload implementation. Representation conversion preserves logical results and TTL. Persistence never serializes private encoding structures.
+
+## 9. Persistence rules
+
+Established invariants:
+
+- only successful logical mutations are appended to AOF;
+- relative TTL persists as an absolute deadline;
+- restart/replay must not resurrect expired state;
+- `SnapshotEntry` is the stable logical persistence boundary;
+- RDB-like files validate magic/version/length/checksum;
+- publication uses same-directory temp → file fsync → atomic rename → directory fsync;
+- failure before rename leaves the old target valid;
+- AOF rewrite emits logical reconstruction commands;
+- writes after the rewrite snapshot boundary enter the rewrite buffer;
 - AOF is authoritative at startup when enabled;
-- truncated final AOF frame is tolerated; corrupt/incompatible RDB fails startup.
+- truncated final ordinary AOF frames are ignored under the explicit crash-tail policy;
+- v0.7 AOF MULTI/EXEC frames are applied only when the closing EXEC is complete;
+- corrupt/incompatible complete persistence input fails startup.
 
-Any new runtime metadata must justify whether it is logical durable state. LRU/LFU heat is explicitly not durable.
-
-## 9. Memory-pressure rules
-
-From v0.6:
+## 10. Memory-pressure rules
 
 - expiration is time validity; eviction is memory-pressure policy;
-- logical byte estimates are deterministic teaching estimates, not heap/RSS claims;
-- `noeviction` rejection cannot leave a partial logical mutation or AOF record;
-- removal-only commands remain usable above the limit;
-- one eviction removes value + expiry + runtime access metadata together;
-- random/LRU/LFU use bounded candidate scoring per victim selection;
-- sampled LRU/LFU do not maintain a globally sorted exact policy structure;
-- eviction is persisted as logical `DEL`, but LRU/LFU metadata is never serialized.
+- `noeviction` rejection cannot leave a partially applied logical mutation;
+- sampling work is bounded and observable;
+- eviction removes value + expiry together;
+- LRU/LFU heat is runtime policy state and never persisted.
 
-## 10. Testing baseline
+## 11. Testing baseline
 
-Before reporting a version clean, run on the exact commit:
+Before reporting a version clean, run on the exact code:
 
 ```bash
 gofmt -d .
@@ -128,45 +186,56 @@ make rehash-demo
 make encodings-demo
 make persistence-demo
 make eviction-demo
+make session-demo
 make smoke
 NETWORK_ENGINE=legacy PORT=16380 make smoke
 ```
 
-Mechanism tests are mandatory: collisions/rehash, encoding conversion, SkipList rank, TTL, persistence crash/recovery, expiration-vs-eviction, noeviction rollback/AOF invariance, bounded LRU/LFU sampling and restart state after eviction.
+For v0.7 specifically test queue-time versus execution-time failures, WATCH conflict/no-conflict, TTL conflict, transaction AOF truncation, subscriber disconnect cleanup and both network engines.
 
-## 11. Documentation contract
+Do not claim a check passed unless it ran on the exact reported SHA.
 
-Every version keeps `Agents.md`, `Plan.md`, `version.md`, `docs/ARCHITECTURE.md`, README, CHANGELOG and VERSION synchronized.
+## 12. Documentation contract
 
-## 12. Commit discipline
+Every version must keep synchronized:
 
-Prefer coherent architectural commits. Do not commit runtime AOF/RDB files, binaries, benchmark profiles or temporary data. Do not rewrite unrelated historical mechanisms merely to make the current version look cleaner.
+- `Agents.md`
+- `Plan.md`
+- `version.md`
+- `docs/ARCHITECTURE.md`
+- README when user-visible behavior changes
+- CHANGELOG / VERSION
 
-## 13. Definition of Done
+`version.md` must explain what changed relative to prior version, why, critical invariants, non-goals and the next dependency.
+
+## 13. Commit discipline
+
+Prefer coherent architectural commits. Do not commit binaries, AOF/RDB runtime files, profiles or generated temporary data. Avoid mixing the next version's mechanism into a current-version fix.
+
+## 14. Definition of Done
 
 - [ ] primary mental model explicit;
 - [ ] promised mechanism implemented;
 - [ ] invariant/error-path tests exist;
-- [ ] race/build/demos/smoke pass;
-- [ ] persistence interaction tested when changed;
+- [ ] race/build/smoke/demo validation passes;
+- [ ] persistence recovery tested when changed;
 - [ ] version/docs synchronized;
 - [ ] exact version SHA passes CI;
 - [ ] `main` fast-forwarded to same SHA;
 - [ ] same SHA passes CI on `main`;
 - [ ] next-version rationale documented.
 
-## 14. Current directive
+## 15. Current directive
 
-Current milestone after integration: **v0.6 — approximate maxmemory accounting, expiration vs eviction, random/sampled LRU/sampled LFU policies**.
+Freeze candidate: **v0.7 — per-client sessions, WATCH/MULTI/EXEC and live Pub/Sub**.
 
-Next milestone: **v0.7 — MULTI/EXEC/DISCARD, WATCH/UNWATCH and basic Pub/Sub**.
+After exact-SHA validation, next milestone is **v0.8 — replication full sync, canonical mutation propagation, offsets/backlog and partial resynchronization**.
 
-For v0.7:
+For v0.8:
 
-1. preserve v0.6 memory/persistence behavior;
-2. define per-client transaction state outside Store values;
-3. validate queued command syntax before EXEC while deferring execution;
-4. add key versioning for optimistic WATCH conflicts;
-5. make EXEC one explicit ordered server boundary and define AOF behavior;
-6. model Pub/Sub connection state explicitly;
-7. do not begin replication yet.
+1. preserve transaction order in the replication stream;
+2. establish a consistent snapshot + post-snapshot suffix boundary before optimizing transfer;
+3. make offsets explicit and testable;
+4. use a bounded backlog for reconnect, never as durable database state;
+5. keep replicas read-only initially;
+6. do not begin Sentinel election or Cluster slots yet.
