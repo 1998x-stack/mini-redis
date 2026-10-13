@@ -41,8 +41,8 @@ type Server struct {
 
 	// replControlMu owns the runtime topology role. v0.8 treated role as static
 	// configuration; v0.9 must change it safely during Sentinel-style failover.
-	replControlMu sync.RWMutex
-	replRootCtx   context.Context
+	replControlMu  sync.RWMutex
+	replRootCtx    context.Context
 	replRoleCancel context.CancelFunc
 	replRole       config.ReplicationRole
 	replUpstream   string
