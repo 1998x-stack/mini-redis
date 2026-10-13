@@ -195,7 +195,7 @@ func (s *Server) acceptReady(poller netpoll.Poller, listenerFD int, clients map[
 		_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
 		client := &reactorClient{fd: fd, lastActive: now}
 		client.session = s.newClientSession(func(value resp.Value) error {
-			payload, err := resp.EncodeValue(value)
+			payload, err := resp.EncodeValueProtocol(value, client.session.protocolMode())
 			if err != nil {
 				return err
 			}
@@ -251,7 +251,7 @@ func (s *Server) processClientInput(client *reactorClient) error {
 	for len(client.input) > 0 {
 		argv, consumed, complete, err := resp.ParseCommand(client.input)
 		if err != nil {
-			payload, encodeErr := resp.EncodeValue(resp.Error("ERR " + err.Error()))
+			payload, encodeErr := resp.EncodeValueProtocol(resp.Error("ERR "+err.Error()), client.session.protocolMode())
 			if encodeErr != nil {
 				return encodeErr
 			}
@@ -273,7 +273,7 @@ func (s *Server) processClientInput(client *reactorClient) error {
 		}
 
 		for _, reply := range s.executeClientCommand(client.session, argv) {
-			payload, err := resp.EncodeValue(reply)
+			payload, err := resp.EncodeValueProtocol(reply, client.session.protocolMode())
 			if err != nil {
 				return err
 			}
