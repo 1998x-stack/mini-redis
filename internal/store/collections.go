@@ -9,9 +9,7 @@ import (
 )
 
 const (
-	// CompactMaxEntries is deliberately tiny so representation changes are easy
-	// to trigger in tests and in OBJECT ENCODING demonstrations.
-	CompactMaxEntries = 8
+	CompactMaxEntries  = 8
 	QuickListChunkSize = 4
 )
 
@@ -21,7 +19,6 @@ type quickNode struct {
 	values     []string
 	prev, next *quickNode
 }
-
 type quickList struct {
 	head, tail *quickNode
 	length     int
@@ -30,7 +27,9 @@ type quickList struct {
 func (q *quickList) pushFront(v string) {
 	if q.head == nil {
 		n := &quickNode{values: []string{v}}
-		q.head, q.tail, q.length = n, n, 1
+		q.head = n
+		q.tail = n
+		q.length = 1
 		return
 	}
 	if len(q.head.values) < QuickListChunkSize {
@@ -43,11 +42,12 @@ func (q *quickList) pushFront(v string) {
 	q.head = n
 	q.length++
 }
-
 func (q *quickList) pushBack(v string) {
 	if q.tail == nil {
 		n := &quickNode{values: []string{v}}
-		q.head, q.tail, q.length = n, n, 1
+		q.head = n
+		q.tail = n
+		q.length = 1
 		return
 	}
 	if len(q.tail.values) < QuickListChunkSize {
@@ -60,7 +60,6 @@ func (q *quickList) pushBack(v string) {
 	q.tail = n
 	q.length++
 }
-
 func (q *quickList) popFront() (string, bool) {
 	if q.head == nil {
 		return "", false
@@ -78,7 +77,6 @@ func (q *quickList) popFront() (string, bool) {
 	}
 	return v, true
 }
-
 func (q *quickList) popBack() (string, bool) {
 	if q.tail == nil {
 		return "", false
@@ -97,7 +95,6 @@ func (q *quickList) popBack() (string, bool) {
 	}
 	return v, true
 }
-
 func (q *quickList) values() []string {
 	out := make([]string, 0, q.length)
 	for n := q.head; n != nil; n = n.next {
@@ -109,41 +106,44 @@ func (q *quickList) values() []string {
 func NewList() Object {
 	return Object{Type: ObjectList, Encoding: EncodingListPack, payload: []string{}}
 }
-
 func (o *Object) ensureQuickList() {
 	if o.Type != ObjectList || o.Encoding != EncodingListPack {
 		return
 	}
+	items := o.payload.([]string)
 	q := &quickList{}
-	for _, v := range o.payload.([]string) {
+	for _, v := range items {
 		q.pushBack(v)
 	}
 	o.Encoding = EncodingQuickList
 	o.payload = q
 }
-
 func (o *Object) ListPush(left bool, values []string) int {
-	for _, v := range values {
-		if o.Encoding == EncodingListPack {
-			if left {
+	if left {
+		for _, v := range values {
+			if o.Encoding == EncodingListPack {
 				o.payload = append([]string{v}, o.payload.([]string)...)
 			} else {
-				o.payload = append(o.payload.([]string), v)
+				o.payload.(*quickList).pushFront(v)
 			}
-			if len(o.payload.([]string)) > CompactMaxEntries {
+			if o.Encoding == EncodingListPack && len(o.payload.([]string)) > CompactMaxEntries {
 				o.ensureQuickList()
 			}
-			continue
 		}
-		if left {
-			o.payload.(*quickList).pushFront(v)
-		} else {
-			o.payload.(*quickList).pushBack(v)
+	} else {
+		for _, v := range values {
+			if o.Encoding == EncodingListPack {
+				o.payload = append(o.payload.([]string), v)
+			} else {
+				o.payload.(*quickList).pushBack(v)
+			}
+			if o.Encoding == EncodingListPack && len(o.payload.([]string)) > CompactMaxEntries {
+				o.ensureQuickList()
+			}
 		}
 	}
 	return o.ListLen()
 }
-
 func (o *Object) ListPop(left bool) (string, bool) {
 	if o.Encoding == EncodingListPack {
 		items := o.payload.([]string)
@@ -166,14 +166,12 @@ func (o *Object) ListPop(left bool) (string, bool) {
 	}
 	return q.popBack()
 }
-
 func (o Object) ListLen() int {
 	if o.Encoding == EncodingListPack {
 		return len(o.payload.([]string))
 	}
 	return o.payload.(*quickList).length
 }
-
 func (o Object) ListRange(start, stop int) []string {
 	var items []string
 	if o.Encoding == EncodingListPack {
@@ -196,7 +194,6 @@ type hashTable struct{ fields *dict.Dict[string] }
 func NewHash() Object {
 	return Object{Type: ObjectHash, Encoding: EncodingListPack, payload: &compactHash{}}
 }
-
 func (o *Object) upgradeHash() {
 	c := o.payload.(*compactHash)
 	d := dict.New[string](dict.FNV1a)
@@ -206,7 +203,6 @@ func (o *Object) upgradeHash() {
 	o.Encoding = EncodingHashTable
 	o.payload = &hashTable{fields: d}
 }
-
 func (o *Object) HashSet(pairs []FieldValue) int {
 	added := 0
 	if o.Encoding == EncodingListPack {
@@ -239,7 +235,6 @@ func (o *Object) HashSet(pairs []FieldValue) int {
 	}
 	return added
 }
-
 func (o Object) HashGet(field string) (string, bool) {
 	if o.Encoding == EncodingListPack {
 		for _, p := range o.payload.(*compactHash).entries {
@@ -251,7 +246,6 @@ func (o Object) HashGet(field string) (string, bool) {
 	}
 	return o.payload.(*hashTable).fields.Get(field)
 }
-
 func (o *Object) HashDelete(fields []string) int {
 	removed := 0
 	if o.Encoding == EncodingListPack {
@@ -280,23 +274,19 @@ func (o *Object) HashDelete(fields []string) int {
 	}
 	return removed
 }
-
 func (o Object) HashLen() int {
 	if o.Encoding == EncodingListPack {
 		return len(o.payload.(*compactHash).entries)
 	}
 	return o.payload.(*hashTable).fields.Len()
 }
-
 func (o Object) HashGetAll() []FieldValue {
 	var out []FieldValue
 	if o.Encoding == EncodingListPack {
 		out = append(out, o.payload.(*compactHash).entries...)
 	} else {
-		o.payload.(*hashTable).fields.Range(func(k, v string) bool {
-			out = append(out, FieldValue{Field: k, Value: v})
-			return true
-		})
+		h := o.payload.(*hashTable)
+		h.fields.Range(func(k, v string) bool { out = append(out, FieldValue{k, v}); return true })
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Field < out[j].Field })
 	return out
@@ -310,17 +300,14 @@ type stringSet struct{ members *dict.Dict[struct{}] }
 func NewSet() Object {
 	return Object{Type: ObjectSet, Encoding: EncodingIntSet, payload: &intSet{}}
 }
-
 func canonicalInt(s string) (int64, bool) {
 	n, err := strconv.ParseInt(s, 10, 64)
 	return n, err == nil && strconv.FormatInt(n, 10) == s
 }
-
 func intIndex(values []int64, n int64) (int, bool) {
 	i := sort.Search(len(values), func(i int) bool { return values[i] >= n })
 	return i, i < len(values) && values[i] == n
 }
-
 func (o *Object) upgradeSet() {
 	s := o.payload.(*intSet)
 	d := dict.New[struct{}](dict.FNV1a)
@@ -330,7 +317,6 @@ func (o *Object) upgradeSet() {
 	o.Encoding = EncodingHashTable
 	o.payload = &stringSet{members: d}
 }
-
 func (o *Object) SetAdd(members []string) int {
 	added := 0
 	if o.Encoding == EncodingIntSet {
@@ -376,13 +362,12 @@ func (o *Object) SetAdd(members []string) int {
 	}
 	return added
 }
-
 func (o *Object) SetRemove(members []string) int {
 	removed := 0
 	if o.Encoding == EncodingIntSet {
 		s := o.payload.(*intSet)
-		for _, member := range members {
-			n, ok := canonicalInt(member)
+		for _, m := range members {
+			n, ok := canonicalInt(m)
 			if !ok {
 				continue
 			}
@@ -396,14 +381,13 @@ func (o *Object) SetRemove(members []string) int {
 		return removed
 	}
 	s := o.payload.(*stringSet)
-	for _, member := range members {
-		if s.members.Delete(member) {
+	for _, m := range members {
+		if s.members.Delete(m) {
 			removed++
 		}
 	}
 	return removed
 }
-
 func (o Object) SetIsMember(member string) bool {
 	if o.Encoding == EncodingIntSet {
 		n, ok := canonicalInt(member)
@@ -416,14 +400,12 @@ func (o Object) SetIsMember(member string) bool {
 	_, ok := o.payload.(*stringSet).members.Get(member)
 	return ok
 }
-
 func (o Object) SetCard() int {
 	if o.Encoding == EncodingIntSet {
 		return len(o.payload.(*intSet).values)
 	}
 	return o.payload.(*stringSet).members.Len()
 }
-
 func (o Object) SetMembers() []string {
 	out := make([]string, 0, o.SetCard())
 	if o.Encoding == EncodingIntSet {
@@ -448,15 +430,12 @@ type largeZSet struct {
 func NewZSet() Object {
 	return Object{Type: ObjectZSet, Encoding: EncodingListPack, payload: &compactZSet{}}
 }
-
 func scoreLess(a, b ScoredMember) bool {
 	return a.Score < b.Score || (a.Score == b.Score && a.Member < b.Member)
 }
-
 func sortZ(entries []ScoredMember) {
 	sort.Slice(entries, func(i, j int) bool { return scoreLess(entries[i], entries[j]) })
 }
-
 func (o *Object) upgradeZSet() {
 	c := o.payload.(*compactZSet)
 	z := &largeZSet{scores: dict.New[float64](dict.FNV1a), order: skiplist.New()}
@@ -467,7 +446,6 @@ func (o *Object) upgradeZSet() {
 	o.Encoding = EncodingSkipList
 	o.payload = z
 }
-
 func (o *Object) ZAdd(pairs []ScoredMember) int {
 	added := 0
 	if o.Encoding == EncodingListPack {
@@ -509,7 +487,6 @@ func (o *Object) ZAdd(pairs []ScoredMember) int {
 	}
 	return added
 }
-
 func (o Object) ZScore(member string) (float64, bool) {
 	if o.Encoding == EncodingListPack {
 		for _, e := range o.payload.(*compactZSet).entries {
@@ -521,7 +498,6 @@ func (o Object) ZScore(member string) (float64, bool) {
 	}
 	return o.payload.(*largeZSet).scores.Get(member)
 }
-
 func (o Object) ZRank(member string) (int, bool) {
 	score, ok := o.ZScore(member)
 	if !ok {
@@ -537,9 +513,9 @@ func (o Object) ZRank(member string) (int, bool) {
 	}
 	return o.payload.(*largeZSet).order.Rank(score, member)
 }
-
 func (o Object) ZRange(start, stop int) []ScoredMember {
-	start, stop, ok := normalizeRange(o.ZLen(), start, stop)
+	n := o.ZLen()
+	start, stop, ok := normalizeRange(n, start, stop)
 	if !ok {
 		return []ScoredMember{}
 	}
@@ -553,14 +529,13 @@ func (o Object) ZRange(start, stop int) []ScoredMember {
 	}
 	return out
 }
-
 func (o *Object) ZRemove(members []string) int {
 	removed := 0
 	if o.Encoding == EncodingListPack {
 		c := o.payload.(*compactZSet)
 		want := map[string]struct{}{}
-		for _, member := range members {
-			want[member] = struct{}{}
+		for _, m := range members {
+			want[m] = struct{}{}
 		}
 		out := c.entries[:0]
 		for _, e := range c.entries {
@@ -575,18 +550,17 @@ func (o *Object) ZRemove(members []string) int {
 		return removed
 	}
 	z := o.payload.(*largeZSet)
-	for _, member := range members {
-		score, ok := z.scores.Get(member)
+	for _, m := range members {
+		score, ok := z.scores.Get(m)
 		if !ok {
 			continue
 		}
-		z.scores.Delete(member)
-		z.order.Delete(score, member)
+		z.scores.Delete(m)
+		z.order.Delete(score, m)
 		removed++
 	}
 	return removed
 }
-
 func (o Object) ZLen() int {
 	if o.Encoding == EncodingListPack {
 		return len(o.payload.(*compactZSet).entries)
@@ -599,10 +573,10 @@ func normalizeRange(length, start, stop int) (int, int, bool) {
 		return 0, 0, false
 	}
 	if start < 0 {
-		start += length
+		start = length + start
 	}
 	if stop < 0 {
-		stop += length
+		stop = length + stop
 	}
 	if start < 0 {
 		start = 0
