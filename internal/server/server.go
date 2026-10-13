@@ -15,6 +15,7 @@ import (
 	"github.com/1998x-stack/mini-redis/internal/aof"
 	"github.com/1998x-stack/mini-redis/internal/command"
 	"github.com/1998x-stack/mini-redis/internal/config"
+	"github.com/1998x-stack/mini-redis/internal/observability"
 	"github.com/1998x-stack/mini-redis/internal/persistence"
 	"github.com/1998x-stack/mini-redis/internal/rdb"
 	"github.com/1998x-stack/mini-redis/internal/replication"
@@ -29,6 +30,7 @@ type Server struct {
 	registry *command.Registry
 	aof      *aof.Log
 	logger   *slog.Logger
+	metrics  *observability.Metrics
 
 	// persistenceMu is the canonical logical-order boundary. v0.9 also uses it
 	// while changing replication roles so a client mutation or replica apply
@@ -79,6 +81,7 @@ func New(cfg config.Config, st store.Store, registry *command.Registry, logger *
 		store:        st,
 		registry:     registry,
 		logger:       logger,
+		metrics:      observability.NewMetrics(),
 		versions:     newKeyVersionTable(),
 		hub:          newPubSubHub(),
 		replRole:     cfg.ReplicationRole,
@@ -156,7 +159,16 @@ func (s *Server) replayAOF() error {
 	})
 }
 
-func (s *Server) SaveRDB() error {
+func (s *Server) SaveRDB() (err error) {
+	start := time.Now()
+	s.metrics.RDBSaveOps.Inc()
+	defer func() {
+		s.metrics.RDBSaveLatency.ObserveDuration(time.Since(start))
+		if err != nil {
+			s.metrics.RDBSaveFailures.Inc()
+		}
+	}()
+
 	if s.cfg.RDBFilename == "" {
 		return errors.New("RDB filename is empty")
 	}
@@ -171,10 +183,25 @@ func (s *Server) SaveRDB() error {
 	if err != nil {
 		return err
 	}
-	return rdb.SaveFile(s.cfg.RDBFilename, entries)
+	if err = rdb.SaveFile(s.cfg.RDBFilename, entries); err != nil {
+		return err
+	}
+	if info, statErr := os.Stat(s.cfg.RDBFilename); statErr == nil && info.Size() > 0 {
+		s.metrics.RDBSaveBytes.Add(uint64(info.Size()))
+	}
+	return nil
 }
 
-func (s *Server) RewriteAOF() error {
+func (s *Server) RewriteAOF() (err error) {
+	start := time.Now()
+	s.metrics.AOFRewriteOps.Inc()
+	defer func() {
+		s.metrics.AOFRewriteLatency.ObserveDuration(time.Since(start))
+		if err != nil {
+			s.metrics.AOFRewriteFailures.Inc()
+		}
+	}()
+
 	if s.aof == nil {
 		return errors.New("AOF is disabled")
 	}
@@ -198,9 +225,12 @@ func (s *Server) RewriteAOF() error {
 		s.aof.AbortRewrite()
 		return err
 	}
-	if err := s.aof.FinishRewrite(commands); err != nil {
+	if err = s.aof.FinishRewrite(commands); err != nil {
 		s.aof.AbortRewrite()
 		return err
+	}
+	if info, statErr := os.Stat(s.cfg.AppendFilename); statErr == nil && info.Size() > 0 {
+		s.metrics.AOFRewriteBytes.Add(uint64(info.Size()))
 	}
 	return nil
 }
@@ -312,8 +342,12 @@ func (s *Server) executeCommandCoreLocked(argv []string, persistNow bool) (resp.
 				s.logger.Error("maxmemory enforcement failed", "error", err)
 				return resp.Error("ERR maxmemory enforcement failed"), nil
 			}
+			if pressure.ExpiredKeys > 0 {
+				s.metrics.ExpiredKeys.Add(uint64(pressure.ExpiredKeys))
+			}
 			if len(pressure.EvictedKeys) > 0 {
 				evicted = append(evicted, pressure.EvictedKeys...)
+				s.metrics.EvictedKeys.Add(uint64(len(pressure.EvictedKeys)))
 				del := append([]string{"DEL"}, pressure.EvictedKeys...)
 				persist = append(persist, del)
 			}
@@ -327,7 +361,7 @@ func (s *Server) executeCommandCoreLocked(argv []string, persistNow bool) (resp.
 
 	if persistNow && len(persist) > 0 {
 		if s.aof != nil {
-			if err := s.aof.AppendBatch(persist); err != nil {
+			if err := s.appendAOF(persist, false); err != nil {
 				s.logger.Error("AOF append failed", "error", err)
 				return resp.Error("MISCONF AOF persistence failed"), nil
 			}
@@ -341,12 +375,17 @@ func (s *Server) runMaintenance() {
 	s.persistenceMu.Lock()
 	defer s.persistenceMu.Unlock()
 
-	s.store.ExpireDue(s.cfg.ActiveExpireSample)
+	s.metrics.MaintenanceRuns.Inc()
+	if expired := s.store.ExpireDue(s.cfg.ActiveExpireSample); expired > 0 {
+		s.metrics.ExpiredKeys.Add(uint64(expired))
+	}
 	if s.cfg.RehashWorkPerCycle <= 0 {
 		return
 	}
 	if stepper, ok := s.store.(store.RehashStepper); ok {
-		stepper.RehashStep(s.cfg.RehashWorkPerCycle)
+		if steps := stepper.RehashStep(s.cfg.RehashWorkPerCycle); steps > 0 {
+			s.metrics.RehashSteps.Add(uint64(steps))
+		}
 	}
 }
 
