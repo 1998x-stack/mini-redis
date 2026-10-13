@@ -109,7 +109,7 @@ func (r *Registry) Execute(ctx *Context, argv []string) Execution {
 		if found {
 			_, found = r.commands[strings.ToUpper(argv[0])]
 		}
-		return Execution{Reply: resp.Error(strings.TrimPrefix(err.Error(), "ERR ")), Spec: spec, Args: argv, Found: found}
+		return Execution{Reply: resp.Error(err.Error()), Spec: spec, Args: argv, Found: found}
 	}
 
 	reply := spec.Handler(ctx, argv[1:])
