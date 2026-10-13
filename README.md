@@ -2,7 +2,7 @@
 
 An architecture-driven Redis learning implementation in Go. Each version replaces one hidden mechanism with an explicit, testable implementation.
 
-## Current milestone: v0.4
+## Current milestone: v0.5
 
 ```text
 v0.1  request → command → state → TTL → AOF
@@ -11,9 +11,11 @@ v0.2  nonblocking sockets + epoll event loop
   ↓
 v0.3  Redis-like Dict + bounded incremental rehash
   ↓
-v0.4  List / Hash / Set / ZSet + adaptive encodings   ← current
+v0.4  List / Hash / Set / ZSet + adaptive encodings
   ↓
-v0.5  RDB-like snapshot + AOF rewrite
+v0.5  logical snapshots + RDB-like state + AOF rewrite   ← current
+  ↓
+v0.6  maxmemory + sampled eviction policies
 ```
 
 ## Architecture
@@ -30,13 +32,17 @@ store.Store
 Memory
   ├── keyspace incremental Dict
   ├── expiry incremental Dict
-  └── Object
-       ├── Type
-       ├── Encoding
-       └── payload
-  ↓
-AOF logical command log
+  └── Object{Type, Encoding, payload}
+             ↓
+         logical state
+             ↓
+       SnapshotEntry[]
+         ┌───┴────┐
+         ▼        ▼
+       RDB       AOF rewrite
 ```
+
+Persistence never serializes quicklist nodes, Dict buckets, intset internals or SkipList levels.
 
 ## Data types and encodings
 
@@ -52,8 +58,6 @@ The compact→general threshold is intentionally **8 entries** for teaching. Use
 
 ## Supported command subset
 
-Strings/keys:
-
 ```text
 PING ECHO
 SET GET DEL EXISTS
@@ -61,11 +65,7 @@ INCR INCRBY
 EXPIRE PEXPIREAT TTL
 KEYS DBSIZE FLUSHDB
 OBJECT ENCODING
-```
 
-Collections:
-
-```text
 LPUSH RPUSH LPOP RPOP LLEN LRANGE
 HSET HGET HDEL HLEN HGETALL
 SADD SREM SISMEMBER SMEMBERS SCARD
@@ -82,47 +82,67 @@ make all
 redis-cli -p 6379
 ```
 
-Linux `auto` selects the epoll reactor. The v0.1-style reference transport remains available:
+Linux `auto` selects the epoll reactor. The v0.1-style reference transport remains available with `-network-engine=legacy`.
+
+### Startup persistence policy
+
+Default configuration enables AOF:
 
 ```bash
-./bin/mini-redis-server -network-engine=legacy
+./bin/mini-redis-server \
+  -appendonly=true \
+  -appendfilename appendonly.aof \
+  -appendfsync everysec
 ```
 
-## Observe an encoding transition
+When AOF is enabled, it is the authoritative startup source and an RDB file is ignored.
+
+To start from the RDB-like snapshot path instead:
+
+```bash
+./bin/mini-redis-server \
+  -appendonly=false \
+  -dbfilename dump.mrdb
+```
+
+A missing RDB means an empty database; corrupt or unsupported RDB input fails startup rather than silently discarding state.
+
+`Server.SaveRDB()` and `Server.RewriteAOF()` expose the v0.5 reference mechanisms in code. They are intentionally **not** yet exposed as Redis `SAVE/BGSAVE/BGREWRITEAOF` commands; use the persistence demo to study them.
+
+## Persistence model
+
+### RDB-like snapshot
 
 ```text
-127.0.0.1:6379> RPUSH jobs a b c d e f g h
-(integer) 8
-127.0.0.1:6379> OBJECT ENCODING jobs
-"listpack"
-127.0.0.1:6379> RPUSH jobs i
-(integer) 9
-127.0.0.1:6379> OBJECT ENCODING jobs
-"quicklist"
+SnapshotEntry[]
+     ↓
+MRDB | version | payload length | logical payload | CRC32
+     ↓
+temp file → fsync(file) → atomic rename → fsync(directory)
 ```
 
-For Set:
+### AOF rewrite
 
 ```text
-SADD ids 1 2 3
-OBJECT ENCODING ids       # intset
-SADD ids 01
-OBJECT ENCODING ids       # hashtable
+old history
+SET x 1
+SET x 2
+SET x 3
+     ↓ logical snapshot
+compact reconstruction
+SET x 3
+     +
+mutations that happened after the snapshot boundary
 ```
 
-For ZSet:
-
-```text
-ZADD rank 1 a 2 b 3 c 4 d 5 e 6 f 7 g 8 h 9 i
-OBJECT ENCODING rank      # skiplist
-ZRANK rank e              # 4
-```
+Expiry is persisted as an absolute `PEXPIREAT` deadline so process downtime does not restart the TTL duration.
 
 ## Learning demos
 
 ```bash
 make rehash-demo       # v0.3: one bounded Dict migration step at a time
 make encodings-demo    # v0.4: compact→general object encodings
+make persistence-demo  # v0.5: RDB round-trip + AOF rewrite/buffering
 make benchmark         # v0.2: reactor vs legacy networking comparison
 make benchmark-dict    # v0.3: educational Dict vs Go map microbenchmark
 ```
@@ -136,29 +156,32 @@ go test -race ./...
 go build ./cmd/mini-redis-server
 make rehash-demo
 make encodings-demo
+make persistence-demo
 make smoke
 NETWORK_ENGINE=legacy PORT=16380 make smoke
 ```
 
 ## Read the code in this order
 
-For v0.4:
+For v0.5:
 
 ```text
-internal/store/store.go
+internal/store/store.go                       # SnapshotEntry boundary
   ↓
-internal/store/collections.go
+internal/store/versionedmemory/snapshot.go    # logical extraction / restore
   ↓
-internal/skiplist/skiplist.go
+internal/rdb/rdb.go                           # state snapshot format
   ↓
-internal/store/versionedmemory/memory.go
+internal/persistence/atomicfile.go            # crash-safe publication
   ↓
-internal/command/core.go
+internal/persistence/commands.go              # state → AOF commands
   ↓
-internal/server/
+internal/aof/aof.go                           # rewrite buffer / fd swap
+  ↓
+internal/server/server.go                     # startup + coordination boundary
 ```
 
-Then compare historical branches `v0.1`, `v0.2`, `v0.3`, and `v0.4` to see one architecture change at a time.
+Compare historical branches `v0.1` through `v0.5` to see one architecture change at a time.
 
 ## Repository contracts
 

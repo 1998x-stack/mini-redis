@@ -1,4 +1,4 @@
-# Architecture — v0.4
+# Architecture — v0.5
 
 ## 1. Current stack
 
@@ -17,129 +17,263 @@ versionedmemory.Memory
                     │
                     ▼
             Object{Type, Encoding, payload}
+                    │
+                    ▼
+              logical state
+                    │
+             SnapshotEntry[]
+               ┌────┴────┐
+               ▼         ▼
+              RDB       AOF rewrite
 ```
 
-v0.4 adds complexity below the Object boundary without coupling protocol or networking to concrete representations.
+v0.5 adds persistence below logical state while keeping protocol, command semantics and physical collection encodings independent.
 
-## 2. Logical type vs physical encoding
+## 2. Why a new serialization boundary?
 
-A Redis-style object has two separate questions:
+Directly serializing the v0.4 payload would make disk compatibility depend on implementation accidents:
 
 ```text
-What operations are legal?      → Type
-How is the value represented?   → Encoding
+bad persistence boundary:
+quickNode pointers
+Dict bucket count
+rehashIndex
+SkipList random levels/spans
 ```
 
-Current matrix:
+Instead `SnapshotEntry` contains only stable meaning:
 
 ```text
-String : int | raw
-List   : listpack → quicklist
-Hash   : listpack → hashtable
-Set    : intset   → hashtable
-ZSet   : listpack → skiplist (+ member-score Dict)
+Key
+Type
+logical values
+absolute expiry deadline
 ```
 
-A command checks logical type; internal methods choose representation-specific algorithms.
-
-## 3. List
-
-Small lists use a contiguous slice. It has excellent conceptual locality and makes compact storage visible. Above the educational threshold it becomes a chunked doubly-linked quicklist:
+Therefore:
 
 ```text
-node [a b c d] ⇄ node [e f g h] ⇄ node [i ...]
+process A: List encoded as quicklist
+              ↓ snapshot
+       logical [a,b,c,...]
+              ↓ restore
+process B: current policy chooses any valid List encoding
 ```
 
-Each node stores a small contiguous chunk rather than one heap node per element. This demonstrates why Redis moved beyond a naive linked list.
+Logical equality, not pointer/layout equality, is the persistence invariant.
 
-## 4. Hash
+## 3. Snapshot extraction and restoration
 
-Small hashes use a field/value array. Lookup is linear but memory structure is compact and simple. Above the threshold fields are copied into v0.3's custom incremental `Dict`.
+`Memory.Snapshot()` holds the Memory lock while establishing a point-in-time state view. It first removes already-expired entries, then walks sorted keys and exports logical values.
+
+`RestoreSnapshot()` constructs fresh top-level Dicts and rebuilds each value through normal object constructors/mutators. Expired absolute deadlines are skipped rather than restored.
+
+This design intentionally makes restoration an encoding-policy decision rather than a disk-format decision.
+
+## 4. RDB-like file format
+
+The project-specific v1 format is:
 
 ```text
-small: [f1,v1,f2,v2,...]
-              ↓ upgrade
-large: Dict[field → value]
+0                                         N
++------+---------+-------------+-----------+------+
+| MRDB | version | payload len | payload   | CRC  |
++------+---------+-------------+-----------+------+
+ 4 B      u16        u64         bytes      u32
 ```
 
-The public `HGET/HSET` behavior is unchanged across the transition.
+The payload is canonical logical data. Keys, Hash fields, Set members and ZSet entries are placed in deterministic order. ZSet scores are wire strings parsed back to `float64`; this preserves finite values and infinities without relying on JSON's unsupported infinite numeric literals.
 
-## 5. Set
+CRC32 is educational corruption detection, not authentication.
 
-If every member is canonical integer text, the compact representation stores sorted `int64` values:
+## 5. Atomic persistence publication
+
+The final path must never intentionally expose an in-progress file:
 
 ```text
-[1, 2, 7, 19]
+OLD VALID TARGET
+      │
+      │         create .target.tmp-XYZ
+      │                   ↓
+      │                  write
+      │                   ↓
+      │                fsync(file)
+      │                   ↓
+      └────────────── atomic rename
+                          ↓
+                     fsync(directory)
+                          ↓
+                    NEW VALID TARGET
 ```
 
-A non-canonical member such as `"01"` cannot be collapsed to integer `1` without changing identity, so the Set upgrades to a string-key Dict. Size can also trigger the upgrade.
+Failure before rename means readers still see the old target. The temp file is best-effort cleaned up. The directory `fsync` exists because persisting file contents and persisting the renamed directory entry are separate durability concerns.
 
-## 6. Sorted Set
+This models the Unix/Linux durability path used by this educational implementation.
 
-Small ZSets use a sorted slice. Large ZSets combine:
+## 6. Why AOF rewrite is necessary
+
+AOF stores mutation history:
 
 ```text
-Dict[member → score]
-        +
-SkipList[(score, member) ordered]
+SET k 1
+SET k 2
+SET k 3
+DEL other
+SET k 4
 ```
 
-The Dict answers membership/score lookup efficiently. The SkipList answers order/rank traversal. Updating a member's score deletes the old ordered node and inserts the new one.
-
-### SkipList spans
-
-Each forward link stores a span. Traversing upper levels accumulates skipped element counts, allowing rank calculation without scanning level 0 from the beginning.
-
-Tie-break order is `(score, member)` so every member has a deterministic rank.
-
-## 7. Encoding transition policy
-
-v0.4 uses `CompactMaxEntries = 8` to make conversions easy to observe:
+Current logical state may require only:
 
 ```text
-compact encoding
-     │
-     ├── size > 8
-     └── content incompatible with compact form
-              ↓
-        general encoding
+SET k 4
 ```
 
-Transitions are one-way. Downgrade/hysteresis is a later policy question.
+`persistence.Commands()` converts `SnapshotEntry[]` into a reconstruction stream using existing commands. Absolute expiry uses `PEXPIREAT`, never a relative duration.
 
-## 8. Store atomicity and TTL
+The rewrite therefore compacts **history → sufficient state reconstruction**.
 
-Command handlers never pull an Object out, mutate it independently and write it back. Collection mutations are Store operations performed while Memory owns its mutex.
+## 7. Rewrite concurrency boundary
 
-This preserves:
-
-- operation-level atomicity in the legacy shared-store engine;
-- serial command semantics in the reactor;
-- existing TTL metadata during collection mutations;
-- coordinated deletion of value and TTL when a collection becomes empty.
-
-## 9. WRONGTYPE
-
-A key has one logical type. Therefore:
+A naive implementation has a lost-write window:
 
 ```text
-SET k hello
-LPUSH k x
+snapshot S0
+          ← mutation happens here and is not in S0
+start buffering
 ```
 
-returns `WRONGTYPE` rather than interpreting a String payload as a List. The error belongs to logical type validation, not physical encoding.
+v0.5 closes that gap with `Server.persistenceMu`:
 
-## 10. Persistence stays logical
+```text
+lock persistenceMu
+  Snapshot S0
+  AOF.BeginRewrite()      # buffering becomes active
+unlock persistenceMu
+```
 
-AOF remains above physical encoding. It records commands and never serializes quicklist nodes, Dict buckets or SkipList levels. A restart may rebuild a physically different representation with the same logical state.
+Every normal command executes its Store mutation and AOF append while holding the same server lock. Therefore no command can cross the snapshot/buffer boundary invisibly.
 
-v0.5 will add an RDB-like state snapshot and AOF rewrite, which will force the project to define a stable logical serialization boundary for every type.
+After buffering begins, command `C` is represented twice temporarily:
 
-## 11. Demos
+```text
+C → old/live AOF      # preserves current durability path
+C → rewrite buffer    # preserves replacement correctness
+```
+
+The compact base is written to a temp file without holding the AOF mutex. Final commit briefly locks the AOF:
+
+```text
+append rewriteBuffer to temp
+fsync(temp)
+rename(temp, AOF)
+swap live file descriptor
+fsync(directory)
+```
+
+After that, new appends go only to the replacement AOF.
+
+## 8. Crash windows
+
+### Before temp creation / during base generation
+
+Old AOF/RDB remains authoritative.
+
+### Temp partially written
+
+Old target remains untouched; temp is not published.
+
+### Temp complete but before rename
+
+Old target remains untouched. Tests inject failure exactly here.
+
+### After rename
+
+The replacement is the visible file. The code then synchronizes the parent directory to make the renamed entry durable under the target filesystem model.
+
+The implementation does not claim to simulate every storage-device failure mode; it teaches the file-publication boundary explicitly.
+
+## 9. Startup precedence
+
+Startup avoids ambiguous merging:
+
+```text
+appendonly=true
+      ↓
+replay AOF only
+(RDB ignored)
+
+appendonly=false
+      ↓
+RDB exists? ── no ─► empty DB
+      │ yes
+      ▼
+validate magic/version/length/checksum
+      ↓
+restore logical snapshot
+```
+
+A complete invalid AOF command fails replay. A truncated final AOF frame is ignored as the explicit crash-tail policy inherited from v0.1. Corrupt/incompatible RDB does not silently turn into an empty database.
+
+## 10. TTL correctness
+
+TTL crosses persistence only as an absolute Unix-millisecond deadline:
+
+```text
+now=100s
+EXPIRE key 60
+absolute deadline=160s
+       ↓ persistence / downtime
+restart at 140s
+       ↓
+remaining ≈20s, NOT 60s
+```
+
+If restart happens after 160s, restoration/replay removes or skips the expired state. Downtime cannot extend key lifetime.
+
+## 11. RDB and AOF roles
+
+```text
+RDB
+  state snapshot
+  compact restart input
+  periodic work concentration
+
+AOF
+  mutation history
+  append-oriented durability path
+  grows with redundant history
+
+AOF rewrite
+  converts history back into compact state reconstruction
+```
+
+v0.5 deliberately keeps both visible because the learning goal is their trade-off, not hiding them behind one persistence abstraction.
+
+## 12. Testing and demo
 
 ```bash
-make rehash-demo
-make encodings-demo
+make persistence-demo
 ```
 
-The first exposes v0.3 dictionary migration; the second shows each v0.4 encoding transition.
+The demo shows:
+
+- logical state saved and restored through RDB;
+- redundant AOF history rewritten to a compact base;
+- a mutation after the snapshot boundary retained through the rewrite buffer;
+- the temp → fsync → rename → directory-fsync publication model.
+
+CI also runs race detection, both network-engine smoke tests, v0.3/v0.4 demos and persistence recovery tests.
+
+## 13. Next architectural layer
+
+v0.6 introduces memory pressure:
+
+```text
+keyspace + expiry
+      ↓
+maxmemory accounting
+      ↓
+policy chooses victim
+```
+
+Expiration remains time validity; eviction will be memory-pressure policy. The two must stay separate even when both delete keys.

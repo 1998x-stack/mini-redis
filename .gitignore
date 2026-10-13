@@ -1,6 +1,7 @@
 *.aof
 *.log
 *.rdb
+*.mrdb
 .DS_Store
 /bin/
 /mini-redis-server

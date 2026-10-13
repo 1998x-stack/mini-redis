@@ -1,123 +1,220 @@
-# mini-redis v0.4 — Core Data Types and Adaptive Encodings
+# mini-redis v0.5 — Persistence Depth
 
 ## 1. Identity
 
 - Integrated branch after validation: `main`
-- Historical learning snapshot: `v0.4`
-- Version label: `v0.4.0`
-- Previous snapshot: `v0.3`
+- Historical learning snapshot: `v0.5`
+- Version label: `v0.5.0`
+- Previous snapshot: `v0.4`
 - Status: implemented and validated
 
 ## 2. Primary question
 
-**Why can one Redis logical type use different physical data structures without changing command semantics?**
+**How does an in-memory database persist logical state, compact write history and replace persistence files without exposing a partially written database after a crash?**
 
-v0.3 introduced `Object{Type, Encoding, payload}`. v0.4 turns that boundary into a real mechanism:
+v0.4 separated logical type from physical encoding. v0.5 adds the next boundary:
 
 ```text
-logical command
-      ↓
-Object.Type
-      ↓
+Object{Type, Encoding, payload}
+              ↓
+      stable logical state
+              ↓
+       SnapshotEntry[]
+          ┌───┴────┐
+          ▼        ▼
+         RDB      AOF rewrite
+```
+
+Persistence is deliberately defined above quicklist/Dict/intset/SkipList layout.
+
+## 3. Stable logical snapshot boundary
+
+`store.SnapshotEntry` contains only:
+
+```text
+key
+logical type
+logical values
+absolute expiry deadline (optional)
+```
+
+It does **not** contain:
+
+```text
 Object.Encoding
-      ↓
-compact representation ── threshold/content ──► general representation
+quicklist nodes
+Dict buckets / rehash cursor
+intset memory layout
+SkipList levels / spans
+Go-private payload pointers
 ```
 
-## 3. What changed relative to v0.3?
+`Memory.Snapshot()` removes already-expired keys, sorts keys deterministically and extracts logical values. `RestoreSnapshot()` reconstructs objects through current constructors/mutators, so the restored process may choose a different physical encoding while preserving the same logical database.
 
-v0.3 made the top-level key dictionary explicit. v0.4 keeps RESP, event loop, Dict, TTL and AOF behavior stable, but enriches each key's value with collection semantics and encoding transitions.
+## 4. RDB-like snapshot format
 
-The key idea is that public behavior belongs to the logical type while memory/performance trade-offs belong to the physical encoding.
-
-## 4. Encoding matrix
-
-| Logical type | Compact/reference encoding | General encoding | Upgrade trigger |
-| --- | --- | --- | --- |
-| String | `int` | `raw` | value shape |
-| List | `listpack`-like slice | chunked `quicklist` | > 8 entries |
-| Hash | `listpack`-like field/value array | custom `Dict` (`hashtable`) | > 8 fields |
-| Set | sorted `intset` | custom `Dict` (`hashtable`) | non-canonical integer or > 8 members |
-| ZSet | sorted compact array | member→score `Dict` + span-aware `SkipList` | > 8 members |
-
-The threshold `8` is intentionally tiny so representation changes are observable in tests and demos. It is not a production Redis default.
-
-Upgrades are one-way in v0.4. Automatic downgrade is deferred because it adds policy complexity without improving the current learning goal.
-
-## 5. Commands added
-
-### List
-
-- `LPUSH`, `RPUSH`
-- `LPOP`, `RPOP`
-- `LLEN`, `LRANGE`
-
-### Hash
-
-- `HSET`, `HGET`
-- `HDEL`, `HLEN`, `HGETALL`
-
-### Set
-
-- `SADD`, `SREM`
-- `SISMEMBER`, `SMEMBERS`, `SCARD`
-
-### Sorted Set
-
-- `ZADD`, `ZSCORE`
-- `ZRANK`, `ZRANGE`, `ZREM`
-
-`OBJECT ENCODING key` exposes the current physical representation.
-
-## 6. SkipList learning mechanism
-
-Large ZSets use two structures at once:
+v0.5 introduces an educational, project-specific format rather than Redis binary compatibility:
 
 ```text
-member ─► score Dict       O(1)-style membership/score lookup
-              +
-score/member SkipList      ordered traversal + rank
++----------+---------+----------------+-------------------+---------+
+| "MRDB"   | version | payload length | logical payload   | CRC32   |
+| 4 bytes  | u16     | u64            | canonical JSON    | u32     |
++----------+---------+----------------+-------------------+---------+
 ```
 
-The SkipList uses probabilistic levels and per-level spans. Equal scores are ordered lexicographically by member, giving one deterministic total order.
+Properties:
 
-Tests compare 500 randomly scored members against a normal sorted reference and validate every rank.
+- format magic: `MRDB`;
+- format version: `1`;
+- all five current logical types supported;
+- absolute TTL milliseconds stored, never relative TTL durations;
+- deterministic ordering for keys and unordered logical collections;
+- checksum detects corruption;
+- unsupported versions fail explicitly;
+- ZSet scores use canonical strings on the wire, allowing `+Inf` and `-Inf` to round-trip even though JSON numeric literals cannot represent them.
 
-## 7. Atomicity, TTL and empty-key rules
+This is intentionally an educational format, not Redis RDB compatibility.
 
-Collection read-modify-write logic lives inside `versionedmemory.Memory`, not command handlers.
+## 5. Crash-safe file publication
+
+Both snapshot publication and AOF rewrite use the same durability shape:
 
 ```text
-command
-   ↓
-Store collection method
-   ↓ one Memory lock
-lazy-expire → type check → mutate encoding → persist object
+valid target file
+       │
+       ├──────── remains untouched ───────────────┐
+       │                                          │
+create same-directory temp                       │
+       ↓                                          │
+write complete new contents                       │
+       ↓                                          │
+fsync(temp file)                                  │
+       ↓                                          │
+atomic rename(temp → target)  ◄───────────────────┘
+       ↓
+fsync(parent directory)
 ```
 
-Invariants:
+If work fails before rename, the previous valid target remains visible. Tests inject a failure in the pre-rename window and verify the old file bytes are unchanged.
 
-- collection mutation preserves an existing TTL;
-- `WRONGTYPE` is returned for incompatible logical types;
-- when the last collection element is removed, the key and its expiry metadata disappear together;
-- encoding conversion does not change logical results.
+`write()` alone is not treated as durability: file data and the directory entry are synchronized separately.
 
-## 8. AOF boundary
+## 6. AOF rewrite
 
-AOF still stores logical commands rather than object memory layouts:
+An append-only log preserves history, so repeated updates make it grow without bound:
 
 ```text
-RPUSH list a b c
-HSET hash f v
-SADD set 1 2
-ZADD z 1 a
+SET x 1
+SET x 2
+SET x 3
+SET x 4
 ```
 
-Replay reconstructs whichever encoding the current implementation chooses. AOF therefore remains independent of listpack/quicklist/intset/skiplist layout.
+The current state needs only:
 
-## 9. Validation
+```text
+SET x 4
+```
 
-The exact v0.4 candidate is required to pass:
+v0.5 converts a logical snapshot to a minimal reconstruction stream:
+
+```text
+String -> SET
+List   -> RPUSH
+Hash   -> HSET
+Set    -> SADD
+ZSet   -> ZADD
+TTL    -> PEXPIREAT absolute_ms
+```
+
+The rewritten AOF therefore records sufficient logical state, not previous mutation history or physical encodings.
+
+## 7. Mutations during rewrite
+
+The hard case is a write that arrives after the rewrite snapshot was taken but before the new AOF is published.
+
+v0.5 names two boundaries:
+
+```text
+Server.persistenceMu
+  └── command Store mutation + live AOF append
+
+AOF Log.mu
+  └── live descriptor + rewrite buffer + final swap
+```
+
+Rewrite timeline:
+
+```text
+lock persistenceMu
+    ↓
+Snapshot S0
+    ↓
+BeginRewrite(buffering ON)
+unlock persistenceMu
+    ↓
+write compact S0 to temp file
+
+meanwhile command C1:
+    ├── execute against Memory
+    ├── append to old/live AOF
+    └── append same RESP bytes to rewrite buffer
+
+final rewrite commit:
+    ├── append buffered C1...Cn to temp
+    ├── fsync temp
+    ├── rename temp over old AOF
+    ├── swap live descriptor
+    └── fsync directory
+```
+
+Because no command can occur between `Snapshot()` and `BeginRewrite()`, and every later mutation is copied into the rewrite buffer, the replacement represents `S0 + all later acknowledged mutations`.
+
+## 8. Startup policy
+
+The recovery policy is deliberately simple and explicit.
+
+### `appendonly=true`
+
+- AOF is authoritative;
+- RDB is ignored even if present;
+- missing/empty AOF means an empty database;
+- a truncated final AOF command is ignored;
+- an invalid complete AOF command fails startup.
+
+### `appendonly=false`
+
+- load `-dbfilename` if it exists;
+- missing RDB means an empty database;
+- bad magic/version/checksum/truncation fails startup;
+- expired entries are skipped during restoration and cannot be resurrected.
+
+No automatic "try one file, then silently fall back to the other" heuristic is used in v0.5.
+
+## 9. RDB vs AOF mental model
+
+```text
+RDB-like snapshot
+  + compact state image
+  + bounded restart input
+  - work is concentrated at snapshot time
+  - state only, not mutation history
+
+AOF
+  + every acknowledged mutation is represented
+  + straightforward append path
+  - file grows with history
+  - restart may replay many redundant commands
+
+AOF rewrite
+  = keep AOF semantics while periodically collapsing history to state
+```
+
+The point of v0.5 is not to declare one universally better; it exposes the trade-off explicitly.
+
+## 10. Validation
+
+The exact v0.5 release SHA is required to pass:
 
 ```bash
 gofmt -d .
@@ -126,60 +223,84 @@ go test -race ./...
 go build ./cmd/mini-redis-server
 make rehash-demo
 make encodings-demo
+make persistence-demo
 make smoke
 NETWORK_ENGINE=legacy PORT=16380 make smoke
 ```
 
-The smoke suite triggers real encoding upgrades through TCP on both network engines.
+Persistence-specific tests cover:
 
-## 10. Important source files
+- all logical types through snapshot/restore;
+- absolute TTL preservation;
+- already-expired state not resurrected;
+- deterministic RDB bytes;
+- checksum/version/corruption failures;
+- `+Inf/-Inf` ZSet score round-trip;
+- failure before rename preserving the previous file;
+- AOF rewrite history compaction;
+- post-snapshot mutation buffering;
+- truncated final AOF command recovery;
+- RDB restart and AOF rewrite restart correctness;
+- explicit AOF-over-RDB startup precedence.
+
+## 11. Important source files
 
 ```text
 internal/store/store.go
-internal/store/collections.go
-internal/skiplist/skiplist.go
-internal/store/versionedmemory/memory.go
-internal/command/core.go
-examples/encodings/main.go
+internal/store/versionedmemory/snapshot.go
+internal/persistence/atomicfile.go
+internal/persistence/commands.go
+internal/rdb/rdb.go
+internal/aof/aof.go
+internal/server/server.go
+examples/persistence/main.go
 ```
 
 Recommended read order:
 
 ```text
-Object type/encoding
-      ↓
-collection encoding implementations
-      ↓
-SkipList
-      ↓
-Memory atomic collection API
-      ↓
-commands
-      ↓
-smoke + invariant tests
+SnapshotEntry
+    ↓
+Memory Snapshot/Restore
+    ↓
+RDB encoding
+    ↓
+atomic file publication
+    ↓
+logical state → command stream
+    ↓
+AOF rewrite buffering
+    ↓
+server persistence boundary / startup policy
 ```
 
-## 11. Non-goals
+## 12. Non-goals
 
-- no production byte-level listpack implementation;
-- no quicklist compression;
-- no automatic encoding downgrade;
-- no `WITHSCORES` / advanced range syntax;
-- no set algebra or blocking-list commands;
-- no RDB;
-- no AOF rewrite;
+- no Redis-compatible production RDB binary format;
+- no `fork()` / copy-on-write background snapshot yet;
+- no `SAVE`/`BGSAVE`/`BGREWRITEAOF` command surface;
+- no multi-part AOF manifest;
+- no automatic RDB fallback when AOF is enabled;
 - no maxmemory/eviction;
 - no transactions, replication, Sentinel or Cluster.
 
-## 12. Next version
+## 13. Next version
 
-v0.5 moves from memory representation to persistence depth:
+v0.6 moves from persistence pressure to memory pressure:
 
 ```text
-current logical state ──► RDB-like snapshot
-AOF history            ──► rewrite / compaction
-                              ↓
-                       atomic replacement
+logical keyspace
+      ↓
+approximate memory accounting
+      ↓
+maxmemory reached?
+      ↓
+expiration is not enough
+      ↓
+eviction policy
+  ├── random
+  ├── sampled LRU
+  └── sampled LFU
 ```
 
-Primary question: **how does an in-memory database trade write cost, restart speed and durability while replacing persistence files safely?**
+Primary question: **what is the difference between expiration and eviction, and how can Redis approximate useful victim selection without maintaining a perfectly ordered global structure?**
