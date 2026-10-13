@@ -73,13 +73,13 @@ type Decision struct {
 }
 
 type MonitorState struct {
-	MonitorID     string
-	NodeID        string
-	LastSuccess   time.Time
-	LastFailure   time.Time
-	FailureSince  time.Time
+	MonitorID      string
+	NodeID         string
+	LastSuccess    time.Time
+	LastFailure    time.Time
+	FailureSince   time.Time
 	SubjectiveDown bool
-	LastStatus    NodeStatus
+	LastStatus     NodeStatus
 }
 
 type monitor struct {
@@ -130,25 +130,25 @@ type probeResult struct {
 }
 
 type candidateScore struct {
-	nodeID   string
-	upVotes  int
-	offset   int64
+	nodeID  string
+	upVotes int
+	offset  int64
 }
 
 type Controller struct {
 	tickMu sync.Mutex
 	mu     sync.RWMutex
 
-	cfg          Config
-	monitorIDs   []string
-	monitors     map[string]*monitor
-	nodeIDs      []string
-	nodes        map[string]Node
-	probe        ProbeFunc
-	primaryID    string
-	epoch        uint64
+	cfg           Config
+	monitorIDs    []string
+	monitors      map[string]*monitor
+	nodeIDs       []string
+	nodes         map[string]Node
+	probe         ProbeFunc
+	primaryID     string
+	epoch         uint64
 	objectiveDown map[string]bool
-	lastDecision Decision
+	lastDecision  Decision
 }
 
 var ErrNoEligibleReplica = errors.New("sentinel: no eligible replica for failover")
