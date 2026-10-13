@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.11.0
+
+Architecture milestone: make connection-local RESP2/RESP3 negotiation, richer logical response types and asynchronous Push representation explicit without changing database semantics.
+
+- add connection-local `Protocol2` / `Protocol3` state with RESP2 as the default;
+- add `HELLO 3` and `HELLO 2` session negotiation;
+- return logical HELLO metadata as RESP3 Map with RESP2 flat-array downgrade;
+- add Null, Boolean, Double, Big Number, Verbatim String, Map, Set and Push logical value types;
+- add shared protocol-aware writer for legacy and reactor transports;
+- add explicit RESP2 downgrade rules for richer logical values;
+- add semantic RESP3 views for `HGETALL`, `SMEMBERS`, `SISMEMBER` and `ZSCORE`;
+- add RESP3 Null representation for existing null bulk/array results;
+- add incremental nested RESP2/RESP3 `ParseValue` with bounded recursion;
+- prove nested Push/Map/Set parsing at every byte fragmentation boundary;
+- represent RESP3 Pub/Sub subscription acknowledgements and messages as Push frames;
+- allow ordinary commands while subscribed in RESP3 because async Push frames are distinguishable from replies;
+- retain historical RESP2 subscribed-mode restrictions and wire forms;
+- keep command requests, AOF frames and replication frames independent of negotiated response protocol;
+- add HELLO 2/3 support to the explicit Cluster endpoint while keeping `ClusterExecute` routing before response adaptation;
+- add a wire test proving RESP3 cannot bypass `MOVED` slot ownership;
+- add legacy/reactor network tests for negotiation, rich replies and Push;
+- add `make resp3-demo` showing RESP2 → HELLO 3 → Map/Set/Boolean/Double/Push → HELLO 2;
+- keep streamed RESP3 forms, complete HELLO AUTH/SETNAME, Attributes, complete Blob Error semantics and client tracking outside v0.11.
+
 ## v0.10.0
 
 Architecture milestone: make Redis Cluster-style hash-slot routing, MOVED/ASK semantics, explicit slot migration and bounded topology dissemination visible as a separate layer above Store.
@@ -21,7 +45,7 @@ Architecture milestone: make Redis Cluster-style hash-slot routing, MOVED/ASK se
 - change stable owner only after the slot transfer completes;
 - add bounded `GossipPage(start, limit)` topology exchange;
 - add topology epochs and deterministic equal-epoch owner/migration-target tie-breaking;
-- add `Server.ServeCluster` as a cluster-aware RESP2/TCP teaching endpoint;
+- add `Server.ServeCluster` as a cluster-aware RESP/TCP teaching endpoint;
 - add direct, real-server and wire-level MOVED/ASKING/migration tests under `go test -race`;
 - add `make cluster-demo` showing MOVED → CROSSSLOT → ASK/ASKING → transfer → owner commit → bounded gossip;
 - explicitly keep cluster MULTI/EXEC, fencing, consensus, production Cluster bus semantics and automatic Sentinel/slot-failover coupling outside v0.10.
