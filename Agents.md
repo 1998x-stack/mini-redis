@@ -6,8 +6,6 @@
 
 mini-redis is an educational Redis implementation in Go. Optimize for architectural clarity, explicit invariants, readable mechanisms, end-to-end observability and version-to-version diffs that each teach one dominant idea.
 
-Do not optimize for full Redis compatibility, production hardening, source-code imitation or feature count.
-
 ```text
 one version
    ↓
@@ -17,8 +15,10 @@ small explicit mechanism
    ↓
 invariant tests
    ↓
-end-to-end demonstration
+end-to-end demo
 ```
+
+Do not optimize for full Redis compatibility, production hardening or feature count.
 
 ## 2. Mandatory reading order
 
@@ -30,11 +30,11 @@ On `main`:
 4. `docs/ARCHITECTURE.md`
 5. relevant source/tests
 
-On `v0.x`: read `Agents.md`, then `version.md`, then subsystem docs/source/tests. Historical branches must not absorb later mechanisms.
+Historical `v0.x` branches are frozen learning snapshots and must not absorb later mechanisms.
 
 ## 3. Branch model
 
-`main` is always the newest validated integrated state. Version branches are frozen educational snapshots.
+`main` is always the newest validated integrated state.
 
 ```text
 main ───────────────────────────────► newest validated
@@ -46,168 +46,159 @@ main ─────────────────────────
  ├── v0.6 maxmemory/eviction
  ├── v0.7 transactions/PubSub
  ├── v0.8 replication
- └── v0.9 Sentinel-inspired HA
+ ├── v0.9 Sentinel-inspired HA
+ └── v0.10 Cluster/hash slots
 ```
 
-Create a new version from current `main`. After Definition of Done, validate the exact version commit, fast-forward `main`, validate that same SHA on `main`, then freeze the version branch.
+Create a version branch from current `main`. Definition of Done requires exact-SHA CI on the version branch, fast-forwarding `main` to that same SHA, then exact-SHA CI on `main`.
 
 ## 4. Architecture direction
 
 ```text
-client TCP/RESP
+client / RESP
       ↓
-clientSession / connection mode
+connection/session layer
       ↓
-server coordination / persistenceMu
+v0.10 cluster routing gate
       ↓
-command registry / memory policy / Store
+Server.persistenceMu
+      ↓
+command registry / Store
       ↓
 logical state + canonical mutation commands
-      ├── RDB/AOF
-      └── v0.8 replication data plane
+      ├── AOF/RDB
+      └── v0.8 replication
              ↓
        primary / replicas
              ↑
-             │ topology control only
-             │
-       v0.9 Sentinel plane
-       SDOWN → ODOWN → epoch
-       → promote → reconfigure
-             ↓
-       future Cluster slots
+       v0.9 Sentinel topology control
+
+v0.10 orthogonal topology:
+key → CRC16/hash-tag → slot → primary owner
 ```
 
 Rules:
 
-- RESP never depends on command handlers;
-- storage never imports network/server;
+- RESP does not depend on Store internals;
+- Store never owns network/failover/slot metadata;
 - command handlers do not inspect private encoding payloads;
-- per-client transaction/subscription state never lives in Store;
-- persistence serializes logical state/history, never unstable Go memory layout;
-- replication consumes canonical logical mutation order, never private Object/Dict layout;
-- Sentinel monitors and reconfigures replication topology; it never becomes a second data-copy path;
-- future Cluster slot ownership must remain separate from ordinary value payloads.
+- persistence and replication serialize logical state, never unstable Go layout;
+- Sentinel monitors/reconfigures replication topology and does not copy database values;
+- Cluster slot ownership/migration state is separate from ordinary key/value Store state;
+- Cluster migration crosses nodes via `SnapshotEntry`, not private Object encodings.
 
 ## 5. Concurrency / atomicity
 
-- Memory mutex remains the Store synchronization boundary because both network engines share it.
-- `Server.persistenceMu` is the logical mutation-order boundary from v0.5 onward.
-- v0.7 holds it across WATCH validation + a complete EXEC.
-- v0.8 uses it for mutation publication and full-sync snapshot/offset/subscriber handoff.
-- v0.9 also uses it across runtime replication role transitions so a logical mutation cannot cross promotion/demotion halfway through.
-- `replControlMu` owns runtime role/upstream/current-primary identity.
-- role-specific contexts cancel obsolete replica-follow or primary-listen goroutines after a topology switch.
-- `replication.Primary.mu` owns repl-id/backlog/live-subscriber ordering.
-- Sentinel `Controller.tickMu` serializes one controller's failover/repair Tick operations.
-- monitor state has independent locks because SDOWN is monitor-local.
-- never claim atomicity without naming the lock, file-system or protocol boundary that enforces it.
+- Store mutexes own in-memory value/TTL atomicity.
+- `Server.persistenceMu` is the canonical logical mutation-order boundary from v0.5 onward.
+- v0.7 holds it across WATCH validation and complete EXEC execution.
+- v0.8 uses it for mutation publication and snapshot/offset/subscriber handoff.
+- v0.9 uses it across runtime replication role transitions.
+- v0.10 cluster routing holds it across migration-sensitive existence observation, route authorization and command execution.
+- `ClusterNode.TransferKey` holds the source `persistenceMu` from logical export through target acknowledgement and source delete.
+- The v0.10 teaching migrator assumes one directed slot migration operation at a time; concurrent opposite-direction migrations are outside scope.
+- `cluster.Topology.mu` owns node/slot/epoch/migration metadata.
+- one cluster RESP connection serially owns its `cluster.Session`; ASKING is connection-local, not shared process state.
+- never claim atomicity without naming its lock, filesystem or protocol boundary.
 
-## 6. Transaction/session rules
+## 6. Established transaction / persistence / memory rules
 
-- `MULTI` queues commands; it does not promise rollback;
-- queue-time validation errors cause `EXECABORT`;
-- execution-time errors remain EXEC result elements without undoing successful siblings;
-- `WATCH` is optimistic conflict detection, not a lock;
-- successful EXEC mutations are one AOF transaction frame and one replication frame;
-- transaction/session state dies with the connection;
-- Pub/Sub subscriptions/messages remain ephemeral runtime state.
-
-## 7. Persistence / memory rules
-
-Established invariants:
-
-- only successful logical mutations enter AOF;
-- relative TTL becomes absolute deadline across persistence/replication;
-- `SnapshotEntry` is the logical serialization boundary;
-- AOF rewrite buffers post-snapshot mutations;
-- truncated final transaction frame does not replay a prefix;
-- expiration and eviction are distinct;
-- noeviction rejection cannot leave a partial logical mutation;
-- eviction-generated DEL belongs to durability and replication order;
+- MULTI queues work; it does not promise SQL rollback.
+- queue-time validation errors cause EXECABORT; execution-time errors remain result elements.
+- WATCH is optimistic conflict detection.
+- successful EXEC mutations are one AOF transaction frame and one replication frame.
+- only successful logical mutations enter AOF.
+- relative TTL becomes an absolute deadline across persistence/replication/migration.
+- `SnapshotEntry` is the stable logical serialization boundary.
+- expiration and eviction are different mechanisms.
+- eviction-generated DEL belongs to durability and replication order.
 - LRU/LFU heat is runtime policy state, never database state.
 
-## 8. Replication rules
+## 7. Replication rules — v0.8
 
-v0.8 remains the only database-copy mechanism.
+- one primary runtime owns one repl-id and canonical byte offset;
+- backlog evicts whole frames only;
+- snapshot + base offset + live subscriber attachment share `persistenceMu`;
+- matching repl-id + retained frame boundary permits CONTINUE; otherwise FULLRESYNC;
+- replica offset advances only after complete frame application;
+- replica client writes are READONLY;
+- private Dict/Object encodings never cross replication.
 
-### Primary stream
+## 8. Sentinel rules — v0.9
 
-- one primary runtime owns one repl-id and byte offset;
-- offsets count canonical RESP mutation payload bytes;
-- ordinary accepted mutation = one frame;
-- successful EXEC = one `MULTI ... EXEC` frame;
-- backlog evicts complete frames only.
+- SDOWN is monitor-local;
+- ODOWN requires configured SDOWN quorum;
+- one controller serializes failover Tick operations;
+- each failover attempt receives a monotonic epoch;
+- candidate must be quorum-visible as replica;
+- teaching ranking is reachable votes DESC → replication offset DESC → node ID ASC;
+- promotion creates fresh replication identity/backlog/listener;
+- surviving replicas follow the promoted primary;
+- returning old primary becomes a replica of the chosen primary;
+- no fencing exists, so split-brain prevention/consensus/linearizability are not claimed.
 
-### Full/partial sync
+## 9. Cluster rules — v0.10
 
-While holding `persistenceMu` the primary captures:
+### Slots and hashing
 
-```text
-SnapshotEntry[]
-      ↓
-base offset
-      ↓
-live subscriber attachment
-```
+- exactly `16384` logical slots;
+- key slot = CRC-16/XMODEM modulo 16384;
+- first non-empty `{...}` hash tag replaces the whole key as hash input;
+- malformed/empty hash tags fall back to the whole key;
+- every routed key deterministically maps to one slot.
 
-Then snapshot transfer may occur. Matching repl-id + retained frame boundary gives CONTINUE; otherwise FULLRESYNC.
+### Multi-key routing
 
-### Replica
+- routed keys are identified before Store execution;
+- all routed keys in one command must share one slot;
+- otherwise fail with `CROSSSLOT` before mutation;
+- v0.10 cluster facade deliberately rejects MULTI/EXEC rather than promise incomplete cross-command routing semantics.
 
-- client writes return READONLY;
-- replication apply bypasses the client gate;
-- offset advances only after whole-frame application;
-- v0.8/v0.9 teaching replicas have no independent local AOF or maxmemory eviction policy.
+### Stable routing
 
-## 9. Sentinel rules
+- local stable owner executes;
+- wrong stable owner returns `MOVED <slot> <addr>`;
+- unassigned slot returns CLUSTERDOWN;
+- MOVED means stable ownership, not temporary migration state.
 
-v0.9 establishes topology control above replication.
+### Migration routing
 
-### Health
+For `owner=source, migrationTarget=target`:
 
-- every monitor owns its own last-success/last-failure/failure-since state;
-- one monitor exceeding `down-after` marks only SDOWN;
-- ODOWN requires configured quorum of SDOWN monitor states;
-- recovery clears that monitor's SDOWN state.
+- source + existing key → execute locally;
+- source + missing key → `ASK <slot> <target>`;
+- target without ASKING → MOVED to stable source;
+- target with ASKING → execute exactly one routed request;
+- ASKING is consumed by the next command on that same connection.
 
-### Failover epoch
+### Key transfer
 
-- one failover attempt receives one monotonically increasing epoch;
-- the teaching leader is the lexicographically first SDOWN voter;
-- this deterministic rule is for observability and is **not** a distributed-consensus claim;
-- one controller serializes Tick calls so overlapping promotions cannot originate from the same controller instance.
+- slot migration state becomes visible before data moves;
+- values cross the node boundary as logical `SnapshotEntry`;
+- source deletes only after target import acknowledges success;
+- target import reconstructs through existing command/persistence/replication machinery;
+- absolute TTL is preserved;
+- partial transfer failure leaves the migration marker visible;
+- retry resumes from source's remaining keys;
+- stable owner switches only after all remaining source keys transfer successfully.
 
-### Candidate selection
+### Topology dissemination
 
-Candidate must have quorum reachability and quorum observation as `replica`.
+- gossip work is bounded by `GossipPage(start, limit)`;
+- merge prefers higher topology epoch;
+- equal epochs use a deterministic `(ownerID, migrationTarget)` tuple tie-break for slots and address tie-break for nodes;
+- this LWW rule is a teaching convergence mechanism, not distributed consensus;
+- do not claim fencing, authoritative conflict resolution, production anti-entropy or Redis Cluster bus compatibility.
 
-Ranking:
+### Endpoint boundary
 
-```text
-reachable votes DESC
-replication offset DESC
-node ID ASC
-```
-
-An unreachable/stale candidate must not win over an eligible healthier/fresher candidate under this policy.
-
-### Promotion / topology repair
-
-- `PromoteToPrimary` cancels upstream following, creates a fresh repl-id/backlog, opens a replication listener and becomes writable;
-- surviving replicas are told to follow the promoted primary;
-- following a different primary resets remembered repl-id/offset and re-enters safe FULLRESYNC;
-- a returning old primary is reconfigured as replica of the chosen primary;
-- dynamic demotion rejects local AOF or maxmemory policy in v0.9 rather than silently violating replica invariants.
-
-### Explicit limitation
-
-Sentinel observation does not fence an unreachable old primary. A partition can temporarily leave an old primary writable while a new primary is promoted. v0.9 therefore does **not** claim linearizability, split-brain prevention, leases, consensus, or production Redis Sentinel compatibility.
-
-Do not hide this limitation in docs/tests.
+- `Server.ServeCluster` is an explicit cluster-aware RESP2 endpoint;
+- the historical standalone endpoint intentionally remains outside cluster routing in v0.10;
+- authoritative cluster traffic must use the cluster facade/endpoint in tests and demos.
 
 ## 10. Testing baseline
 
-Before reporting a version clean, run on the exact code:
+Before reporting a version clean, run on the exact SHA:
 
 ```bash
 gofmt -d .
@@ -221,22 +212,25 @@ make eviction-demo
 make session-demo
 make replication-demo
 make sentinel-demo
+make cluster-demo
 make smoke
 NETWORK_ENGINE=legacy PORT=16380 make smoke
 ```
 
-For v0.9 specifically prove:
+For v0.10 specifically prove:
 
-- one SDOWN vote cannot create ODOWN;
-- quorum ODOWN creates one epoch/failover;
-- candidate reachability and freshness ranking;
-- runtime replica promotion and fresh repl-id;
-- surviving replica reconfiguration and convergence;
-- old-primary return as replica;
-- repeated Tick after a healthy failover does not create another promotion;
-- real three-node failover under `go test -race`;
-- deterministic `sentinel-demo`;
-- previous v0.8 replication behavior remains green.
+- CRC16/hash-tag vectors;
+- CROSSSLOT rejection before mutation;
+- stable MOVED;
+- ASK versus MOVED during migration;
+- ASKING one-shot semantics in direct and real TCP tests;
+- logical key + TTL migration;
+- source delete only after target success;
+- partial failure remains visibly migrating and retry resumes;
+- stable owner switches only after migration completion;
+- bounded gossip reconstructs topology;
+- equal-epoch gossip conflicts converge independent of arrival order;
+- all v0.8 replication and v0.9 Sentinel tests/demos remain green.
 
 Do not claim a check passed unless it ran on the exact reported SHA.
 
@@ -251,16 +245,16 @@ Every version keeps synchronized:
 - README when user-visible behavior changes
 - CHANGELOG / VERSION
 
-`version.md` explains prior-version delta, mechanism, invariants, non-goals and next dependency.
+`version.md` explains prior-version delta, mechanisms, invariants, non-goals, reading order and next dependency.
 
 ## 12. Definition of Done
 
 - [ ] primary mental model explicit;
 - [ ] promised mechanism implemented;
-- [ ] invariant/error-path tests exist;
-- [ ] race/build/smoke/demo validation passes;
-- [ ] persistence/replication/topology boundaries tested when changed;
-- [ ] version/docs synchronized;
+- [ ] invariant + error-path tests exist;
+- [ ] race/build/wire/demo/smoke validation passes;
+- [ ] persistence/replication/topology boundaries tested where changed;
+- [ ] docs and VERSION synchronized;
 - [ ] exact version SHA passes CI;
 - [ ] `main` fast-forwarded to same SHA;
 - [ ] same SHA passes CI on `main`;
@@ -268,14 +262,8 @@ Every version keeps synchronized:
 
 ## 13. Current directive
 
-Freeze candidate: **v0.9 — SDOWN/ODOWN, failover epoch, deterministic candidate promotion and topology repair**.
+Freeze candidate: **v0.10 — 16384 slots, MOVED/ASK/ASKING, resumable SnapshotEntry migration and bounded topology dissemination**.
 
-After exact-SHA validation, next milestone is **v0.10 — Cluster hash slots, MOVED/ASK and migration**.
+Next milestone after exact-SHA validation: **v0.11 — RESP3 negotiation, richer types and push messages**.
 
-For v0.10:
-
-1. keep slot ownership separate from Store value representation;
-2. implement deterministic key→slot routing before migration complexity;
-3. distinguish stable `MOVED` from temporary migration `ASK` semantics;
-4. reuse replication/failover mechanisms rather than creating a parallel copy/failure stack;
-5. do not claim production Redis Cluster consensus semantics.
+Do not begin v0.11 until v0.10 branch and main are identical on one green exact SHA.
