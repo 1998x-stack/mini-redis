@@ -1,358 +1,484 @@
-# Architecture — v0.8
+# Architecture — v0.9
 
 ## 1. Current stack
 
 ```text
-client TCP/RESP2
-      ↓
-reactor or legacy transport
-      ↓
-clientSession
-      ↓
-Server.persistenceMu  ← canonical logical order
-      ├── command execution
-      ├── memory-pressure decision
-      ├── AOF publication
-      ├── RDB/full-sync snapshot capture
-      └── replication publication
-              ↓
-       replication.Primary
-       ├── repl-id
-       ├── canonical byte offset
-       ├── frame-aware backlog
-       └── live subscribers
-              ↓
-       replication TCP
-              ↓
-            replica
-              ↓
-   SnapshotEntry restore + RESP frame apply
+                         Sentinel-inspired control plane
+                    ┌──────────┬──────────┬──────────┐
+                    │ monitor  │ monitor  │ monitor  │
+                    │    s1    │    s2    │    s3    │
+                    └────┬─────┴────┬─────┴────┬─────┘
+                         │ health observations │
+                         └──────────┬───────────┘
+                                    ↓
+                           SDOWN → quorum ODOWN
+                                    ↓
+                              failover epoch
+                                    ↓
+                           candidate selection
+                                    ↓
+                           topology operations
+                                    │
+        ┌───────────────────────────┼───────────────────────────┐
+        ↓                           ↓                           ↓
+   data node P                  data node R1                data node R2
+ client RESP plane             client RESP plane           client RESP plane
+        │                           │                           │
+        └────────────── v0.8 replication data plane ───────────┘
+                  SnapshotEntry base + RESP mutation frames
 ```
 
-v0.8's central lesson is that replication is not “copy the Go heap.” It is **base state + one ordered logical mutation stream**.
+v0.9's central lesson is:
 
-## 2. Why replication has a separate transport
+> **Replication answers “how does another node get the data?” Sentinel answers “which replication topology should be active?”**
 
-Client I/O mechanics were already the v0.2 lesson. Reusing the client reactor for every replication concern would mix epoll mechanics with synchronization semantics.
+Those layers are deliberately separate.
 
-v0.8 therefore keeps:
+## 2. Why Sentinel does not live inside Store
+
+Failure detection, election epoch and primary identity are not key/value data:
 
 ```text
-client plane      → normal RESP command server
-replication plane → dedicated TCP synchronization connection
+Store database state
+  keys / values / TTLs
+
+Sentinel runtime state
+  monitor observations
+  SDOWN flags
+  current chosen primary
+  failover epoch
+  last decision
 ```
 
-The replication transport is separate, but the mutation payload is deliberately **not** a private protocol object graph. Frames contain canonical RESP reconstruction commands already understood by the command layer.
+Persisting monitor state inside the database would incorrectly make failover metadata subject to ordinary Redis commands, TTL, snapshots and replication.
 
-## 3. The canonical stream
+The `internal/sentinel` package therefore depends on a small `Node` control interface rather than Store internals.
 
-An accepted mutation already produces reconstruction commands for AOF. v0.8 reuses that logical form:
+## 3. The Node control-plane boundary
+
+Sentinel sees:
+
+```go
+ID()
+Probe(ctx) -> NodeStatus
+Promote(ctx)
+Follow(ctx, upstream)
+```
+
+`NodeStatus` exposes only logical topology facts:
 
 ```text
-SET session abc EX 10
+node ID
+role
+client address
+replication address
+upstream
+replication identity
+offset
+```
+
+The adapter for a real mini-redis node is `ServerNode`.
+
+A health probe first performs a real client-plane TCP `PING`. Only after that succeeds does it read the node's explicit replication topology state. Thus “healthy” means the data-serving endpoint is reachable, not merely that an in-process Go object exists.
+
+## 4. Subjective failure: SDOWN
+
+Each monitor owns an independent state record per node:
+
+```text
+last success
+last failure
+failure since
+subjective-down flag
+last successful NodeStatus
+```
+
+On the first failed probe:
+
+```text
+failureSince = now
+SDOWN = false
+```
+
+Only when:
+
+```text
+now >= failureSince + downAfter
+```
+
+that monitor marks the node SDOWN.
+
+A successful probe clears `failureSince` and SDOWN.
+
+This state is intentionally monitor-local. If s1 is partitioned from the primary but s2 and s3 are healthy, only s1 has SDOWN.
+
+## 5. Objective failure: ODOWN
+
+The controller counts current monitor SDOWN states for the **current chosen primary**:
+
+```text
+SDOWN voters >= quorum ?
+      │
+   no │ yes
+      ↓
+ no failover       ODOWN
+                    ↓
+              candidate election
+```
+
+One timeout never implies objective failure.
+
+With three monitors and quorum two:
+
+```text
+s1 SDOWN
+s2 SDOWN
+s3 healthy
+   ↓
+ODOWN
+```
+
+This makes the local-versus-shared-failure distinction observable and testable.
+
+## 6. One controller Tick is one serialized decision boundary
+
+`Controller.tickMu` serializes Tick calls.
+
+One Tick performs:
+
+```text
+probe monitor × node matrix
+       ↓
+update monitor-local state
+       ↓
+compute current-primary SDOWN voters
+       ↓
+ODOWN?
+  ├── no → optional topology repair
+  └── yes
         ↓
-SET session abc
-PEXPIREAT session <absolute-ms>
+     candidate ranking
+        ↓
+     next epoch
+        ↓
+     promotion
+        ↓
+     replica reconfiguration
+        ↓
+     commit chosen primary
 ```
 
-Likewise, memory-pressure eviction contributes reconstruction `DEL` commands.
+This prevents two goroutines using the same Controller instance from overlapping promotions.
 
-One normal accepted logical mutation becomes one replication frame. Successful EXEC mutations become one frame:
+It is not a claim that independent controller processes have reached consensus.
+
+## 7. Failover epoch and deterministic leader
+
+Every failover attempt increments a monotonically increasing in-memory epoch.
+
+For an educational deterministic rule, SDOWN voter IDs are sorted and the first voter is recorded as the leader/coordinator for the attempt.
 
 ```text
-MULTI
-<mutation reconstruction commands>
-EXEC
+SDOWN voters = [s1, s2, s3]
+leader = s1
+epoch = previous + 1
 ```
 
-Reads, failed commands and rejected replica writes emit no replication bytes.
+Why have an epoch at all?
 
-## 4. Replication identity and byte offset
-
-A primary process owns a random replication identity. v0.8 intentionally does not persist it across primary restart.
-
-The replication offset is the cumulative length of canonical RESP **payload bytes**:
+Without one, logs/tests cannot distinguish:
 
 ```text
-frame A: bytes 1..40
-frame B: bytes 41..90
-frame C: bytes 91..140
+one failover retried internally
 ```
 
-TCP bulk-string envelope bytes do not count. This keeps stream position independent of transport packetization.
-
-Replica offset advances only after the whole corresponding frame applies successfully.
-
-## 5. Frame-aware backlog
-
-The primary keeps a bounded runtime backlog.
-
-A naive byte ring can overwrite the first half of a RESP command while retaining its tail. v0.8 instead evicts complete frames:
+from:
 
 ```text
-capacity pressure
-       ↓
-drop complete oldest frame
-       ↓
-remaining resume points are still logical boundaries
+a later, separate failover decision
 ```
 
-Important subtlety: if frame A has been evicted, a replica whose offset equals **A's end** may still resume when frame B is retained. The replica already has A; it needs only B onward.
+The epoch creates an explicit identity for topology-changing decisions.
 
-An offset inside a frame is never accepted as a partial-resync point.
+Production Redis Sentinel uses richer peer/election behavior. v0.9's deterministic rule is intentionally not presented as equivalent.
 
-## 6. Full synchronization boundary
+## 8. Candidate eligibility and ranking
 
-The hard problem is not serializing a snapshot; it is preventing a gap between snapshot and subsequent live writes.
+For every non-primary node the controller evaluates the current probe matrix.
 
-The primary performs:
+Eligibility requires:
 
 ```text
-lock persistenceMu
-    ↓
-SnapshotEntry[] = current logical state
-    ↓
-baseOffset = replication current end
-    ↓
-attach live subscriber at baseOffset
-    ↓
-unlock persistenceMu
-    ↓
-serialize / transfer snapshot
-    ↓
-consume buffered frames created after baseOffset
-    ↓
-continue live
+reachable votes >= quorum
+AND
+votes observing RoleReplica >= quorum
 ```
 
-Because ordinary mutations also need `persistenceMu`, there cannot be a write between snapshot capture and subscriber attachment.
-
-This gives the invariant:
+Then ranking is:
 
 ```text
-replica state = snapshot(baseOffset) + every frame after baseOffset
+1. reachable votes DESC
+2. replication offset DESC
+3. node ID ASC
 ```
 
-If a subscriber cannot keep up and its bounded channel is lost, correctness is recovered by reconnecting rather than silently dropping frames.
+This produces a stable teaching policy:
 
-## 7. Handshake
+- a replica visible to only one of three monitors cannot be promoted when quorum is two;
+- among equally reachable replicas, the fresher replication offset wins;
+- exact ties are deterministic.
 
-Replica sends:
+The policy is deliberately inspectable rather than trying to reproduce every Redis Sentinel candidate-priority rule.
+
+## 9. Runtime promotion required a new server abstraction
+
+v0.8 treated replication role as startup configuration. Sentinel cannot work if role is immutable.
+
+v0.9 adds runtime topology state:
 
 ```text
-PSYNC <known-repl-id-or-?> <last-applied-offset>
+replControlMu
+  replRole
+  replUpstream
+  replPrimary
+  replRoleCancel
+  replRootCtx
 ```
 
-### Full path
+The old static `cfg.ReplicationRole` still supplies startup intent, but request authorization and replication behavior consult runtime state.
 
-Used when identity is unknown/stale or the needed suffix is no longer retained:
-
-```text
-+FULLRESYNC <id> <base-offset>
-$<snapshot-json>
-<live bulk frames...>
-```
-
-The snapshot JSON is an educational wire representation of logical `SnapshotEntry[]`, not private object encodings.
-
-### Partial path
-
-Used when identity matches and offset is a retained frame boundary:
-
-```text
-+CONTINUE <id> <current-offset>
-<retained missing frame 1>
-<retained missing frame 2>
-...
-<live frames...>
-```
-
-Catch-up frames are sent separately. Concatenating them into one payload would destroy transaction/frame boundaries and make offset advancement ambiguous.
-
-## 8. Replica apply path
-
-Replica application intentionally bypasses the normal client write gate:
-
-```text
-replication frame
-      ↓
-decode canonical RESP commands
-      ↓
-lock persistenceMu
-      ↓
-apply commands directly through command.Registry
-      ↓
-update WATCH/key-version runtime metadata
-      ↓
-advance replica offset by frame payload length
-```
-
-If a frame starts with MULTI it must close with EXEC. Markers are stripped and all enclosed reconstruction commands apply under one `persistenceMu` hold.
-
-Client-originated mutating commands on the same replica return:
-
-```text
-READONLY You can't write against a read only replica.
-```
-
-Thus “replication may mutate replica state” and “clients may not mutate replica state” are two distinct authorization paths.
-
-## 9. Why v0.8 disables replica AOF and maxmemory
-
-A teaching replica with its own eviction policy could remove a different victim than the primary and diverge. A replica re-appending replicated frames to an independent AOF would also introduce a second durability story before replication semantics are established.
-
-So v0.8 constrains replicas to:
-
-```text
-appendonly = false
-maxmemory  = 0
-```
-
-This is an explicit simplification, not a statement about production Redis.
-
-## 10. Expiration semantics
-
-The canonical stream carries absolute `PEXPIREAT` deadlines. Primary and replica therefore agree on one logical expiration instant instead of restarting a relative TTL at replication time.
-
-Active/lazy expiration can physically remove an expired key on either node after the deadline, but it cannot extend the lifetime beyond the propagated absolute deadline.
-
-## 11. Transactions across replication
-
-v0.7 established one non-interleaved EXEC execution/persistence boundary. v0.8 extends it:
+### Promotion
 
 ```text
 lock persistenceMu
-    ↓
-WATCH validation
-    ↓
-execute queued commands
-    ↓
-collect successful mutation reconstruction commands
-    ↓
-AOF MULTI...EXEC frame
-    ↓
-replication MULTI...EXEC frame
-    ↓
+   ↓
+cancel replica-follow role
+close old upstream connection
+   ↓
+create fresh replication.Primary
+  → fresh repl-id
+  → empty backlog / offset 0
+   ↓
+open replication listener
+   ↓
+role = primary
 unlock
 ```
 
-This avoids publishing transaction children as unrelated independently resumable frames.
+The promoted node is then writable because the client READONLY gate reads the runtime role.
 
-## 12. Full versus partial resync
+The data itself is not reconstructed during promotion; the replica already owns its v0.8 synchronized state.
+
+## 10. Role-scoped goroutines
+
+A subtle failover bug would be:
 
 ```text
-reconnect
-   ↓
-repl-id matches?
- ├── no → FULLRESYNC
- └── yes
-       ↓
- offset is retained complete-frame boundary?
- ├── no → FULLRESYNC
- └── yes → CONTINUE + missing frames
+replica promoted
+    ↓
+old runReplicaLoop still alive
+    ↓
+it reconnects to old primary later
 ```
 
-Backlog wrap therefore affects **efficiency**, not correctness.
+v0.9 prevents this with a role-specific context. Promotion/demotion cancels the previous role context and closes the old connection/listener.
 
-## 13. Observability used by tests/demo
+Likewise, primary replication handlers capture the concrete `replication.Primary` instance that accepted them, rather than repeatedly dereferencing a server field that may have been replaced by promotion.
 
-`replication.Primary` exposes teaching stats:
+## 11. Runtime demotion / FollowPrimary
 
-```text
-FullSyncs
-PartialSyncs
-Subscribers
-```
-
-The replica exposes its current repl-id and last applied offset. `DisconnectReplicationLink()` is a deliberate diagnostic hook used to force reconnect without destroying in-memory identity/offset.
-
-`make replication-demo` visibly demonstrates:
+A node following a different primary performs:
 
 ```text
+lock persistenceMu
+  ↓
+cancel old replication role
+close old primary listener / upstream connection
+  ↓
+role = replica
+upstream = promoted primary address
+current primary feed = nil
+remembered repl-id/offset = empty
+  ↓
+unlock
+  ↓
+run v0.8 replica loop
+  ↓
+PSYNC ? -1
+  ↓
 FULLRESYNC
-  ↓
-live SET propagation
-  ↓
-forced disconnect
-  ↓
-write while disconnected
-  ↓
-CONTINUE from backlog
-  ↓
-READONLY replica client write
 ```
 
-## 14. Validation model
+Resetting repl-id/offset is intentional. An offset from the old primary's replication identity must never be interpreted inside a new primary's stream.
 
-Focused mechanism tests:
+## 12. Why dynamic demotion rejects AOF/maxmemory in v0.9
 
-- frame offsets and whole-frame eviction;
-- earliest resumable boundary;
-- stale identity rejection;
-- live subscription handoff.
+v0.8 replica semantics intentionally disable:
 
-Server integration tests:
+```text
+local AOF
+local maxmemory eviction policy
+```
 
-- initial full-sync convergence;
-- live write propagation;
-- repl-id/offset equality after convergence;
-- replica READONLY;
-- disconnect + partial catch-up;
-- backlog loss + full-sync fallback;
-- transaction frame replication.
+A dynamically demoted old primary may have started with primary-only policies. Silently keeping them would be incorrect:
 
-Everything runs under `go test -race ./...` plus the normal demos/smoke tests.
+- its old AOF would no longer represent the new upstream mutation stream;
+- local eviction could independently remove a different key from the chosen primary.
 
-## 15. Runtime state versus database state
+Therefore `FollowPrimary` in v0.9 explicitly refuses dynamic demotion when:
+
+```text
+appendonly is active
+OR
+maxmemory > 0
+```
+
+The Sentinel demo/tests run failover-capable nodes with `appendonly=false` and `maxmemory=0`.
+
+This is a deliberate capability boundary, not production Redis behavior.
+
+## 13. Topology repair
+
+After a successful promotion the controller reconfigures reachable surviving replicas immediately.
+
+The failed old primary is skipped while unreachable.
+
+On a later Tick, if the chosen primary is healthy, `repairTopology` checks every reachable node:
+
+```text
+already replica of chosen primary?
+  yes → nothing
+  no  → FollowPrimary(chosen primary)
+```
+
+If that node still reports `RolePrimary`, the event is recorded as `rejoined`.
+
+There is no attempt to merge divergent histories. The returning old primary becomes a replica and receives the chosen primary's state via v0.8 synchronization.
+
+## 14. The fencing / split-brain boundary
+
+This is the most important limitation of v0.9.
+
+Suppose monitors cannot reach P but some clients still can:
+
+```text
+monitor quorum ──X──> P
+clients A ──────────> P
+
+Sentinel promotes R1
+
+clients B ──────────> R1
+```
+
+Nothing in v0.9 remotely disables writes on unreachable P. Therefore two writable nodes can exist during the partition.
+
+Sentinel-style health observation alone is not a fencing mechanism.
+
+v0.9 does not claim:
+
+- linearizability;
+- split-brain prevention;
+- leases;
+- quorum writes;
+- a replicated consensus log;
+- production Redis Sentinel protocol compatibility.
+
+When P becomes reachable to the control plane again, topology repair demotes it and FULLRESYNC makes it follow the chosen primary.
+
+## 15. Failure simulation
+
+The core controller accepts a `ProbeFunc` containing `monitorID`.
+
+Tests can therefore model asymmetric reachability:
+
+```text
+s1 cannot reach P
+s2 can reach P
+s3 can reach P
+```
+
+without stopping P itself.
+
+This distinction is essential for testing SDOWN separately from ODOWN.
+
+## 16. Validation model
+
+### Pure control-plane tests
+
+- isolated monitor reaches SDOWN without ODOWN;
+- quorum ODOWN promotes exactly once;
+- freshest eligible replica wins;
+- fresher but quorum-unreachable replica loses;
+- repeated Tick after failover does not advance epoch;
+- old primary rejoin is observable.
+
+### Real server tests
+
+- running replica can promote to writable primary;
+- promotion creates a new repl-id/listener;
+- old primary can become READONLY replica;
+- old primary and surviving replica converge through v0.8 replication;
+- three real data nodes complete an end-to-end Sentinel failover under `go test -race`.
+
+### Demo
+
+```bash
+make sentinel-demo
+```
+
+prints:
+
+```text
+single observer → SDOWN only
+quorum observers → ODOWN
+epoch / deterministic leader
+promotion
+surviving replica follows new primary
+old primary rejoin
+post-repair convergence
+split-brain/fencing warning
+```
+
+## 17. Runtime state versus database state
 
 Database/logical state:
 
 ```text
 keys
-logical values
+values
 absolute expiry deadlines
 ```
 
-Runtime replication state:
+Replication runtime state:
 
 ```text
-primary repl-id
-primary byte offset
+repl-id
+offset
 backlog
-subscriber channels
-replica last-applied offset
-replication TCP connection
-sync counters
+upstream connection
 ```
 
-v0.8 deliberately does not persist the latter.
-
-## 16. Non-goals
-
-- no persistent replication identity/offset;
-- no ACK quorum or WAIT;
-- no replica promotion;
-- no Sentinel failure detection/election;
-- no Cluster slots;
-- no claim of production-compatible Redis replication wire protocol;
-- no production diskless-sync optimization.
-
-## 17. Next architectural layer
-
-v0.9 asks a different question: once copies exist, **who decides the primary is actually dead and which replica should become the next primary?**
+Sentinel runtime state:
 
 ```text
-replication topology
-       ↓
-health observations
-       ↓
-SDOWN vs quorum-backed ODOWN
-       ↓
-election epoch
-       ↓
-replica selection / promotion
-       ↓
-topology reconfiguration
+monitor observations
+SDOWN
+ODOWN view
+chosen primary
+failover epoch
+last decision
 ```
 
-Sentinel work must reuse this v0.8 replication topology rather than bypassing it.
+None of the Sentinel state is serialized as database content.
+
+## 18. Next architectural layer
+
+v0.10 changes the topology question again:
+
+```text
+v0.9: which node is primary for this replicated dataset?
+
+v0.10: which primary owns this key's hash slot?
+```
+
+The next mechanisms are 16384 logical slots, key→slot routing, stable `MOVED`, migration-time `ASK`, and explicit slot ownership state.
