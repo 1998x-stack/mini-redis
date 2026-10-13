@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.12.0
+
+Architecture milestone: make the mechanisms built in v0.1–v0.11 measurable through observer-only bounded metrics, immutable snapshots and repeatable profiling without changing database semantics.
+
+- add `internal/observability` atomic counters/gauges and fixed-bucket bounded duration histograms;
+- add synchronized dynamic-label maps whose steady-state updates are atomic and whose snapshots are copies;
+- add command call/error counts and command latency histogram;
+- add RESP2/RESP3 request/reply and Push counters;
+- add accepted/active connection counters;
+- count actual legacy `net.Conn` read/write bytes;
+- count actual reactor `syscall.Read/Write` bytes plus epoll wait calls/events/duration and buffer-limit events;
+- add expiration, eviction, maintenance and bounded rehash-work counters;
+- measure real AOF append, RDB save and AOF rewrite operations/bytes/failures/durations;
+- expose primary repl-id/offset/backlog/full/partial-sync/subscriber state plus replica-local sync/link/frame/byte evidence;
+- explicitly avoid invented primary-visible replica lag because v0.8 has no replica ACK protocol;
+- add Cluster routing/MOVED/ASK/CROSSSLOT/migration/gossip metrics through `Topology.MetricsSnapshot()`;
+- add Sentinel Tick/probe/failover/promotion/reconfiguration metrics through `Controller.MetricsSnapshot()`;
+- add immutable `Server.MetricsSnapshot()` and read-only `INFO [section]` teaching view;
+- keep Cluster/Sentinel control-plane snapshots separate from Server data-plane metrics;
+- require instrumentation to remain optional so established mechanisms still work without a metric sink;
+- add race-tested primitive, real legacy/reactor wire, persistence, Cluster and Sentinel observability tests;
+- add `make observability-demo` using real TCP plus Cluster/Sentinel control-plane decisions;
+- add `make benchmark-observability` for Counter/CounterMap/Histogram overhead;
+- add `docs/PERFORMANCE.md` with workload metadata rules and pprof workflow;
+- keep Prometheus/OpenTelemetry export, distributed aggregation, production SLO tooling and production Redis performance parity outside v0.12.
+
 ## v0.11.0
 
 Architecture milestone: make connection-local RESP2/RESP3 negotiation, richer logical response types and asynchronous Push representation explicit without changing database semantics.
