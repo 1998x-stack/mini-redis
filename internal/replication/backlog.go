@@ -53,15 +53,12 @@ func (b *Backlog) Append(payload []byte) Frame {
 	frame := Frame{Start: b.end + 1, End: b.end + int64(len(copyData)), Data: copyData}
 	b.end = frame.End
 
-	// Empty frames carry no stream position and are intentionally not retained.
 	if len(copyData) == 0 || b.capacity == 0 {
 		return frame
 	}
 	b.frames = append(b.frames, frame)
 	b.used += len(copyData)
 
-	// Evict complete oldest frames. A single frame larger than capacity is not
-	// partially retained; after eviction partial resync before b.end is impossible.
 	for b.used > b.capacity && len(b.frames) > 0 {
 		b.used -= len(b.frames[0].Data)
 		b.frames[0].Data = nil
@@ -70,11 +67,9 @@ func (b *Backlog) Append(payload []byte) Frame {
 	return frame
 }
 
-// SuffixAfter returns every retained stream byte after offset. ok is true only
-// when offset is exactly the current end or a retained frame boundary. Replica
-// offsets are advanced only after whole-frame apply, so accepting arbitrary
-// interior byte positions would weaken the protocol invariant.
-func (b *Backlog) SuffixAfter(offset int64) ([]byte, bool) {
+// FramesAfter returns retained complete frames strictly after offset. ok is
+// true only when offset is the current end or a retained frame boundary.
+func (b *Backlog) FramesAfter(offset int64) ([]Frame, bool) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
@@ -100,12 +95,26 @@ func (b *Backlog) SuffixAfter(offset int64) ([]byte, bool) {
 		return nil, false
 	}
 
+	out := make([]Frame, len(b.frames[start:]))
+	for i, frame := range b.frames[start:] {
+		out[i] = Frame{Start: frame.Start, End: frame.End, Data: append([]byte(nil), frame.Data...)}
+	}
+	return out, true
+}
+
+// SuffixAfter is a convenience view used by focused backlog tests. Transport
+// code should prefer FramesAfter so transaction boundaries remain explicit.
+func (b *Backlog) SuffixAfter(offset int64) ([]byte, bool) {
+	frames, ok := b.FramesAfter(offset)
+	if !ok {
+		return nil, false
+	}
 	var size int
-	for _, frame := range b.frames[start:] {
+	for _, frame := range frames {
 		size += len(frame.Data)
 	}
 	out := make([]byte, 0, size)
-	for _, frame := range b.frames[start:] {
+	for _, frame := range frames {
 		out = append(out, frame.Data...)
 	}
 	return out, true
