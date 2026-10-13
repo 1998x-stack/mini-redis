@@ -58,11 +58,27 @@ func (r *Registry) Register(spec Spec) {
 }
 
 // Lookup exposes immutable command metadata before execution. v0.6 uses this
-// to decide whether noeviction needs a logical rollback snapshot before a
-// potentially mutating command runs; it does not execute handlers.
+// to reason about memory pressure without executing a handler first.
 func (r *Registry) Lookup(name string) (Spec, bool) {
 	spec, ok := r.commands[strings.ToUpper(name)]
 	return spec, ok
+}
+
+// MayGrowMemory identifies the current mutating command subset that can create
+// a key/value, enlarge a value, or add expiry metadata. Removal-only commands
+// remain usable under noeviction even if a process starts above maxmemory.
+func (r *Registry) MayGrowMemory(name string) bool {
+	spec, ok := r.Lookup(name)
+	if !ok || !spec.Mutating {
+		return false
+	}
+	switch spec.Name {
+	case "SET", "INCR", "INCRBY", "EXPIRE", "PEXPIREAT",
+		"LPUSH", "RPUSH", "HSET", "SADD", "ZADD":
+		return true
+	default:
+		return false
+	}
 }
 
 func (r *Registry) Execute(ctx *Context, argv []string) Execution {
