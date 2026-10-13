@@ -1,16 +1,11 @@
 package server
 
 import (
-	"io"
-	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/1998x-stack/mini-redis/internal/command"
 	"github.com/1998x-stack/mini-redis/internal/config"
-	"github.com/1998x-stack/mini-redis/internal/store"
-	"github.com/1998x-stack/mini-redis/internal/store/versionedmemory"
 )
 
 func replicationConfig(role config.ReplicationRole) config.Config {
@@ -40,7 +35,7 @@ func waitForCondition(t *testing.T, timeout time.Duration, what string, fn func(
 	t.Fatalf("timeout waiting for %s", what)
 }
 
-func stringValue(s *Server, key string) (string, bool) {
+func replicatedString(s *Server, key string) (string, bool) {
 	obj, ok := s.store.Get(key)
 	if !ok {
 		return "", false
@@ -65,7 +60,7 @@ func TestReplicationFullSyncLivePropagationAndReplicaReadOnly(t *testing.T) {
 	replica, _ := startTestServer(t, replicaCfg)
 
 	waitForCondition(t, 2*time.Second, "full sync convergence", func() bool {
-		value, ok := stringValue(replica, "before")
+		value, ok := replicatedString(replica, "before")
 		return ok && value == "1"
 	})
 	if stats := primary.ReplicationStats(); stats.FullSyncs < 1 {
@@ -76,7 +71,7 @@ func TestReplicationFullSyncLivePropagationAndReplicaReadOnly(t *testing.T) {
 		t.Fatalf("primary live SET failed: %#v", reply)
 	}
 	waitForCondition(t, 2*time.Second, "live replication", func() bool {
-		value, ok := stringValue(replica, "live")
+		value, ok := replicatedString(replica, "live")
 		return ok && value == "2"
 	})
 
@@ -84,7 +79,7 @@ func TestReplicationFullSyncLivePropagationAndReplicaReadOnly(t *testing.T) {
 	if !blocked.IsError() || !strings.Contains(blocked.Str, "READONLY") {
 		t.Fatalf("replica write reply=%#v", blocked)
 	}
-	if _, ok := stringValue(replica, "local"); ok {
+	if _, ok := replicatedString(replica, "local"); ok {
 		t.Fatal("rejected replica write changed state")
 	}
 
@@ -123,8 +118,8 @@ func TestReplicationPartialResyncAfterDisconnect(t *testing.T) {
 		return primary.ReplicationStats().PartialSyncs >= 1
 	})
 	waitForCondition(t, 2*time.Second, "partial catch-up", func() bool {
-		v1, ok1 := stringValue(replica, "gap:1")
-		v2, ok2 := stringValue(replica, "gap:2")
+		v1, ok1 := replicatedString(replica, "gap:1")
+		v2, ok2 := replicatedString(replica, "gap:2")
 		return ok1 && ok2 && v1 == "a" && v2 == "b"
 	})
 	_, idAfter, offsetAfter := replica.ReplicationState()
@@ -160,7 +155,7 @@ func TestReplicationBacklogWrapFallsBackToFullSync(t *testing.T) {
 		return primary.ReplicationStats().FullSyncs >= 2
 	})
 	waitForCondition(t, 2*time.Second, "full-sync fallback convergence", func() bool {
-		value, ok := stringValue(replica, "large")
+		value, ok := replicatedString(replica, "large")
 		return ok && value == large
 	})
 }
@@ -188,21 +183,12 @@ func TestReplicationPreservesTransactionFrame(t *testing.T) {
 	}
 
 	waitForCondition(t, 2*time.Second, "transaction replication", func() bool {
-		value, ok := stringValue(replica, "tx")
+		value, ok := replicatedString(replica, "tx")
 		return ok && value == "2"
 	})
 	_, _, primaryOffset := primary.ReplicationState()
-	_, _, replicaOffset := replica.ReplicationState()
 	waitForCondition(t, time.Second, "replication offsets converge", func() bool {
-		_, _, replicaOffset = replica.ReplicationState()
+		_, _, replicaOffset := replica.ReplicationState()
 		return replicaOffset == primaryOffset
 	})
 }
-
-// Compile-time reminder that replication tests intentionally stay in-package so
-// they can inspect the same logical store boundary used by transaction tests.
-var _ = slog.New
-var _ = io.Discard
-var _ = command.NewRegistry
-var _ = store.RealClock{}
-var _ = versionedmemory.New
