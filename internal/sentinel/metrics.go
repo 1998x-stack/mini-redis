@@ -24,19 +24,19 @@ func newControllerMetrics() *controllerMetrics {
 }
 
 type MetricsSnapshot struct {
-	Ticks            uint64                           `json:"ticks"`
-	TickErrors       uint64                           `json:"tick_errors"`
-	Probes           uint64                           `json:"probes"`
-	ProbeFailures    uint64                           `json:"probe_failures"`
-	FailoverAttempts uint64                           `json:"failover_attempts"`
-	Promotions       uint64                           `json:"promotions"`
-	Reconfigurations uint64                           `json:"reconfigurations"`
+	Ticks            uint64                          `json:"ticks"`
+	TickErrors       uint64                          `json:"tick_errors"`
+	Probes           uint64                          `json:"probes"`
+	ProbeFailures    uint64                          `json:"probe_failures"`
+	FailoverAttempts uint64                          `json:"failover_attempts"`
+	Promotions       uint64                          `json:"promotions"`
+	Reconfigurations uint64                          `json:"reconfigurations"`
 	TickLatency      observability.HistogramSnapshot `json:"tick_latency"`
 	ProbeLatency     observability.HistogramSnapshot `json:"probe_latency"`
 	FailoverLatency  observability.HistogramSnapshot `json:"failover_latency"`
-	Epoch            uint64                           `json:"epoch"`
-	PrimaryID        string                           `json:"primary_id"`
-	LastDecision     Decision                         `json:"last_decision"`
+	Epoch            uint64                          `json:"epoch"`
+	PrimaryID        string                          `json:"primary_id"`
+	LastDecision     Decision                        `json:"last_decision"`
 }
 
 func (c *Controller) MetricsSnapshot() MetricsSnapshot {
