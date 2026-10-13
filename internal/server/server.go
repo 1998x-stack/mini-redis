@@ -208,10 +208,10 @@ func (s *Server) executeCommand(argv []string) resp.Value {
 	defer s.persistenceMu.Unlock()
 
 	var (
-		controller     store.MemoryController
-		rollbackStore  store.Snapshotter
-		rollbackState  []store.SnapshotEntry
-		memoryManaged  bool
+		controller    store.MemoryController
+		rollbackStore store.Snapshotter
+		rollbackState []store.SnapshotEntry
+		memoryManaged bool
 	)
 	if c, ok := s.store.(store.MemoryController); ok {
 		controller = c
