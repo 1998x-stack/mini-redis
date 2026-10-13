@@ -1,7 +1,7 @@
 APP := mini-redis-server
 PKG := ./...
 
-.PHONY: all build test fmt vet run clean smoke benchmark benchmark-dict rehash-demo encodings-demo persistence-demo eviction-demo session-demo replication-demo sentinel-demo cluster-demo
+.PHONY: all build test fmt vet run clean smoke benchmark benchmark-dict rehash-demo encodings-demo persistence-demo eviction-demo session-demo replication-demo sentinel-demo cluster-demo resp3-demo
 
 all: fmt vet test build
 
@@ -53,6 +53,9 @@ sentinel-demo:
 
 cluster-demo:
 	go run ./examples/cluster
+
+resp3-demo:
+	go run ./examples/resp3
 
 clean:
 	rm -rf bin coverage.out *.aof *.mrdb
