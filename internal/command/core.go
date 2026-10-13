@@ -1,6 +1,7 @@
 package command
 
 import (
+	"errors"
 	"math"
 	"strconv"
 	"strings"
@@ -9,6 +10,8 @@ import (
 	"github.com/1998x-stack/mini-redis/internal/resp"
 	"github.com/1998x-stack/mini-redis/internal/store"
 )
+
+const wrongTypeMessage = "WRONGTYPE operation against a key holding the wrong kind of value"
 
 func RegisterCore(r *Registry) {
 	specs := []Spec{
@@ -27,11 +30,44 @@ func RegisterCore(r *Registry) {
 		{Name: "DBSIZE", Arity: 1, Handler: dbsize, Summary: "number of live keys"},
 		{Name: "FLUSHDB", Arity: 1, Mutating: true, Handler: flushdb, Summary: "remove all keys"},
 		{Name: "OBJECT", Arity: -2, Handler: objectInfo, Summary: "inspect object encoding"},
+
+		{Name: "LPUSH", Arity: -3, Mutating: true, Handler: lpush, Summary: "prepend list values"},
+		{Name: "RPUSH", Arity: -3, Mutating: true, Handler: rpush, Summary: "append list values"},
+		{Name: "LPOP", Arity: 2, Mutating: true, Handler: lpop, Summary: "pop list head"},
+		{Name: "RPOP", Arity: 2, Mutating: true, Handler: rpop, Summary: "pop list tail"},
+		{Name: "LLEN", Arity: 2, Handler: llen, Summary: "list length"},
+		{Name: "LRANGE", Arity: 4, Handler: lrange, Summary: "inclusive list range"},
+
+		{Name: "HSET", Arity: -4, Mutating: true, Handler: hset, Summary: "set hash fields"},
+		{Name: "HGET", Arity: 3, Handler: hget, Summary: "get hash field"},
+		{Name: "HDEL", Arity: -3, Mutating: true, Handler: hdel, Summary: "delete hash fields"},
+		{Name: "HLEN", Arity: 2, Handler: hlen, Summary: "hash field count"},
+		{Name: "HGETALL", Arity: 2, Handler: hgetall, Summary: "all hash fields and values"},
+
+		{Name: "SADD", Arity: -3, Mutating: true, Handler: sadd, Summary: "add set members"},
+		{Name: "SREM", Arity: -3, Mutating: true, Handler: srem, Summary: "remove set members"},
+		{Name: "SISMEMBER", Arity: 3, Handler: sismember, Summary: "set membership"},
+		{Name: "SMEMBERS", Arity: 2, Handler: smembers, Summary: "all set members"},
+		{Name: "SCARD", Arity: 2, Handler: scard, Summary: "set cardinality"},
+
+		{Name: "ZADD", Arity: -4, Mutating: true, Handler: zadd, Summary: "add/update sorted-set members"},
+		{Name: "ZSCORE", Arity: 3, Handler: zscore, Summary: "sorted-set score"},
+		{Name: "ZRANK", Arity: 3, Handler: zrank, Summary: "zero-based sorted-set rank"},
+		{Name: "ZRANGE", Arity: 4, Handler: zrange, Summary: "sorted-set rank range"},
+		{Name: "ZREM", Arity: -3, Mutating: true, Handler: zrem, Summary: "remove sorted-set members"},
+
 		{Name: "COMMAND", Arity: -1, Handler: commandInfo, Summary: "minimal compatibility response"},
 	}
 	for _, spec := range specs {
 		r.Register(spec)
 	}
+}
+
+func wrongType(err error) resp.Value {
+	if errors.Is(err, store.ErrWrongType) {
+		return resp.Error(wrongTypeMessage)
+	}
+	return resp.Error("ERR internal data error")
 }
 
 func ping(_ *Context, args []string) resp.Value {
@@ -49,8 +85,6 @@ func echo(_ *Context, args []string) resp.Value { return resp.BulkString(args[0]
 func set(ctx *Context, args []string) resp.Value {
 	key, value := args[0], args[1]
 	var ttl *time.Duration
-
-	// v0.1 supports one optional expiration modifier: EX seconds or PX ms.
 	if len(args) > 2 {
 		if len(args) != 4 {
 			return resp.Error("ERR syntax error")
@@ -76,7 +110,6 @@ func set(ctx *Context, args []string) resp.Value {
 		}
 		ttl = &d
 	}
-
 	ctx.Store.Set(key, store.NewString(value), ttl)
 	return resp.SimpleString("OK")
 }
@@ -87,7 +120,7 @@ func get(ctx *Context, args []string) resp.Value {
 		return resp.NullBulkString()
 	}
 	if obj.Type != store.ObjectString {
-		return resp.Error("WRONGTYPE operation against a key holding the wrong kind of value")
+		return resp.Error(wrongTypeMessage)
 	}
 	value, ok := obj.StringValue()
 	if !ok {
@@ -104,9 +137,7 @@ func exists(ctx *Context, args []string) resp.Value {
 	return resp.Integer(int64(ctx.Store.Exists(args...)))
 }
 
-func incr(ctx *Context, args []string) resp.Value {
-	return doIncrBy(ctx, args[0], 1)
-}
+func incr(ctx *Context, args []string) resp.Value { return doIncrBy(ctx, args[0], 1) }
 
 func incrby(ctx *Context, args []string) resp.Value {
 	delta, err := strconv.ParseInt(args[1], 10, 64)
@@ -118,6 +149,9 @@ func incrby(ctx *Context, args []string) resp.Value {
 
 func doIncrBy(ctx *Context, key string, delta int64) resp.Value {
 	value, err := ctx.Store.IncrBy(key, delta)
+	if errors.Is(err, store.ErrWrongType) {
+		return resp.Error(wrongTypeMessage)
+	}
 	if err != nil {
 		return resp.Error("ERR value is not an integer or out of range")
 	}
@@ -192,8 +226,6 @@ func ttl(ctx *Context, args []string) resp.Value {
 	if !result.HasExpiry {
 		return resp.Integer(-1)
 	}
-	// Redis TTL is integer seconds. Ceiling avoids reporting 0 immediately
-	// after EXPIRE key 1 due solely to sub-second processing time.
 	seconds := int64((result.Remaining + time.Second - 1) / time.Second)
 	if seconds < 0 {
 		seconds = 0
@@ -206,11 +238,7 @@ func keys(ctx *Context, args []string) resp.Value {
 	if err != nil {
 		return resp.Error("ERR invalid pattern")
 	}
-	out := make([]resp.Value, 0, len(names))
-	for _, name := range names {
-		out = append(out, resp.BulkString(name))
-	}
-	return resp.Array(out)
+	return bulkArray(names)
 }
 
 func dbsize(ctx *Context, _ []string) resp.Value { return resp.Integer(int64(ctx.Store.Len())) }
@@ -231,9 +259,229 @@ func objectInfo(ctx *Context, args []string) resp.Value {
 	return resp.BulkString(obj.Encoding.String())
 }
 
+func lpush(ctx *Context, args []string) resp.Value { return listPush(ctx, args, true) }
+func rpush(ctx *Context, args []string) resp.Value { return listPush(ctx, args, false) }
+
+func listPush(ctx *Context, args []string, left bool) resp.Value {
+	n, err := ctx.Store.ListPush(args[0], left, args[1:])
+	if err != nil {
+		return wrongType(err)
+	}
+	return resp.Integer(int64(n))
+}
+
+func lpop(ctx *Context, args []string) resp.Value { return listPop(ctx, args, true) }
+func rpop(ctx *Context, args []string) resp.Value { return listPop(ctx, args, false) }
+
+func listPop(ctx *Context, args []string, left bool) resp.Value {
+	value, ok, err := ctx.Store.ListPop(args[0], left)
+	if err != nil {
+		return wrongType(err)
+	}
+	if !ok {
+		return resp.NullBulkString()
+	}
+	return resp.BulkString(value)
+}
+
+func llen(ctx *Context, args []string) resp.Value {
+	n, err := ctx.Store.ListLen(args[0])
+	if err != nil {
+		return wrongType(err)
+	}
+	return resp.Integer(int64(n))
+}
+
+func lrange(ctx *Context, args []string) resp.Value {
+	start, err := strconv.Atoi(args[1])
+	if err != nil {
+		return resp.Error("ERR value is not an integer or out of range")
+	}
+	stop, err := strconv.Atoi(args[2])
+	if err != nil {
+		return resp.Error("ERR value is not an integer or out of range")
+	}
+	values, err := ctx.Store.ListRange(args[0], start, stop)
+	if err != nil {
+		return wrongType(err)
+	}
+	return bulkArray(values)
+}
+
+func hset(ctx *Context, args []string) resp.Value {
+	if len(args) < 3 || len(args)%2 == 0 {
+		return resp.Error("ERR wrong number of arguments for 'hset' command")
+	}
+	pairs := make([]store.FieldValue, 0, (len(args)-1)/2)
+	for i := 1; i < len(args); i += 2 {
+		pairs = append(pairs, store.FieldValue{Field: args[i], Value: args[i+1]})
+	}
+	n, err := ctx.Store.HashSet(args[0], pairs)
+	if err != nil {
+		return wrongType(err)
+	}
+	return resp.Integer(int64(n))
+}
+
+func hget(ctx *Context, args []string) resp.Value {
+	value, ok, err := ctx.Store.HashGet(args[0], args[1])
+	if err != nil {
+		return wrongType(err)
+	}
+	if !ok {
+		return resp.NullBulkString()
+	}
+	return resp.BulkString(value)
+}
+
+func hdel(ctx *Context, args []string) resp.Value {
+	n, err := ctx.Store.HashDelete(args[0], args[1:]...)
+	if err != nil {
+		return wrongType(err)
+	}
+	return resp.Integer(int64(n))
+}
+
+func hlen(ctx *Context, args []string) resp.Value {
+	n, err := ctx.Store.HashLen(args[0])
+	if err != nil {
+		return wrongType(err)
+	}
+	return resp.Integer(int64(n))
+}
+
+func hgetall(ctx *Context, args []string) resp.Value {
+	pairs, err := ctx.Store.HashGetAll(args[0])
+	if err != nil {
+		return wrongType(err)
+	}
+	out := make([]resp.Value, 0, len(pairs)*2)
+	for _, pair := range pairs {
+		out = append(out, resp.BulkString(pair.Field), resp.BulkString(pair.Value))
+	}
+	return resp.Array(out)
+}
+
+func sadd(ctx *Context, args []string) resp.Value {
+	n, err := ctx.Store.SetAdd(args[0], args[1:]...)
+	if err != nil {
+		return wrongType(err)
+	}
+	return resp.Integer(int64(n))
+}
+
+func srem(ctx *Context, args []string) resp.Value {
+	n, err := ctx.Store.SetRemove(args[0], args[1:]...)
+	if err != nil {
+		return wrongType(err)
+	}
+	return resp.Integer(int64(n))
+}
+
+func sismember(ctx *Context, args []string) resp.Value {
+	ok, err := ctx.Store.SetIsMember(args[0], args[1])
+	if err != nil {
+		return wrongType(err)
+	}
+	if ok {
+		return resp.Integer(1)
+	}
+	return resp.Integer(0)
+}
+
+func smembers(ctx *Context, args []string) resp.Value {
+	values, err := ctx.Store.SetMembers(args[0])
+	if err != nil {
+		return wrongType(err)
+	}
+	return bulkArray(values)
+}
+
+func scard(ctx *Context, args []string) resp.Value {
+	n, err := ctx.Store.SetCard(args[0])
+	if err != nil {
+		return wrongType(err)
+	}
+	return resp.Integer(int64(n))
+}
+
+func zadd(ctx *Context, args []string) resp.Value {
+	if len(args) < 3 || len(args)%2 == 0 {
+		return resp.Error("ERR wrong number of arguments for 'zadd' command")
+	}
+	pairs := make([]store.ScoredMember, 0, (len(args)-1)/2)
+	for i := 1; i < len(args); i += 2 {
+		score, err := strconv.ParseFloat(args[i], 64)
+		if err != nil || math.IsNaN(score) {
+			return resp.Error("ERR value is not a valid float")
+		}
+		pairs = append(pairs, store.ScoredMember{Member: args[i+1], Score: score})
+	}
+	n, err := ctx.Store.ZAdd(args[0], pairs)
+	if err != nil {
+		return wrongType(err)
+	}
+	return resp.Integer(int64(n))
+}
+
+func zscore(ctx *Context, args []string) resp.Value {
+	score, ok, err := ctx.Store.ZScore(args[0], args[1])
+	if err != nil {
+		return wrongType(err)
+	}
+	if !ok {
+		return resp.NullBulkString()
+	}
+	return resp.BulkString(strconv.FormatFloat(score, 'g', -1, 64))
+}
+
+func zrank(ctx *Context, args []string) resp.Value {
+	rank, ok, err := ctx.Store.ZRank(args[0], args[1])
+	if err != nil {
+		return wrongType(err)
+	}
+	if !ok {
+		return resp.NullBulkString()
+	}
+	return resp.Integer(int64(rank))
+}
+
+func zrange(ctx *Context, args []string) resp.Value {
+	start, err := strconv.Atoi(args[1])
+	if err != nil {
+		return resp.Error("ERR value is not an integer or out of range")
+	}
+	stop, err := strconv.Atoi(args[2])
+	if err != nil {
+		return resp.Error("ERR value is not an integer or out of range")
+	}
+	pairs, err := ctx.Store.ZRange(args[0], start, stop)
+	if err != nil {
+		return wrongType(err)
+	}
+	out := make([]resp.Value, 0, len(pairs))
+	for _, pair := range pairs {
+		out = append(out, resp.BulkString(pair.Member))
+	}
+	return resp.Array(out)
+}
+
+func zrem(ctx *Context, args []string) resp.Value {
+	n, err := ctx.Store.ZRemove(args[0], args[1:]...)
+	if err != nil {
+		return wrongType(err)
+	}
+	return resp.Integer(int64(n))
+}
+
+func bulkArray(values []string) resp.Value {
+	out := make([]resp.Value, 0, len(values))
+	for _, value := range values {
+		out = append(out, resp.BulkString(value))
+	}
+	return resp.Array(out)
+}
+
 func commandInfo(_ *Context, _ []string) resp.Value {
-	// redis-cli can issue COMMAND during capability discovery. Returning an
-	// empty array is enough for v0.1 interoperability without pretending to
-	// implement Redis' full command metadata schema.
 	return resp.Array(nil)
 }
