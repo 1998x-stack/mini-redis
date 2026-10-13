@@ -27,5 +27,6 @@ jobs:
       - run: make session-demo
       - run: make replication-demo
       - run: make sentinel-demo
+      - run: make cluster-demo
       - run: make smoke
       - run: NETWORK_ENGINE=legacy PORT=16380 make smoke
