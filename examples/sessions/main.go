@@ -140,19 +140,19 @@ func main() {
 	defer bob.close()
 
 	fmt.Println("== WATCH optimistic conflict ==")
-	mustPrint("bob SET balance 10", bob.command("SET", "balance", "10"))
-	mustPrint("alice WATCH balance", alice.command("WATCH", "balance"))
-	mustPrint("bob SET balance 11", bob.command("SET", "balance", "11"))
-	mustPrint("alice MULTI", alice.command("MULTI"))
-	mustPrint("alice SET balance 12", alice.command("SET", "balance", "12"))
-	mustPrint("alice EXEC", alice.command("EXEC"))
+	mustCommand("bob SET balance 10", bob, "SET", "balance", "10")
+	mustCommand("alice WATCH balance", alice, "WATCH", "balance")
+	mustCommand("bob SET balance 11", bob, "SET", "balance", "11")
+	mustCommand("alice MULTI", alice, "MULTI")
+	mustCommand("alice SET balance 12", alice, "SET", "balance", "12")
+	mustCommand("alice EXEC", alice, "EXEC")
 
 	fmt.Println("\n== MULTI queues, EXEC runs in order ==")
-	mustPrint("MULTI", alice.command("MULTI"))
-	mustPrint("SET tx 1", alice.command("SET", "tx", "1"))
-	mustPrint("INCR tx", alice.command("INCR", "tx"))
-	mustPrint("GET tx", alice.command("GET", "tx"))
-	mustPrint("EXEC", alice.command("EXEC"))
+	mustCommand("MULTI", alice, "MULTI")
+	mustCommand("SET tx 1", alice, "SET", "tx", "1")
+	mustCommand("INCR tx", alice, "INCR", "tx")
+	mustCommand("GET tx", alice, "GET", "tx")
+	mustCommand("EXEC", alice, "EXEC")
 
 	fmt.Println("\n== Pub/Sub changes connection role ==")
 	subscriber, err := dial(addr)
@@ -165,11 +165,16 @@ func main() {
 		panic(err)
 	}
 	defer publisher.close()
-	mustPrint("SUBSCRIBE news", subscriber.command("SUBSCRIBE", "news"))
-	mustPrint("PUBLISH news hello", publisher.command("PUBLISH", "news", "hello"))
+	mustCommand("SUBSCRIBE news", subscriber, "SUBSCRIBE", "news")
+	mustCommand("PUBLISH news hello", publisher, "PUBLISH", "news", "hello")
 	message, err := subscriber.readValue()
 	mustPrint("subscriber push", message, err)
-	mustPrint("UNSUBSCRIBE news", subscriber.command("UNSUBSCRIBE", "news"))
+	mustCommand("UNSUBSCRIBE news", subscriber, "UNSUBSCRIBE", "news")
+}
+
+func mustCommand(label string, c *client, args ...string) {
+	value, err := c.command(args...)
+	mustPrint(label, value, err)
 }
 
 func mustPrint(label string, value string, err error) {
