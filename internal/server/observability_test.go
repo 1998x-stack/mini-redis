@@ -1,14 +1,20 @@
 package server
 
 import (
+	"io"
+	"log/slog"
 	"net"
 	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
 
+	"github.com/1998x-stack/mini-redis/internal/aof"
+	"github.com/1998x-stack/mini-redis/internal/command"
 	"github.com/1998x-stack/mini-redis/internal/config"
 	"github.com/1998x-stack/mini-redis/internal/resp"
+	"github.com/1998x-stack/mini-redis/internal/store"
+	"github.com/1998x-stack/mini-redis/internal/store/versionedmemory"
 )
 
 func readWireValue(t *testing.T, conn net.Conn) resp.Value {
@@ -124,9 +130,12 @@ func TestPersistenceMetricsMeasureRealFiles(t *testing.T) {
 	cfg.AppendOnly = true
 	cfg.AppendFilename = filepath.Join(dir, "appendonly.aof")
 	cfg.RDBFilename = filepath.Join(dir, "dump.mrdb")
-	cfg.AppendFsync = config.AppendFsyncAlways
+	cfg.AppendFsync = aof.FsyncAlways
 
-	registry, st, logger := testServerParts()
+	registry := command.NewRegistry()
+	command.RegisterCore(registry)
+	st := versionedmemory.New(store.RealClock{})
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv, err := New(cfg, st, registry, logger)
 	if err != nil {
 		t.Fatal(err)
