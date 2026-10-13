@@ -18,5 +18,6 @@ jobs:
       - run: go build ./cmd/mini-redis-server
       - run: make rehash-demo
       - run: make encodings-demo
+      - run: make persistence-demo
       - run: make smoke
       - run: NETWORK_ENGINE=legacy PORT=16380 make smoke
