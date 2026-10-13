@@ -359,8 +359,19 @@ func (s *Server) execTransaction(session *clientSession) resp.Value {
 	}
 
 	replies := make([]resp.Value, 0, len(queue))
-	for _, command := range queue {
-		replies = append(replies, s.executeCommandLocked(command))
+	var persist [][]string
+	for _, queuedCommand := range queue {
+		reply, commands := s.executeCommandDeferredLocked(queuedCommand)
+		replies = append(replies, reply)
+		persist = append(persist, commands...)
+	}
+	if s.aof != nil && len(persist) > 0 {
+		if err := s.aof.AppendTransaction(persist); err != nil {
+			s.logger.Error("AOF transaction append failed", "error", err)
+			s.persistenceMu.Unlock()
+			session.resetTransaction(true)
+			return resp.Error("MISCONF AOF transaction persistence failed")
+		}
 	}
 	s.persistenceMu.Unlock()
 	session.resetTransaction(true)
