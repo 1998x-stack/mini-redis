@@ -186,6 +186,7 @@ func (s *Server) streamReplicationFrames(ctx context.Context, writer *resp.Write
 func (s *Server) runReplicaLoop(ctx context.Context, upstream string) {
 	for ctx.Err() == nil {
 		if err := s.followPrimaryOnce(ctx, upstream); err != nil && ctx.Err() == nil {
+			s.metrics.ReplicationLinkFailures.Inc()
 			s.logger.Warn("replication link lost", "upstream", upstream, "error", err)
 		}
 		timer := time.NewTimer(s.cfg.ReplicationReconnectDelay)
@@ -259,6 +260,7 @@ func (s *Server) followPrimaryOnce(ctx context.Context, upstream string) error {
 		if err := s.installReplicaSnapshot(entries, parts[1], baseOffset); err != nil {
 			return err
 		}
+		s.metrics.ReplicationFullSyncsApplied.Inc()
 	case "CONTINUE":
 		if len(parts) != 3 {
 			return fmt.Errorf("invalid CONTINUE header %q", header)
@@ -266,6 +268,7 @@ func (s *Server) followPrimaryOnce(ctx context.Context, upstream string) error {
 		if parts[1] != id {
 			return fmt.Errorf("CONTINUE identity mismatch: got %q want %q", parts[1], id)
 		}
+		s.metrics.ReplicationPartialSyncsApplied.Inc()
 	default:
 		return fmt.Errorf("unexpected replication handshake %q", header)
 	}
@@ -341,6 +344,8 @@ func (s *Server) applyReplicationPayload(payload []byte) error {
 	s.replStateMu.Lock()
 	s.replicaOffset += int64(len(payload))
 	s.replStateMu.Unlock()
+	s.metrics.ReplicationFramesApplied.Inc()
+	s.metrics.ReplicationBytesApplied.Add(uint64(len(payload)))
 	return nil
 }
 
