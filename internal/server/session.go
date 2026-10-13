@@ -3,10 +3,12 @@ package server
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/1998x-stack/mini-redis/internal/resp"
+	"github.com/1998x-stack/mini-redis/internal/version"
 )
 
 type watchToken struct {
@@ -61,6 +63,7 @@ type clientSession struct {
 	id uint64
 
 	mu            sync.Mutex
+	protocol      resp.Protocol
 	inMulti       bool
 	dirty         bool
 	queue         [][]string
@@ -72,6 +75,7 @@ type clientSession struct {
 func (s *Server) newClientSession(push func(resp.Value) error) *clientSession {
 	return &clientSession{
 		id:            s.sessionSeq.Add(1),
+		protocol:      resp.Protocol2,
 		watched:       make(map[string]watchToken),
 		subscriptions: make(map[string]struct{}),
 		push:          push,
@@ -83,6 +87,12 @@ func (s *Server) closeClientSession(session *clientSession) {
 		return
 	}
 	s.hub.unsubscribeAll(session)
+}
+
+func (c *clientSession) protocolMode() resp.Protocol {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.protocol
 }
 
 func (c *clientSession) subscriptionCount() int {
@@ -102,6 +112,13 @@ func (c *clientSession) resetTransaction(clearWatches bool) {
 		c.watched = make(map[string]watchToken)
 	}
 	c.mu.Unlock()
+}
+
+func (c *clientSession) pubSubFrame(values []resp.Value) resp.Value {
+	if c.protocolMode() == resp.Protocol3 {
+		return resp.Push(values)
+	}
+	return resp.Array(values)
 }
 
 type pubSubHub struct {
@@ -170,12 +187,12 @@ func (h *pubSubHub) publish(channel, payload string) int {
 	}
 	h.mu.Unlock()
 
-	message := resp.Array([]resp.Value{
-		resp.BulkString("message"),
-		resp.BulkString(channel),
-		resp.BulkString(payload),
-	})
 	for _, session := range targets {
+		message := session.pubSubFrame([]resp.Value{
+			resp.BulkString("message"),
+			resp.BulkString(channel),
+			resp.BulkString(payload),
+		})
 		if session.push != nil {
 			_ = session.push(message)
 		}
@@ -183,8 +200,8 @@ func (h *pubSubHub) publish(channel, payload string) int {
 	return len(targets)
 }
 
-func pubSubCountReply(kind, channel string, count int) resp.Value {
-	return resp.Array([]resp.Value{
+func pubSubCountReply(session *clientSession, kind, channel string, count int) resp.Value {
+	return session.pubSubFrame([]resp.Value{
 		resp.BulkString(kind),
 		resp.BulkString(channel),
 		resp.Integer(int64(count)),
@@ -197,7 +214,14 @@ func (s *Server) executeClientCommand(session *clientSession, argv []string) []r
 	}
 	name := strings.ToUpper(argv[0])
 
-	if session.subscribed() {
+	if name == "HELLO" {
+		return []resp.Value{s.helloCommand(session, argv)}
+	}
+
+	// RESP2 subscribed mode is ambiguous because asynchronous messages and normal
+	// replies are both arrays. RESP3 Push frames remove that ambiguity, so a
+	// subscribed RESP3 client may continue issuing ordinary commands.
+	if session.subscribed() && session.protocolMode() == resp.Protocol2 {
 		switch name {
 		case "SUBSCRIBE":
 			return s.subscribeCommand(session, argv)
@@ -213,7 +237,7 @@ func (s *Server) executeClientCommand(session *clientSession, argv []string) []r
 			}
 			return []resp.Value{resp.Array([]resp.Value{resp.BulkString("pong"), resp.BulkString(payload)})}
 		default:
-			return []resp.Value{resp.Error("ERR only SUBSCRIBE, UNSUBSCRIBE and PING are allowed in subscribed mode")}
+			return []resp.Value{resp.Error("ERR only SUBSCRIBE, UNSUBSCRIBE and PING are allowed in subscribed RESP2 mode")}
 		}
 	}
 
@@ -264,7 +288,7 @@ func (s *Server) executeClientCommand(session *clientSession, argv []string) []r
 		}
 		session.mu.Unlock()
 		if inMulti {
-			return []resp.Value{resp.Error("ERR PUBLISH is not queued inside MULTI in mini-redis v0.8")}
+			return []resp.Value{resp.Error("ERR PUBLISH is not queued inside MULTI in mini-redis")}
 		}
 		if len(argv) != 3 {
 			return []resp.Value{resp.Error("ERR wrong number of arguments for 'publish' command")}
@@ -285,7 +309,82 @@ func (s *Server) executeClientCommand(session *clientSession, argv []string) []r
 		return []resp.Value{resp.SimpleString("QUEUED")}
 	}
 	session.mu.Unlock()
-	return []resp.Value{s.executeCommand(argv)}
+	reply := s.executeCommand(argv)
+	return []resp.Value{s.adaptReplyForProtocol(session, argv, reply)}
+}
+
+func (s *Server) helloCommand(session *clientSession, argv []string) resp.Value {
+	if len(argv) > 2 {
+		return resp.Error("ERR syntax error")
+	}
+
+	session.mu.Lock()
+	if session.inMulti {
+		session.mu.Unlock()
+		return resp.Error("ERR HELLO must be called outside MULTI")
+	}
+	protocol := session.protocol
+	if len(argv) == 2 {
+		versionNumber, err := strconv.Atoi(argv[1])
+		if err != nil {
+			session.mu.Unlock()
+			return resp.Error("ERR Protocol version is not an integer")
+		}
+		negotiated, ok := resp.ValidProtocol(versionNumber)
+		if !ok {
+			session.mu.Unlock()
+			return resp.Error("NOPROTO unsupported protocol version")
+		}
+		protocol = negotiated
+		session.protocol = negotiated
+	}
+	id := session.id
+	session.mu.Unlock()
+
+	role := string(s.currentReplicationRole())
+	if role == "" {
+		role = "standalone"
+	}
+	return resp.MapValue([]resp.MapEntry{
+		{Key: resp.BulkString("server"), Value: resp.BulkString("mini-redis")},
+		{Key: resp.BulkString("version"), Value: resp.BulkString(version.Version)},
+		{Key: resp.BulkString("proto"), Value: resp.Integer(int64(protocol))},
+		{Key: resp.BulkString("id"), Value: resp.Integer(int64(id))},
+		{Key: resp.BulkString("mode"), Value: resp.BulkString("standalone")},
+		{Key: resp.BulkString("role"), Value: resp.BulkString(role)},
+	})
+}
+
+func (s *Server) adaptReplyForProtocol(session *clientSession, argv []string, reply resp.Value) resp.Value {
+	if session.protocolMode() != resp.Protocol3 || len(argv) == 0 || reply.IsError() {
+		return reply
+	}
+	switch strings.ToUpper(argv[0]) {
+	case "HGETALL":
+		if reply.Type != resp.ArrayType || len(reply.Array)%2 != 0 {
+			return reply
+		}
+		entries := make([]resp.MapEntry, 0, len(reply.Array)/2)
+		for i := 0; i < len(reply.Array); i += 2 {
+			entries = append(entries, resp.MapEntry{Key: reply.Array[i], Value: reply.Array[i+1]})
+		}
+		return resp.MapValue(entries)
+	case "SMEMBERS":
+		if reply.Type == resp.ArrayType {
+			return resp.Set(reply.Array)
+		}
+	case "SISMEMBER":
+		if reply.Type == resp.IntegerType {
+			return resp.Boolean(reply.Int != 0)
+		}
+	case "ZSCORE":
+		if reply.Type == resp.BulkStringType {
+			if score, err := strconv.ParseFloat(reply.Str, 64); err == nil {
+				return resp.Double(score)
+			}
+		}
+	}
+	return reply
 }
 
 func (s *Server) watchCommand(session *clientSession, argv []string) resp.Value {
@@ -365,7 +464,7 @@ func (s *Server) execTransaction(session *clientSession) resp.Value {
 	var persist [][]string
 	for _, queuedCommand := range queue {
 		reply, commands := s.executeCommandDeferredLocked(queuedCommand)
-		replies = append(replies, reply)
+		replies = append(replies, s.adaptReplyForProtocol(session, queuedCommand, reply))
 		persist = append(persist, commands...)
 	}
 	if s.aof != nil && len(persist) > 0 {
@@ -401,7 +500,7 @@ func (s *Server) subscribeCommand(session *clientSession, argv []string) []resp.
 	replies := make([]resp.Value, 0, len(argv)-1)
 	for _, channel := range argv[1:] {
 		count := s.hub.subscribe(session, channel)
-		replies = append(replies, pubSubCountReply("subscribe", channel, count))
+		replies = append(replies, pubSubCountReply(session, "subscribe", channel, count))
 	}
 	return replies
 }
@@ -427,14 +526,14 @@ func (s *Server) unsubscribeCommand(session *clientSession, argv []string) []res
 		session.mu.Unlock()
 		sort.Strings(channels)
 		if len(channels) == 0 {
-			return []resp.Value{pubSubCountReply("unsubscribe", "", 0)}
+			return []resp.Value{pubSubCountReply(session, "unsubscribe", "", 0)}
 		}
 	}
 
 	replies := make([]resp.Value, 0, len(channels))
 	for _, channel := range channels {
 		count := s.hub.unsubscribe(session, channel)
-		replies = append(replies, pubSubCountReply("unsubscribe", channel, count))
+		replies = append(replies, pubSubCountReply(session, "unsubscribe", channel, count))
 	}
 	return replies
 }
