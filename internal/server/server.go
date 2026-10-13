@@ -17,6 +17,7 @@ import (
 	"github.com/1998x-stack/mini-redis/internal/config"
 	"github.com/1998x-stack/mini-redis/internal/persistence"
 	"github.com/1998x-stack/mini-redis/internal/rdb"
+	"github.com/1998x-stack/mini-redis/internal/replication"
 	"github.com/1998x-stack/mini-redis/internal/resp"
 	"github.com/1998x-stack/mini-redis/internal/store"
 	"github.com/1998x-stack/mini-redis/internal/store/memorypolicy"
@@ -29,21 +30,27 @@ type Server struct {
 	aof      *aof.Log
 	logger   *slog.Logger
 
-	// persistenceMu names the v0.5 state/AOF boundary. v0.6 also keeps one
-	// command, its memory-pressure decision and eviction DEL persistence inside
-	// this boundary. v0.7 EXEC holds it across WATCH validation and the entire
-	// queued command sequence, so other clients, maintenance and snapshots cannot
-	// observe/interleave a half-executed transaction.
+	// persistenceMu is the canonical logical-order boundary. v0.8 couples the
+	// primary replication feed to the same order already used by commands, EXEC,
+	// snapshots and AOF publication.
 	persistenceMu sync.Mutex
 
 	versions   *keyVersionTable
 	hub        *pubSubHub
 	sessionSeq atomic.Uint64
 
+	replPrimary *replication.Primary
+	replStateMu sync.Mutex
+	replicaID   string
+	replicaOffset int64
+
 	stateMu        sync.RWMutex
 	cancel         context.CancelFunc
 	legacyListener net.Listener
 	addr           net.Addr
+	replListener   net.Listener
+	replAddr       net.Addr
+	replicaConn    net.Conn
 	done           chan struct{}
 	started        bool
 
@@ -66,6 +73,13 @@ func New(cfg config.Config, st store.Store, registry *command.Registry, logger *
 		logger:   logger,
 		versions: newKeyVersionTable(),
 		hub:      newPubSubHub(),
+	}
+	if cfg.ReplicationRole == config.ReplicationPrimary {
+		primary, err := replication.NewPrimary(cfg.ReplicationBacklogBytes, cfg.ReplicationSubscriberFrames)
+		if err != nil {
+			return nil, fmt.Errorf("configure replication primary: %w", err)
+		}
+		s.replPrimary = primary
 	}
 
 	// Recovery happens before installing the runtime memory-policy wrapper. LRU
@@ -148,8 +162,6 @@ func (s *Server) SaveRDB() error {
 		return err
 	}
 
-	// A snapshot is a logical observer. Serialize snapshot capture with EXEC so
-	// no RDB can represent only a prefix of one transaction.
 	s.persistenceMu.Lock()
 	entries, err := snapshotter.Snapshot()
 	s.persistenceMu.Unlock()
@@ -210,7 +222,10 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	}()
 
 	engine := s.cfg.EffectiveNetworkEngine()
-	s.logger.Info("starting mini-redis", "network_engine", engine)
+	s.logger.Info("starting mini-redis", "network_engine", engine, "replication_role", s.cfg.ReplicationRole)
+	if err := s.startReplication(runCtx); err != nil {
+		return err
+	}
 
 	switch engine {
 	case config.NetworkReactor:
@@ -228,10 +243,6 @@ func (s *Server) executeCommand(argv []string) resp.Value {
 	return s.executeCommandLocked(argv)
 }
 
-// executeCommandLocked runs one command while persistenceMu is already held.
-// Normal requests enter through executeCommand; EXEC uses the deferred-AOF form
-// repeatedly so its queued commands are ordered as one non-interleaved server
-// unit and persisted as one MULTI/EXEC AOF frame.
 func (s *Server) executeCommandLocked(argv []string) resp.Value {
 	reply, _ := s.executeCommandCoreLocked(argv, true)
 	return reply
@@ -242,6 +253,12 @@ func (s *Server) executeCommandDeferredLocked(argv []string) (resp.Value, [][]st
 }
 
 func (s *Server) executeCommandCoreLocked(argv []string, persistNow bool) (resp.Value, [][]string) {
+	if s.cfg.ReplicationRole == config.ReplicationReplica && len(argv) > 0 {
+		if spec, ok := s.registry.Lookup(argv[0]); ok && spec.Mutating {
+			return resp.Error("READONLY You can't write against a read only replica."), nil
+		}
+	}
+
 	var (
 		controller    store.MemoryController
 		rollbackStore store.Snapshotter
@@ -305,19 +322,19 @@ func (s *Server) executeCommandCoreLocked(argv []string, persistNow bool) (resp.
 		s.noteAcceptedMutation(argv, evicted)
 	}
 
-	if persistNow && s.aof != nil && len(persist) > 0 {
-		if err := s.aof.AppendBatch(persist); err != nil {
-			s.logger.Error("AOF append failed", "error", err)
-			return resp.Error("MISCONF AOF persistence failed"), nil
+	if persistNow && len(persist) > 0 {
+		if s.aof != nil {
+			if err := s.aof.AppendBatch(persist); err != nil {
+				s.logger.Error("AOF append failed", "error", err)
+				return resp.Error("MISCONF AOF persistence failed"), nil
+			}
 		}
+		s.replicateCommandsLocked(persist, false)
 	}
 	return result.Reply, persist
 }
 
 func (s *Server) runMaintenance() {
-	// In legacy mode maintenance runs in another goroutine. Share the same
-	// logical-state boundary as commands/EXEC so expiration cannot occur between
-	// WATCH validation and the transaction body.
 	s.persistenceMu.Lock()
 	defer s.persistenceMu.Unlock()
 
@@ -361,6 +378,8 @@ func (s *Server) Close() error {
 	s.stateMu.RLock()
 	cancel := s.cancel
 	listener := s.legacyListener
+	replListener := s.replListener
+	replicaConn := s.replicaConn
 	done := s.done
 	started := s.started
 	s.stateMu.RUnlock()
@@ -370,6 +389,12 @@ func (s *Server) Close() error {
 	}
 	if listener != nil {
 		_ = listener.Close()
+	}
+	if replListener != nil {
+		_ = replListener.Close()
+	}
+	if replicaConn != nil {
+		_ = replicaConn.Close()
 	}
 	if started && done != nil {
 		<-done
