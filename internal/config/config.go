@@ -26,6 +26,7 @@ type Config struct {
 	AppendOnly              bool
 	AppendFilename          string
 	AppendFsync             aof.FsyncPolicy
+	RDBFilename             string
 	ActiveExpireEvery       time.Duration
 	ActiveExpireSample      int
 	RehashWorkPerCycle      int
@@ -41,6 +42,7 @@ func Default() Config {
 		AppendOnly:              true,
 		AppendFilename:          "appendonly.aof",
 		AppendFsync:             aof.FsyncEverySec,
+		RDBFilename:             "dump.mrdb",
 		ActiveExpireEvery:       100 * time.Millisecond,
 		ActiveExpireSample:      64,
 		RehashWorkPerCycle:      64,
@@ -68,9 +70,10 @@ func ParseFlags() (Config, error) {
 	flag.StringVar(&engine, "network-engine", engine, "network engine: auto|reactor|legacy")
 	flag.IntVar(&cfg.ClientInputBufferLimit, "client-input-buffer-limit", cfg.ClientInputBufferLimit, "max buffered request bytes per client")
 	flag.IntVar(&cfg.ClientOutputBufferLimit, "client-output-buffer-limit", cfg.ClientOutputBufferLimit, "max queued response bytes per client")
-	flag.BoolVar(&cfg.AppendOnly, "appendonly", cfg.AppendOnly, "enable AOF persistence")
+	flag.BoolVar(&cfg.AppendOnly, "appendonly", cfg.AppendOnly, "enable AOF persistence; when enabled AOF is authoritative at startup")
 	flag.StringVar(&cfg.AppendFilename, "appendfilename", cfg.AppendFilename, "AOF file path")
 	flag.StringVar(&fsync, "appendfsync", fsync, "AOF fsync policy: always|everysec|no")
+	flag.StringVar(&cfg.RDBFilename, "dbfilename", cfg.RDBFilename, "RDB-like snapshot path; loaded at startup only when appendonly=false")
 	flag.DurationVar(&cfg.ActiveExpireEvery, "active-expire-every", cfg.ActiveExpireEvery, "active expiration cycle interval")
 	flag.IntVar(&cfg.ActiveExpireSample, "active-expire-sample", cfg.ActiveExpireSample, "max TTL entries checked per cycle; <=0 full scan")
 	flag.IntVar(&cfg.RehashWorkPerCycle, "rehash-work-per-cycle", cfg.RehashWorkPerCycle, "bounded dictionary rehash work units per maintenance cycle; 0 disables timer-driven work")

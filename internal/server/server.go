@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +14,8 @@ import (
 	"github.com/1998x-stack/mini-redis/internal/aof"
 	"github.com/1998x-stack/mini-redis/internal/command"
 	"github.com/1998x-stack/mini-redis/internal/config"
+	"github.com/1998x-stack/mini-redis/internal/persistence"
+	"github.com/1998x-stack/mini-redis/internal/rdb"
 	"github.com/1998x-stack/mini-redis/internal/resp"
 	"github.com/1998x-stack/mini-redis/internal/store"
 )
@@ -23,6 +26,10 @@ type Server struct {
 	registry *command.Registry
 	aof      *aof.Log
 	logger   *slog.Logger
+
+	// persistenceMu names the v0.5 state/AOF boundary. A command's Store mutation
+	// and AOF append happen under the same lock relative to rewrite snapshotting.
+	persistenceMu sync.Mutex
 
 	stateMu        sync.RWMutex
 	cancel         context.CancelFunc
@@ -44,6 +51,11 @@ func New(cfg config.Config, st store.Store, registry *command.Registry, logger *
 	}
 
 	s := &Server{cfg: cfg, store: st, registry: registry, logger: logger}
+
+	// Startup policy is deliberately explicit: when AOF is enabled it is the
+	// authoritative source and RDB is ignored. When AOF is disabled, an existing
+	// RDB is loaded; a missing RDB means an empty database. Corrupt/incompatible
+	// RDB and invalid complete AOF commands fail startup.
 	if cfg.AppendOnly {
 		log, err := aof.Open(cfg.AppendFilename, cfg.AppendFsync)
 		if err != nil {
@@ -54,8 +66,38 @@ func New(cfg config.Config, st store.Store, registry *command.Registry, logger *
 			_ = log.Close()
 			return nil, err
 		}
+	} else if cfg.RDBFilename != "" {
+		if err := s.loadRDBIfPresent(); err != nil {
+			return nil, err
+		}
 	}
 	return s, nil
+}
+
+func (s *Server) snapshotter() (store.Snapshotter, error) {
+	snapshotter, ok := s.store.(store.Snapshotter)
+	if !ok {
+		return nil, errors.New("store does not support logical snapshots")
+	}
+	return snapshotter, nil
+}
+
+func (s *Server) loadRDBIfPresent() error {
+	entries, err := rdb.LoadFile(s.cfg.RDBFilename)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("load RDB: %w", err)
+	}
+	snapshotter, err := s.snapshotter()
+	if err != nil {
+		return err
+	}
+	if err := snapshotter.RestoreSnapshot(entries); err != nil {
+		return fmt.Errorf("restore RDB: %w", err)
+	}
+	return nil
 }
 
 func (s *Server) replayAOF() error {
@@ -70,6 +112,58 @@ func (s *Server) replayAOF() error {
 		}
 		return nil
 	})
+}
+
+// SaveRDB performs the v0.5 blocking reference snapshot. Memory.Snapshot owns
+// its Store lock while extracting logical state; file publication is then done
+// through fsync + atomic rename without serializing private encodings.
+func (s *Server) SaveRDB() error {
+	if s.cfg.RDBFilename == "" {
+		return errors.New("RDB filename is empty")
+	}
+	snapshotter, err := s.snapshotter()
+	if err != nil {
+		return err
+	}
+	entries, err := snapshotter.Snapshot()
+	if err != nil {
+		return err
+	}
+	return rdb.SaveFile(s.cfg.RDBFilename, entries)
+}
+
+// RewriteAOF compacts history into a logical snapshot command stream. The
+// persistence lock makes snapshot -> BeginRewrite a gap-free boundary; later
+// mutations are appended to the old AOF and buffered into the new one.
+func (s *Server) RewriteAOF() error {
+	if s.aof == nil {
+		return errors.New("AOF is disabled")
+	}
+	snapshotter, err := s.snapshotter()
+	if err != nil {
+		return err
+	}
+
+	s.persistenceMu.Lock()
+	entries, err := snapshotter.Snapshot()
+	if err == nil {
+		err = s.aof.BeginRewrite()
+	}
+	s.persistenceMu.Unlock()
+	if err != nil {
+		return err
+	}
+
+	commands, err := persistence.Commands(entries)
+	if err != nil {
+		s.aof.AbortRewrite()
+		return err
+	}
+	if err := s.aof.FinishRewrite(commands); err != nil {
+		s.aof.AbortRewrite()
+		return err
+	}
+	return nil
 }
 
 // ListenAndServe chooses the requested network engine. On Linux, auto selects
@@ -109,13 +203,16 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 }
 
 func (s *Server) executeCommand(argv []string) resp.Value {
+	s.persistenceMu.Lock()
+	defer s.persistenceMu.Unlock()
+
 	result := s.registry.Execute(&command.Context{Store: s.store}, argv)
 	if s.aof != nil {
 		persist := result.AOFCommands(time.Now())
 		if len(persist) > 0 {
-			// Keep v0.1's durability boundary: append before acknowledging the
-			// mutation. AOF writes remain synchronous in v0.2 so networking, not
-			// disk I/O, is the isolated learning variable.
+			// Append before acknowledging the mutation. v0.5 additionally keeps
+			// this command mutation + append inside persistenceMu relative to AOF
+			// rewrite snapshot boundaries.
 			if err := s.aof.AppendBatch(persist); err != nil {
 				s.logger.Error("AOF append failed", "error", err)
 				return resp.Error("MISCONF AOF persistence failed")
