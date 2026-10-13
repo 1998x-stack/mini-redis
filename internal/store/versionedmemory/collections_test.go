@@ -55,7 +55,17 @@ func TestEmptyCollectionDeletesKeyAndTTL(t *testing.T) {
 
 func TestZSetEncodingVisibleThroughObject(t *testing.T) {
 	m := New(&fakeClock{now: time.Unix(100, 0)})
-	pairs := []store.ScoredMember{{"a", 1}, {"b", 2}, {"c", 3}, {"d", 4}, {"e", 5}, {"f", 6}, {"g", 7}, {"h", 8}, {"i", 9}}
+	pairs := []store.ScoredMember{
+		{Member: "a", Score: 1},
+		{Member: "b", Score: 2},
+		{Member: "c", Score: 3},
+		{Member: "d", Score: 4},
+		{Member: "e", Score: 5},
+		{Member: "f", Score: 6},
+		{Member: "g", Score: 7},
+		{Member: "h", Score: 8},
+		{Member: "i", Score: 9},
+	}
 	if n, err := m.ZAdd("z", pairs); err != nil || n != 9 {
 		t.Fatal(n, err)
 	}
