@@ -59,6 +59,7 @@ func (s *Server) ClusterExecute(topology *cluster.Topology, localID string, sess
 		return s.executeCommand(argv)
 	}
 	if _, err := cluster.CommonSlot(keys); err != nil {
+		topology.RecordCrossSlot()
 		return resp.Error(err.Error())
 	}
 
@@ -183,7 +184,7 @@ func (n *ClusterNode) ImportKey(ctx context.Context, entry store.SnapshotEntry) 
 		persist = append(persist, batch...)
 	}
 	if s.aof != nil && len(persist) > 0 {
-		if err := s.aof.AppendTransaction(persist); err != nil {
+		if err := s.appendAOF(persist, true); err != nil {
 			_ = snapshotter.RestoreSnapshot(rollback)
 			s.versions.bumpAll()
 			s.persistenceMu.Unlock()
