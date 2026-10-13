@@ -1,388 +1,490 @@
-# Architecture — v0.11
+# Architecture — v0.12
 
 ## 1. Current stack
 
 ```text
 TCP connection
       ↓
-command request parser
+command/session/protocol
       ↓
-clientSession
-  ├── protocol = RESP2 by default
-  ├── HELLO 2 / HELLO 3
-  ├── MULTI / WATCH state
-  └── Pub/Sub state
-      ↓
-cluster routing gate when applicable
-  ├── CROSSSLOT
-  ├── MOVED
-  └── ASK / ASKING
+Cluster routing when applicable
       ↓
 Server.persistenceMu
       ↓
 command registry / Store
       ↓
-logical reply (resp.Value)
-      ↓
-protocol view adapter
-      ├── HGETALL → Map in RESP3
-      ├── SMEMBERS → Set in RESP3
-      ├── SISMEMBER → Boolean in RESP3
-      └── ZSCORE → Double in RESP3
-      ↓
-protocol-aware encoder
-      ├── RESP2 compatibility bytes
-      └── RESP3 richer bytes
+logical mutation + reply
+   ├── AOF / RDB
+   ├── replication
+   └── RESP2 / RESP3 representation
+
+          existing mechanism events
+                    │
+                    ↓
+          v0.12 observation points
+                    │
+        ┌───────────┼───────────┐
+        ↓           ↓           ↓
+     Server      Topology    Sentinel
+     Metrics      Metrics     Metrics
+        │           │           │
+        └──── immutable snapshots ────┐
+                                      ↓
+                           INFO / demo / profile
 ```
 
-v0.11's central lesson is:
+v0.12's central lesson is:
 
-> **The database computes one logical result; the connection chooses how that result is represented on the wire.**
+> **Observability is evidence about mechanisms. It is not another mechanism that mechanisms depend on.**
 
-## 2. Why protocol mode belongs to the connection
+## 2. Why metrics are not database state
 
-Two clients can talk to the same server simultaneously:
+A command counter, epoll wait duration or failover count must never survive because the database survives.
 
-```text
-client A → RESP2
-client B → HELLO 3 → RESP3
-```
-
-Neither should change the other's responses. Therefore protocol mode cannot be:
-
-- a Server-global flag;
-- Store metadata;
-- SnapshotEntry data;
-- AOF state;
-- replication state.
-
-It is stored in `clientSession`, protected by the session mutex.
-
-## 3. HELLO is session control, not a Store command
-
-HELLO is intercepted before the ordinary command registry because it changes connection interpretation rather than database state.
+Therefore metrics are intentionally excluded from:
 
 ```text
-new connection
-  protocol = 2
-
-HELLO 3
-  protocol = 3
-  reply = logical Map
-  encoder = RESP3
-
-HELLO 2
-  protocol = 2
-  same logical metadata
-  encoder = RESP2 downgrade
-```
-
-HELLO is rejected inside MULTI so a queued database transaction cannot contain a mid-transaction wire-mode switch.
-
-## 4. Requests stay canonical
-
-The teaching server continues to accept command requests as arrays of blob strings.
-
-That grammar already works for both RESP2 and RESP3 command requests and is also the canonical format used by AOF/replication command frames.
-
-Keeping request parsing independent from response negotiation prevents protocol-version concerns from entering:
-
-```text
-command validation
-Store
+Store Object
+SnapshotEntry
+RDB
 AOF
-replication offset accounting
-Cluster key routing
+replication frames
+Cluster slot ownership
+Sentinel election state
 ```
 
-## 5. Rich logical values
+Restarting the process resets process-local metrics. Restoring a database does not restore yesterday's latency histogram.
 
-`resp.Value` now models:
+This separation prevents accidental behavior such as replication or migration copying instrumentation state.
+
+## 3. Bounded metrics primitives
+
+`internal/observability` provides the smallest useful building blocks.
+
+### Counter
 
 ```text
-Simple String
-Error
-Integer
-Blob String
-Array
-Null
-Boolean
-Double
-Big Number
-Verbatim String
-Map
-Set
-Push
+atomic.Uint64
 ```
 
-This is deliberately a logical intermediate representation.
+Used for monotonic event counts and byte totals.
 
-The same value can have two wire encodings. For example:
+### Gauge
 
 ```text
-Boolean(true)
-   ├─ RESP2 → :1
-   └─ RESP3 → #t
+atomic.Int64
 ```
 
-and:
+Used for point-in-time values such as active connections.
+
+### Dynamic maps
+
+Labels such as command names or network-engine names are created under a small mutex. Once a label exists, steady-state updates hit an atomic value.
+
+Snapshots allocate a copy:
 
 ```text
-Map{k:v}
-   ├─ RESP2 → *2 [k, v]
-   └─ RESP3 → %1 {k => v}
+internal map
+    ↓ copy keys + atomic loads
+snapshot map
 ```
 
-## 6. Response adaptation sits above command semantics
+Mutating the returned map cannot mutate the metrics owner.
 
-The command implementation does not need a RESP2 branch and a RESP3 branch.
+### Fixed-bucket histogram
 
-Example HGETALL:
+Latency histograms keep:
 
 ```text
-Store / command handler
+fixed upper bounds
+bucket counters
+count
+sum_ns
+max_ns
+```
+
+They never retain individual samples. Runtime memory therefore does not grow with request count.
+
+## 4. Three separate observation owners
+
+A single global metrics object would blur ownership that earlier versions deliberately separated.
+
+v0.12 keeps three surfaces.
+
+### Data plane: `Server.MetricsSnapshot()`
+
+Owns evidence for:
+
+- client commands/errors/latency;
+- protocol request/reply mix;
+- connection and transport bytes;
+- reactor poll behavior;
+- expiration/eviction/maintenance;
+- AOF/RDB/rewrite work;
+- server-visible replication state.
+
+### Cluster control plane: `Topology.MetricsSnapshot()`
+
+Owns evidence for:
+
+- route decisions;
+- MOVED / ASK / CLUSTERDOWN;
+- CROSSSLOT;
+- bounded gossip work;
+- migration attempts/keys/errors/duration.
+
+### Sentinel control plane: `Controller.MetricsSnapshot()`
+
+Owns evidence for:
+
+- Tick calls/errors/duration;
+- Probe calls/failures/duration;
+- failover attempts/duration;
+- promotions/reconfigurations;
+- current epoch/primary/last decision.
+
+These snapshots can be displayed together, but their mutable state is never merged.
+
+## 5. Command observation boundary
+
+The shared session path is wrapped by `executeObservedClientCommand`:
+
+```text
+capture start + current protocol
+       ↓
+record command request
+       ↓
+execute existing session/command mechanism
+       ↓
+record duration + error outcome
+```
+
+The observer never changes:
+
+- command validation;
+- MULTI queueing;
+- WATCH conflict logic;
+- Store mutation;
+- AOF/replication publication.
+
+`INFO` is handled as session control/read-only introspection and returns a logical Map. RESP2 clients receive the existing v0.11 Map→flat-array downgrade; RESP3 clients receive a Map.
+
+## 6. Network evidence measures actual I/O
+
+Counting `len(EncodeValue(...))` would describe a planned payload, not what the socket actually accepted.
+
+v0.12 instead instruments the transport boundary.
+
+### Legacy engine
+
+A transparent `metricConn` wraps the accepted `net.Conn`:
+
+```text
+net.Conn.Read  → actual n → bytes_read
+net.Conn.Write → actual n → bytes_written
+```
+
+The wrapper does not buffer or retry.
+
+### Reactor engine
+
+The reactor already owns raw file descriptors, so instrumentation sits beside:
+
+```text
+syscall.Read
+syscall.Write
+Poller.Wait
+```
+
+It records:
+
+- actual read/write bytes;
+- epoll wait calls;
+- returned event count;
+- wait duration;
+- input/output buffer-limit events.
+
+The reactor remains the owner of scheduling, buffers and backpressure. Metrics do not affect interest masks or readiness decisions.
+
+## 7. Expiration, eviction and maintenance
+
+Expiration and eviction remain different mechanisms.
+
+v0.12 observes them where they already become explicit:
+
+```text
+active maintenance ExpireDue
+  → expired_keys
+
+maxmemory EnforceMaxMemory
+  → pressure.ExpiredKeys
+  → pressure.EvictedKeys
+```
+
+Dictionary maintenance also exposes how much bounded rehash work a cycle performed.
+
+A historical test directly constructs a minimal `Server` without `New()`. v0.12 therefore keeps instrumentation optional: if `metrics == nil`, maintenance and memory-policy mechanisms still execute normally. This is an intentional observer-independence invariant, not only a testing convenience.
+
+## 8. Persistence evidence wraps real operations
+
+### AOF append
+
+The server wraps the existing append call:
+
+```text
+canonical commands
       ↓
-logical field/value array
+calculate canonical encoded bytes
       ↓
-protocol adapter
-  RESP2 → leave array
-  RESP3 → Map
+real AOF AppendBatch / AppendTransaction
+      ↓
+ops / bytes / failures / duration
 ```
 
-The current richer views are:
+The observer does not change which commands are persisted or fsync policy.
 
-| Logical command result | RESP2 | RESP3 |
-| --- | --- | --- |
-| `HGETALL` pairs | Array | Map |
-| `SMEMBERS` members | Array | Set |
-| `SISMEMBER` 0/1 | Integer | Boolean |
-| `ZSCORE` text score | Blob | Double |
-| missing value | null bulk/array | Null |
+### RDB save
 
-The adapter does not inspect physical Store encodings.
+`SaveRDB` measures the real snapshot-save operation and reads the resulting file size after success.
 
-## 7. RESP2 downgrade is a first-class path
+### AOF rewrite
 
-RESP3 support is not allowed to break historical clients.
+`RewriteAOF` measures the established rewrite path and resulting published AOF size.
 
-The protocol-aware writer maps richer logical values back to RESP2 forms:
+The distinction matters: persistence latency is evidence about durability work, not automatically a Store latency problem.
+
+## 9. Replication evidence and the ACK boundary
+
+A primary can truthfully know:
 
 ```text
-Map      → flat Array
-Set      → Array
-Push     → Array
-Boolean  → Integer 0/1
-Double   → Blob String
-BigNumber→ Blob String
-Null     → null bulk
-Verbatim → normal blob payload
+repl-id
+current canonical offset
+backlog start
+retained backlog byte window
+FULLRESYNC count
+CONTINUE count
+live subscribers
 ```
 
-This lets internal code use richer semantic values without forcing every caller to understand RESP3.
-
-## 8. Incremental nested value parser
-
-`ParseValue` is separate from the command parser.
-
-Its contract is:
+A replica can truthfully know locally:
 
 ```text
-valid but incomplete prefix
-  → complete=false
-  → consumed=0
-
-complete frame
-  → logical Value
-  → exact consumed byte count
-
-provably malformed frame
-  → protocol error
+repl-id
+applied offset
+FULLRESYNC applied
+CONTINUE applied
+frames applied
+bytes applied
+link failures
 ```
 
-Nested Map/Set/Push parsing is recursion-bounded. Tests split a nested payload at every byte boundary.
+But v0.8 does **not** send replica acknowledgements back to the primary.
 
-This parser is useful for demos/tests and provides a future foundation for clients consuming Push frames.
-
-## 9. Pub/Sub: representation finally matches asynchronous semantics
-
-RESP2 represents Pub/Sub messages as ordinary arrays. A subscribed RESP2 connection therefore keeps the historical restricted command mode.
-
-RESP3 has a dedicated Push marker:
+Therefore v0.12 deliberately does not expose:
 
 ```text
->3
-$7
-message
-$4
-news
-$5
-hello
-
+primary-visible authoritative remote replica applied offset
+primary-visible authoritative replica lag
 ```
 
-So the receiver can distinguish:
+Inventing that number would make observability lie about the protocol. Adding ACK would be a future replication-protocol feature, not a metrics-only change.
+
+## 10. Cluster metrics remain downstream of policy
+
+The route algorithm still computes:
 
 ```text
-normal command reply
+EXECUTE / MOVED / ASK / CLUSTERDOWN
 ```
 
-from:
+from slot ownership/migration state and key existence.
+
+Only after the decision is produced does the Topology observer increment the corresponding counter.
+
+CROSSSLOT is recorded only after `CommonSlot` has already rejected the request.
+
+Migration observation wraps the existing `MigrateSlot` contract:
 
 ```text
-unsolicited async message
+BeginMigration
+  ↓
+TransferKey ...
+  ↓
+CommitMigration / error
+  ↓
+record run / successful-key count / error / duration
 ```
 
-without relying on array contents.
+No metric is consulted by ownership or migration commit.
 
-The Pub/Sub hub is unchanged as a delivery mechanism. Only the frame representation changes.
+Gossip metrics count bounded work performed: pages emitted/merged and records processed. They do not claim unique topology-record cardinality.
 
-## 10. Why RESP3 subscribers may issue ordinary commands
+## 11. Sentinel metrics remain downstream of election policy
 
-Once asynchronous frames are visibly Push values, normal replies are no longer ambiguous.
-
-Therefore:
+`Controller.Tick` still owns:
 
 ```text
-RESP2 subscribed
-  → historical SUBSCRIBE / UNSUBSCRIBE / PING restriction
-
-RESP3 subscribed
-  → ordinary commands allowed
-  → Pub/Sub arrives as Push
+Probe
+  ↓
+monitor-local SDOWN
+  ↓
+quorum ODOWN
+  ↓
+epoch
+  ↓
+candidate ranking
+  ↓
+promotion / reconfiguration
 ```
 
-This demonstrates one of RESP3's architectural benefits rather than treating new markers as cosmetic syntax.
+v0.12 wraps those existing operations with timers/counters.
 
-## 11. Legacy and reactor transports share semantics
-
-The goroutine-per-connection transport and epoll reactor do not contain separate HELLO state machines.
-
-Both follow:
+Candidate ranking still reads only topology/probe state:
 
 ```text
-parse command
-   ↓
-execute shared session path
-   ↓
-read session.protocol
-   ↓
-EncodeValueProtocol
+reachable votes DESC
+replication offset DESC
+node ID ASC
 ```
 
-The reactor still owns nonblocking buffers/backpressure; the legacy engine still owns blocking goroutine scheduling. Protocol negotiation is orthogonal to both.
+It never reads probe latency, failover count or any other metric.
 
-## 12. Cluster composition
+Metrics lifecycle belongs directly to the Controller rather than a global pointer table, so observation does not accidentally retain old controllers.
 
-The explicit v0.10 Cluster endpoint now supports HELLO too, but the ordering is intentionally:
+## 12. INFO is a teaching view, not mutable state
+
+`INFO [section]` is assembled from `Server.MetricsSnapshot()`.
+
+Current sections include:
 
 ```text
-ordinary command
-   ↓
-ClusterExecute
-   ↓
-slot authorization / redirect
-   ↓
-logical reply
-   ↓
-RESP3 adaptation + encoding
+server
+clients
+commands
+protocol
+persistence
+replication
+memory
+reactor
 ```
 
-not:
+It intentionally does not hide Cluster/Sentinel state inside Server. Those have their own snapshots because they are separate control-plane owners.
+
+INFO does not reset counters, mutate keyspace, change protocol policy or expose internal maps by reference.
+
+## 13. Microbenchmark versus end-to-end workload
+
+v0.12 keeps two measurement layers explicit.
+
+### Instrumentation microbenchmark
+
+```bash
+make benchmark-observability
+```
+
+Answers questions such as:
+
+- what is the steady-state cost of one atomic counter increment?
+- what is the cost of a hot CounterMap label?
+- what is the cost of placing a duration into a fixed histogram?
+
+### End-to-end network benchmark
+
+```bash
+make benchmark
+```
+
+Uses the existing legacy/reactor comparison harness and includes TCP, parsing, command dispatch, Store and reply handling.
+
+A microbenchmark result must never be presented as server throughput.
+
+## 14. Profiling workflow
+
+The recommended workflow is evidence-first:
 
 ```text
-RESP3
-   ↓
-bypass Cluster routing
+reproduce workload
+      ↓
+capture metrics snapshot
+      ↓
+identify suspicious mechanism
+      ↓
+profile
+      ↓
+change one mechanism
+      ↓
+rerun identical workload
+      ↓
+compare correctness + metrics + profile
 ```
 
-Wire tests prove a RESP3 client connected to the wrong owner still gets `MOVED`.
-
-HELLO itself is connection control and returns `mode=cluster` on the Cluster endpoint.
-
-## 13. Persistence and replication are protocol-independent
-
-A client may write using a RESP3 connection, but successful mutation publication still produces the same canonical command sequence used before v0.11.
-
-```text
-RESP3 client
-  SET k v
-     ↓
-command semantics
-     ↓
-canonical mutation
-   ├── AOF RESP command frame
-   └── replication RESP command frame
-```
-
-Thus changing HELLO mode cannot alter:
-
-- AOF replay meaning;
-- replication byte offsets;
-- backlog frame boundaries;
-- full/partial synchronization;
-- SnapshotEntry representation.
-
-## 14. Relationship to earlier topology layers
-
-```text
-v0.8 Replication
-  answers: how does another node receive data?
-
-v0.9 Sentinel
-  answers: which replica should become primary?
-
-v0.10 Cluster
-  answers: which primary owns this key's slot?
-
-v0.11 RESP3
-  answers: how does this connection represent replies and async events?
-```
-
-RESP3 is above these mechanisms rather than replacing any of them.
+`docs/PERFORMANCE.md` contains the benchmark metadata contract and pprof commands.
 
 ## 15. Validation model
 
-### Codec
+### Primitive tests
 
-- native RESP3 Map/Set/Boolean/Double/Null/Push encoding;
-- explicit RESP2 downgrade;
-- `inf`, `-inf`, `nan` doubles;
-- nested fragmented parser boundaries.
+- concurrent atomics/maps under `-race`;
+- histogram boundedness/count consistency;
+- returned maps are copies.
 
-### Network
+### Real network tests
 
-On both legacy and reactor:
+On legacy and reactor:
 
-- HELLO 3 / HELLO 2;
-- richer command replies;
-- Pub/Sub Push;
-- normal commands while subscribed in RESP3;
-- unchanged RESP2 behavior.
+- actual connections and bytes increase;
+- command counts/latency increase;
+- HELLO changes request protocol mix as expected;
+- INFO does not mutate keyspace;
+- reactor poll evidence is non-zero on reactor.
 
-### Cluster
+### Persistence tests
 
-- HELLO 3 reports cluster mode;
-- wrong owner remains MOVED;
-- rich views occur after successful slot authorization.
+Real temporary AOF/RDB files prove operation counts, byte evidence and duration observations.
+
+### Control-plane tests
+
+- Cluster tests drive real MOVED, ASK, CROSSSLOT, migration and gossip paths;
+- Sentinel tests drive real down-after/quorum/election/promotion paths.
 
 ### Demo
 
 ```bash
-make resp3-demo
+make observability-demo
 ```
 
-performs real TCP negotiation and prints RESP2 versus RESP3 value categories.
+shows server, Cluster and Sentinel evidence side by side.
 
-## 16. Explicit limits
+## 16. Relationship to the full learning arc
 
-v0.11 does not implement every RESP3 feature. In particular it does not claim complete support for streamed aggregates/strings, Attributes, full Blob Error semantics, client tracking pushes, or the production Redis HELLO option surface.
+```text
+v0.1  request/state/AOF
+v0.2  event loop
+v0.3  Dict/rehash
+v0.4  collections/encodings
+v0.5  RDB/AOF rewrite
+v0.6  maxmemory/eviction
+v0.7  transactions/PubSub
+v0.8  replication
+v0.9  Sentinel
+v0.10 Cluster
+v0.11 RESP3
+v0.12 observability/performance
+```
 
-Those omissions keep the learning boundary focused on negotiation, richer value representation and asynchronous Push.
+The first eleven versions expose mechanisms. v0.12 makes those mechanisms measurable enough that a future optimization can begin from evidence instead of intuition.
 
-## 17. Next architectural layer
+## 17. Explicit limits
 
-v0.12 asks a different question:
+v0.12 does not claim:
 
-> **Can we observe and measure the cost/behavior of all these explicit mechanisms without changing their semantics?**
+- Prometheus/OpenTelemetry compatibility;
+- distributed metrics aggregation;
+- production monitoring/SLO infrastructure;
+- zero-cost instrumentation;
+- production Redis performance parity;
+- portable benchmark numbers across different machines;
+- remote replica lag that the current replication protocol cannot actually know.
 
-The next layer is metrics, latency, lag, queueing, profiling and repeatable performance evidence.
+A future version should start a new learning arc only after measurements identify one concrete mechanism worth replacing or extending.
