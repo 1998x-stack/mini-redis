@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/1998x-stack/mini-redis/internal/cluster"
 	"github.com/1998x-stack/mini-redis/internal/resp"
@@ -35,17 +36,21 @@ func (s *Server) ServeCluster(ctx context.Context, listener net.Listener, topolo
 			}
 			return err
 		}
+		s.metrics.Connections.Inc("cluster")
 		go s.serveClusterConn(ctx, conn, topology, localID)
 	}
 }
 
 func (s *Server) serveClusterConn(ctx context.Context, conn net.Conn, topology *cluster.Topology, localID string) {
-	defer conn.Close()
+	s.metrics.ActiveConnections.Add("cluster", 1)
+	defer s.metrics.ActiveConnections.Add("cluster", -1)
+	observedConn := &metricConn{Conn: conn, metrics: s.metrics, engine: "cluster"}
+	defer observedConn.Close()
 	clusterSession := &cluster.Session{}
 	protocolSession := s.newClientSession(nil)
 	defer s.closeClientSession(protocolSession)
-	reader := resp.NewReader(conn)
-	writer := resp.NewWriter(conn)
+	reader := resp.NewReader(observedConn)
+	writer := resp.NewWriter(observedConn)
 	for {
 		if ctx.Err() != nil {
 			return
@@ -55,23 +60,30 @@ func (s *Server) serveClusterConn(ctx context.Context, conn net.Conn, topology *
 			if errors.Is(err, io.EOF) {
 				return
 			}
-			_ = writer.WriteValueProtocol(resp.Error("ERR "+err.Error()), protocolSession.protocolMode())
+			protocol := protocolSession.protocolMode()
+			value := resp.Error("ERR " + err.Error())
+			_ = writer.WriteValueProtocol(value, protocol)
+			s.observeReply(protocol, value)
 			return
 		}
 
+		started := time.Now()
+		requestProtocol := protocolSession.protocolMode()
+		var reply resp.Value
 		if len(argv) > 0 && strings.EqualFold(argv[0], "HELLO") {
-			reply := setHelloMode(s.helloCommand(protocolSession, argv), "cluster")
-			if err := writer.WriteValueProtocol(reply, protocolSession.protocolMode()); err != nil {
-				return
-			}
-			continue
+			reply = setHelloMode(s.helloCommand(protocolSession, argv), "cluster")
+		} else if len(argv) > 0 && strings.EqualFold(argv[0], "INFO") {
+			reply = s.infoCommand(argv)
+		} else {
+			reply = s.ClusterExecute(topology, localID, clusterSession, argv)
+			reply = s.adaptReplyForProtocol(protocolSession, argv, reply)
 		}
-
-		reply := s.ClusterExecute(topology, localID, clusterSession, argv)
-		reply = s.adaptReplyForProtocol(protocolSession, argv, reply)
-		if err := writer.WriteValueProtocol(reply, protocolSession.protocolMode()); err != nil {
+		s.recordClusterCommand(requestProtocol, argv, reply, started)
+		protocol := protocolSession.protocolMode()
+		if err := writer.WriteValueProtocol(reply, protocol); err != nil {
 			return
 		}
+		s.observeReply(protocol, reply)
 	}
 }
 
