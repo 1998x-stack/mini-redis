@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.8.0
+
+Architecture milestone: make primary/replica synchronization, canonical replication offsets, bounded backlog and partial resynchronization explicit.
+
+- add explicit `standalone`, `primary` and `replica` roles and replication configuration;
+- add a dedicated educational replication TCP plane beside normal client transport;
+- add random primary replication identity and monotonically increasing canonical mutation byte offset;
+- couple primary replication publication to the existing `Server.persistenceMu` logical-order boundary;
+- add logical `SnapshotEntry[]` full synchronization without serializing private Dict/Object layouts;
+- capture snapshot, base offset and live subscriber under one mutation-ordering boundary to prevent snapshot→stream gaps;
+- add frame-aware bounded backlog with whole-frame eviction and exact resume boundaries;
+- add `PSYNC`, `FULLRESYNC` and `CONTINUE` teaching handshake semantics;
+- add partial resync from retained suffix and automatic full-sync fallback after identity mismatch/backlog wrap;
+- preserve catch-up frame boundaries instead of flattening multiple logical frames;
+- advance replica offset only after a complete frame applies successfully;
+- propagate absolute `PEXPIREAT` reconstruction commands and eviction-generated `DEL` through the canonical feed;
+- preserve successful EXEC mutations as one `MULTI ... EXEC` replication frame;
+- add replica-side READONLY client gate while allowing the dedicated replication apply path;
+- intentionally require v0.8 replicas to disable local AOF/maxmemory policy to avoid independent durability/eviction semantics;
+- add replication full/live/partial/fallback/transaction integration tests under the race detector;
+- add sync counters and a diagnostic disconnect hook for deterministic learning tests;
+- add `make replication-demo` showing FULLRESYNC → live propagation → disconnect → CONTINUE → READONLY.
+
 ## v0.7.0
 
 Architecture milestone: make per-connection transaction state, optimistic WATCH conflicts, EXEC persistence framing and live Pub/Sub explicit.
