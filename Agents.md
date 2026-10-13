@@ -48,7 +48,8 @@ main ─────────────────────────
  ├── v0.8 replication
  ├── v0.9 Sentinel-inspired HA
  ├── v0.10 Cluster/hash slots
- └── v0.11 RESP3
+ ├── v0.11 RESP3
+ └── v0.12 observability/performance
 ```
 
 Create a version branch from current `main`. Definition of Done requires exact-SHA CI on the version branch, fast-forwarding `main` to that same SHA, then exact-SHA CI on `main`.
@@ -84,19 +85,28 @@ logical reply
 v0.11 protocol view
    ├── RESP2
    └── RESP3
+
+all established mechanisms
+   ↓
+v0.12 observation points
+   ↓
+atomic counters + bounded histograms
+   ↓
+immutable snapshots / INFO / demos / profiles
 ```
 
 Rules:
 
 - protocol representation never owns database semantics;
 - RESP parsing/encoding does not depend on Store internals;
-- Store never owns network/failover/slot/protocol metadata;
+- Store never owns network/failover/slot/protocol/metrics metadata;
 - command handlers do not inspect private encoding payloads;
-- persistence and replication serialize logical state/commands, never client protocol state;
+- persistence and replication serialize logical state/commands, never client protocol or metrics state;
 - Sentinel monitors/reconfigures replication topology and never copies database values;
 - Cluster ownership/migration remains separate from Store values;
 - Cluster migration crosses nodes via `SnapshotEntry`;
-- response adaptation occurs only after command and Cluster authorization.
+- response adaptation occurs only after command and Cluster authorization;
+- observability records completed/attempted mechanism work but never decides mechanism behavior.
 
 ## 5. Concurrency / atomicity
 
@@ -110,6 +120,9 @@ Rules:
 - `cluster.Topology.mu` owns node/slot/epoch/migration metadata.
 - v0.11 protocol mode is connection-local session state protected by `clientSession.mu`.
 - transports may read protocol mode to encode bytes, but must not implement separate HELLO semantics.
+- v0.12 hot-path counters use atomics; dynamic metric-label creation/snapshot copying may use their own small mutexes.
+- v0.12 histograms are fixed-bucket bounded structures; no unbounded per-request samples.
+- metrics locks/atomics never replace Store, persistence, replication, Sentinel or Cluster synchronization.
 - never claim atomicity without naming its lock, filesystem or protocol boundary.
 
 ## 6. Established transaction / persistence / memory rules
@@ -133,7 +146,8 @@ Rules:
 - matching repl-id + retained frame boundary permits CONTINUE; otherwise FULLRESYNC;
 - replica offset advances only after complete frame application;
 - replica client writes are READONLY;
-- client RESP2/RESP3 mode never changes replication frames.
+- client RESP2/RESP3 mode never changes replication frames;
+- v0.8 has no replica→primary ACK protocol, so a primary cannot truthfully report authoritative remote applied-offset lag.
 
 ## 8. Sentinel rules — v0.9
 
@@ -164,48 +178,51 @@ Rules:
 
 ## 10. RESP3 rules — v0.11
 
-### Negotiation
-
 - every new connection starts in RESP2;
-- `HELLO 3` switches only that connection to RESP3;
-- `HELLO 2` switches only that connection back to RESP2;
+- `HELLO 3` and `HELLO 2` change only that connection;
 - protocol state never enters Store, SnapshotEntry, AOF, replication backlog or Cluster topology;
-- command requests remain canonical arrays of blob strings.
+- `resp.Value` may represent richer logical values and RESP2 explicitly downgrades them;
+- current rich views include HGETALL→Map, SMEMBERS→Set, SISMEMBER→Boolean and ZSCORE→Double;
+- Pub/Sub Push is RESP3 representation of the same delivery mechanism;
+- incomplete nested frames are never partially consumed;
+- legacy/reactor engines share the same session protocol state;
+- Cluster HELLO negotiation never bypasses MOVED/ASK/CROSSSLOT.
 
-### Logical value versus wire form
+## 11. Observability rules — v0.12
 
-- `resp.Value` may represent Null, Boolean, Double, Big Number, Verbatim String, Map, Set and Push;
-- the RESP3 encoder emits native markers;
-- RESP2 encoding explicitly downgrades richer values rather than changing command semantics;
-- selected command replies gain richer RESP3 views only after execution/authorization.
+### Observer-only contract
 
-Current view adaptations:
+- metrics are process/control-plane runtime evidence, never database state;
+- metrics never enter Store, SnapshotEntry, AOF, RDB, replication frames or slot topology records;
+- metrics never decide command success, eviction, expiration, persistence, replication, routing or failover;
+- instrumentation is optional: an established mechanism must still work if its metric sink is absent;
+- observation failure must not convert a successful database operation into an error.
 
-```text
-HGETALL    RESP2 Array  → RESP3 Map
-SMEMBERS   RESP2 Array  → RESP3 Set
-SISMEMBER  RESP2 0/1    → RESP3 Boolean
-ZSCORE      RESP2 bulk   → RESP3 Double
-null bulk/array          → RESP3 Null
-```
+### Snapshot contract
 
-### Push
+- `Server.MetricsSnapshot`, `Topology.MetricsSnapshot` and `Controller.MetricsSnapshot` expose copies/atomic loads only;
+- callers cannot mutate internal metric maps or mechanism state through snapshots;
+- `INFO` is a read-only server teaching view assembled from a snapshot;
+- Cluster and Sentinel keep separate snapshots because they own separate control-plane state.
 
-- Pub/Sub delivery remains one mechanism;
-- RESP3 represents subscription acknowledgements/messages as Push;
-- RESP2 downgrades Push to Array;
-- a RESP3 subscriber may issue ordinary commands because Push disambiguates asynchronous frames;
-- RESP2 subscribed-mode restrictions remain for backward compatibility.
+### Measurement contract
 
-### Parser / transport
+- command/network/persistence timing wraps real existing operations instead of synthetic substitutes;
+- legacy socket bytes are counted from actual `net.Conn` reads/writes;
+- reactor bytes are counted from actual `syscall.Read/Write`, and epoll wait is measured at `Poller.Wait`;
+- fixed histogram buckets bound memory independently of request count;
+- persistence byte evidence comes from actual encoded AOF work or resulting RDB/rewrite files;
+- replication exposes primary offset/backlog/sync counts and replica-local applied offset/work; no remote lag is invented without ACKs;
+- Cluster redirect/migration/gossip and Sentinel probe/failover metrics are recorded after/around existing policy decisions, never consulted by them.
 
-- `ParseValue` must not consume an incomplete nested frame;
-- nested value parsing has a bounded depth;
-- legacy and reactor engines share session-level HELLO/protocol semantics;
-- transports only encode the logical reply using the current session protocol;
-- Cluster HELLO negotiation must never bypass MOVED/ASK/CROSSSLOT routing.
+### Performance claims
 
-## 11. Testing baseline
+- microbenchmarks and end-to-end workloads answer different questions;
+- every quoted performance result must identify commit, environment and workload/configuration;
+- do not claim production Redis parity or context-free speedups;
+- profile before changing a mechanism and rerun the identical workload afterward.
+
+## 12. Testing baseline
 
 Before reporting a version clean, run on the exact SHA:
 
@@ -223,25 +240,29 @@ make replication-demo
 make sentinel-demo
 make cluster-demo
 make resp3-demo
+make observability-demo
 make smoke
 NETWORK_ENGINE=legacy PORT=16380 make smoke
 ```
 
-For v0.11 specifically prove:
+For v0.12 specifically prove:
 
-- RESP3 native Map/Set/Boolean/Double/Null/Push encoding;
-- RESP2 downgrade of richer logical values;
-- fragmented nested value parsing at every split boundary;
-- HELLO 3 and HELLO 2 are connection-local;
-- rich command views on both legacy and reactor engines;
-- Pub/Sub Push and ordinary commands while subscribed in RESP3;
-- RESP2 historical Pub/Sub behavior remains green;
-- Cluster HELLO 3 does not bypass MOVED/ASK/CROSSSLOT;
-- all v0.8 replication, v0.9 Sentinel and v0.10 Cluster demos remain green.
+- concurrent counters/histograms are race-free and bounded;
+- metric snapshots do not expose mutable maps;
+- INFO is read-only;
+- command/protocol/connection/actual-wire-byte/latency metrics work on legacy and reactor;
+- reactor poll observation does not change event-loop behavior;
+- expiration/eviction observation preserves established semantics;
+- AOF/RDB/rewrite metrics measure real operations/bytes and errors;
+- replication metrics expose truthful local/full/partial/backlog evidence without inventing remote ACK state;
+- Cluster MOVED/ASK/CROSSSLOT/gossip/migration metrics come from real paths;
+- Sentinel probe/failover metrics come from the existing quorum/election path;
+- `make observability-demo` produces a coherent cross-layer snapshot;
+- all historical demos remain green.
 
 Do not claim a check passed unless it ran on the exact reported SHA.
 
-## 12. Documentation contract
+## 13. Documentation contract
 
 Every version keeps synchronized:
 
@@ -254,23 +275,21 @@ Every version keeps synchronized:
 
 `version.md` explains prior-version delta, mechanisms, invariants, non-goals, reading order and next dependency.
 
-## 13. Definition of Done
+## 14. Definition of Done
 
 - [ ] primary mental model explicit;
 - [ ] promised mechanism implemented;
 - [ ] invariant + error-path tests exist;
 - [ ] race/build/wire/demo/smoke validation passes;
-- [ ] persistence/replication/topology/protocol boundaries tested where changed;
+- [ ] changed persistence/replication/topology/protocol/observability boundaries tested;
 - [ ] docs and VERSION synchronized;
 - [ ] exact version SHA passes CI;
 - [ ] `main` fast-forwarded to same SHA;
 - [ ] same SHA passes CI on `main`;
 - [ ] next-version rationale documented.
 
-## 14. Current directive
+## 15. Current directive
 
-Freeze candidate: **v0.11 — HELLO 2/3, connection-local protocol mode, richer response types, RESP2 downgrade and Pub/Sub Push**.
+Freeze candidate: **v0.12 — bounded observer-only metrics, immutable snapshots/INFO, cross-layer mechanism evidence and repeatable profiling workflow**.
 
-Next milestone after exact-SHA validation: **v0.12 — Observability / Performance**.
-
-Do not begin v0.12 until v0.11 and `main` are identical on one green exact SHA.
+v0.12 completes the original architecture-learning sequence. Do not start a v0.13 feature list by momentum alone; a next arc should begin from measured evidence and one explicit new learning question.
