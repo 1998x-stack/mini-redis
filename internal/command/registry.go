@@ -64,6 +64,27 @@ func (r *Registry) Lookup(name string) (Spec, bool) {
 	return spec, ok
 }
 
+// Validate performs queue-time command/arity validation without executing the
+// handler. v0.7 transactions use this so syntax/unknown-command errors mark a
+// MULTI block dirty before EXEC, matching Redis' distinction between queue-time
+// and execution-time failures.
+func (r *Registry) Validate(argv []string) (Spec, error) {
+	if len(argv) == 0 {
+		return Spec{}, fmt.Errorf("ERR empty command")
+	}
+	name := strings.ToUpper(argv[0])
+	spec, ok := r.commands[name]
+	if !ok {
+		return Spec{}, fmt.Errorf("ERR unknown command '%s'", strings.ToLower(argv[0]))
+	}
+	argc := len(argv)
+	valid := (spec.Arity > 0 && argc == spec.Arity) || (spec.Arity < 0 && argc >= -spec.Arity)
+	if !valid {
+		return spec, fmt.Errorf("ERR wrong number of arguments for '%s' command", strings.ToLower(spec.Name))
+	}
+	return spec, nil
+}
+
 // MayGrowMemory identifies the current mutating command subset that can create
 // a key/value, enlarge a value, or add expiry metadata. Removal-only commands
 // remain usable under noeviction even if a process starts above maxmemory.
@@ -82,28 +103,13 @@ func (r *Registry) MayGrowMemory(name string) bool {
 }
 
 func (r *Registry) Execute(ctx *Context, argv []string) Execution {
-	if len(argv) == 0 {
-		return Execution{Reply: resp.Error("ERR empty command")}
-	}
-
-	name := strings.ToUpper(argv[0])
-	spec, ok := r.commands[name]
-	if !ok {
-		return Execution{
-			Reply: resp.Error(fmt.Sprintf("ERR unknown command '%s'", strings.ToLower(argv[0]))),
-			Args:  argv,
+	spec, err := r.Validate(argv)
+	if err != nil {
+		found := len(argv) > 0
+		if found {
+			_, found = r.commands[strings.ToUpper(argv[0])]
 		}
-	}
-
-	argc := len(argv)
-	valid := (spec.Arity > 0 && argc == spec.Arity) || (spec.Arity < 0 && argc >= -spec.Arity)
-	if !valid {
-		return Execution{
-			Reply: resp.Error(fmt.Sprintf("ERR wrong number of arguments for '%s' command", strings.ToLower(spec.Name))),
-			Spec:  spec,
-			Args:  argv,
-			Found: true,
-		}
+		return Execution{Reply: resp.Error(strings.TrimPrefix(err.Error(), "ERR ")), Spec: spec, Args: argv, Found: found}
 	}
 
 	reply := spec.Handler(ctx, argv[1:])

@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/1998x-stack/mini-redis/internal/aof"
@@ -30,8 +31,13 @@ type Server struct {
 
 	// persistenceMu names the v0.5 state/AOF boundary. v0.6 also keeps one
 	// command, its memory-pressure decision and eviction DEL persistence inside
-	// this boundary so the legacy and reactor engines observe the same ordering.
+	// this boundary. v0.7 EXEC holds it across WATCH validation and the entire
+	// queued command sequence, so other clients cannot interleave mutations.
 	persistenceMu sync.Mutex
+
+	versions   *keyVersionTable
+	hub        *pubSubHub
+	sessionSeq atomic.Uint64
 
 	stateMu        sync.RWMutex
 	cancel         context.CancelFunc
@@ -52,7 +58,14 @@ func New(cfg config.Config, st store.Store, registry *command.Registry, logger *
 		logger = slog.Default()
 	}
 
-	s := &Server{cfg: cfg, store: st, registry: registry, logger: logger}
+	s := &Server{
+		cfg:      cfg,
+		store:    st,
+		registry: registry,
+		logger:   logger,
+		versions: newKeyVersionTable(),
+		hub:      newPubSubHub(),
+	}
 
 	// Recovery happens before installing the runtime memory-policy wrapper. LRU
 	// and LFU heat are deliberately not reconstructed from AOF history or RDB.
@@ -206,7 +219,13 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 func (s *Server) executeCommand(argv []string) resp.Value {
 	s.persistenceMu.Lock()
 	defer s.persistenceMu.Unlock()
+	return s.executeCommandLocked(argv)
+}
 
+// executeCommandLocked runs one command while persistenceMu is already held.
+// Normal requests enter through executeCommand; EXEC uses this form repeatedly
+// so its queued commands are ordered as one non-interleaved server unit.
+func (s *Server) executeCommandLocked(argv []string) resp.Value {
 	var (
 		controller    store.MemoryController
 		rollbackStore store.Snapshotter
@@ -224,9 +243,6 @@ func (s *Server) executeCommand(argv []string) resp.Value {
 		policy = controller.MemoryPolicyConfig().Policy
 	}
 
-	// noeviction must fail without a partially applied logical mutation. Only
-	// commands that may grow memory need rollback; DEL/POP/HDEL/SREM/ZREM and
-	// FLUSHDB remain usable to recover when a process starts above maxmemory.
 	if memoryManaged && policy == store.PolicyNoEviction && mayGrow {
 		var err error
 		rollbackStore, err = s.snapshotter()
@@ -241,11 +257,9 @@ func (s *Server) executeCommand(argv []string) resp.Value {
 
 	result := s.registry.Execute(&command.Context{Store: s.store}, argv)
 	persist := result.AOFCommands(time.Now())
+	var evicted []string
 
 	if memoryManaged && result.Runnable && result.Spec.Mutating && !result.Reply.IsError() {
-		// Under noeviction, removal-only mutations are always allowed. Policies
-		// with eviction still enforce after any mutation so a write that grows
-		// state can evict enough complete keys before acknowledgement.
 		shouldEnforce := policy != store.PolicyNoEviction || mayGrow
 		if shouldEnforce {
 			pressure, err := controller.EnforceMaxMemory()
@@ -263,10 +277,16 @@ func (s *Server) executeCommand(argv []string) resp.Value {
 				return resp.Error("ERR maxmemory enforcement failed")
 			}
 			if len(pressure.EvictedKeys) > 0 {
+				evicted = append(evicted, pressure.EvictedKeys...)
 				del := append([]string{"DEL"}, pressure.EvictedKeys...)
 				persist = append(persist, del)
 			}
 		}
+	}
+
+	acceptedMutation := result.Runnable && result.Spec.Mutating && !result.Reply.IsError()
+	if acceptedMutation {
+		s.noteAcceptedMutation(argv, evicted)
 	}
 
 	if s.aof != nil && len(persist) > 0 {

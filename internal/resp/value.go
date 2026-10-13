@@ -9,6 +9,7 @@ const (
 	BulkStringType
 	NullBulkStringType
 	ArrayType
+	NullArrayType
 )
 
 type Value struct {
@@ -24,5 +25,6 @@ func Integer(n int64) Value       { return Value{Type: IntegerType, Int: n} }
 func BulkString(s string) Value   { return Value{Type: BulkStringType, Str: s} }
 func NullBulkString() Value       { return Value{Type: NullBulkStringType} }
 func Array(values []Value) Value  { return Value{Type: ArrayType, Array: values} }
+func NullArray() Value            { return Value{Type: NullArrayType} }
 
 func (v Value) IsError() bool { return v.Type == ErrorType }

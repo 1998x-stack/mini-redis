@@ -25,6 +25,7 @@ type reactorClient struct {
 	output          []byte
 	lastActive      time.Time
 	closeAfterWrite bool
+	session         *clientSession
 }
 
 func (c *reactorClient) queue(payload []byte, limit int) error {
@@ -66,15 +67,13 @@ func (s *Server) serveReactor(ctx context.Context) error {
 
 	clients := make(map[int]*reactorClient)
 	defer func() {
-		for fd := range clients {
+		for fd, client := range clients {
+			s.closeClientSession(client.session)
 			_ = poller.Del(fd)
 			_ = syscall.Close(fd)
 		}
 	}()
 
-	// Context cancellation must wake EpollWait. A single wake goroutine replaces
-	// the v0.1 one-goroutine-per-client execution model; it never executes
-	// commands or touches client state.
 	go func() {
 		<-ctx.Done()
 		_, _ = syscall.Write(wakeWrite, []byte{1})
@@ -195,7 +194,18 @@ func (s *Server) acceptReady(poller netpoll.Poller, listenerFD int, clients map[
 
 		_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
 		client := &reactorClient{fd: fd, lastActive: now}
+		client.session = s.newClientSession(func(value resp.Value) error {
+			payload, err := resp.EncodeValue(value)
+			if err != nil {
+				return err
+			}
+			if err := client.queue(payload, s.cfg.ClientOutputBufferLimit); err != nil {
+				return err
+			}
+			return updateClientInterest(poller, client)
+		})
 		if err := poller.Add(fd, netpoll.Read); err != nil {
+			s.closeClientSession(client.session)
 			_ = syscall.Close(fd)
 			return fmt.Errorf("register client: %w", err)
 		}
@@ -262,12 +272,14 @@ func (s *Server) processClientInput(client *reactorClient) error {
 			client.input = client.input[consumed:]
 		}
 
-		payload, err := resp.EncodeValue(s.executeCommand(argv))
-		if err != nil {
-			return err
-		}
-		if err := client.queue(payload, s.cfg.ClientOutputBufferLimit); err != nil {
-			return err
+		for _, reply := range s.executeClientCommand(client.session, argv) {
+			payload, err := resp.EncodeValue(reply)
+			if err != nil {
+				return err
+			}
+			if err := client.queue(payload, s.cfg.ClientOutputBufferLimit); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -309,9 +321,11 @@ func updateClientInterest(poller netpoll.Poller, client *reactorClient) error {
 }
 
 func (s *Server) closeReactorClient(poller netpoll.Poller, clients map[int]*reactorClient, fd int) {
-	if _, ok := clients[fd]; !ok {
+	client, ok := clients[fd]
+	if !ok {
 		return
 	}
+	s.closeClientSession(client.session)
 	_ = poller.Del(fd)
 	_ = syscall.Close(fd)
 	delete(clients, fd)

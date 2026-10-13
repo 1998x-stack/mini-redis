@@ -54,6 +54,9 @@ func writeValue(w io.Writer, v Value) error {
 			}
 		}
 		return nil
+	case NullArrayType:
+		_, err := io.WriteString(w, "*-1\r\n")
+		return err
 	default:
 		return fmt.Errorf("unsupported RESP value type %d", v.Type)
 	}

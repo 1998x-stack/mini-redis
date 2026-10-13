@@ -71,6 +71,14 @@ func (s *Server) handleBlockingConnection(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 	reader := resp.NewReader(conn)
 	writer := resp.NewWriter(conn)
+	var writeMu sync.Mutex
+	writeReply := func(value resp.Value) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return writer.WriteValue(value)
+	}
+	session := s.newClientSession(writeReply)
+	defer s.closeClientSession(session)
 
 	for {
 		select {
@@ -87,12 +95,14 @@ func (s *Server) handleBlockingConnection(ctx context.Context, conn net.Conn) {
 			if errors.Is(err, io.EOF) {
 				return
 			}
-			_ = writer.WriteValue(resp.Error("ERR " + err.Error()))
+			_ = writeReply(resp.Error("ERR " + err.Error()))
 			return
 		}
 
-		if err := writer.WriteValue(s.executeCommand(argv)); err != nil {
-			return
+		for _, reply := range s.executeClientCommand(session, argv) {
+			if err := writeReply(reply); err != nil {
+				return
+			}
 		}
 	}
 }
