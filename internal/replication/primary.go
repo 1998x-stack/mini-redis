@@ -18,16 +18,24 @@ type subscriber struct {
 	ch chan Frame
 }
 
+type Stats struct {
+	FullSyncs    uint64
+	PartialSyncs uint64
+	Subscribers  int
+}
+
 // Primary owns one replication identity, canonical byte offset, retained
 // backlog and live replica fan-out. It is transport-agnostic: the server layer
 // decides how snapshot/handshake data is moved over TCP.
 type Primary struct {
-	mu       sync.Mutex
-	id       string
-	backlog  *Backlog
-	nextSub  uint64
-	subs     map[uint64]*subscriber
-	buffered int
+	mu           sync.Mutex
+	id           string
+	backlog      *Backlog
+	nextSub      uint64
+	subs         map[uint64]*subscriber
+	buffered     int
+	fullSyncs    uint64
+	partialSyncs uint64
 }
 
 func NewPrimary(backlogBytes, subscriberFrames int) (*Primary, error) {
@@ -69,6 +77,24 @@ func (p *Primary) BacklogStartOffset() int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.backlog.StartOffset()
+}
+
+func (p *Primary) Stats() Stats {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return Stats{FullSyncs: p.fullSyncs, PartialSyncs: p.partialSyncs, Subscribers: len(p.subs)}
+}
+
+func (p *Primary) RecordFullSync() {
+	p.mu.Lock()
+	p.fullSyncs++
+	p.mu.Unlock()
+}
+
+func (p *Primary) RecordPartialSync() {
+	p.mu.Lock()
+	p.partialSyncs++
+	p.mu.Unlock()
 }
 
 // Append publishes one already-ordered canonical mutation frame. Slow live
