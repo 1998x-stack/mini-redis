@@ -13,9 +13,9 @@ type Counter struct {
 	value atomic.Uint64
 }
 
-func (c *Counter) Inc()             { c.value.Add(1) }
-func (c *Counter) Add(v uint64)     { c.value.Add(v) }
-func (c *Counter) Load() uint64     { return c.value.Load() }
+func (c *Counter) Inc()         { c.value.Add(1) }
+func (c *Counter) Add(v uint64) { c.value.Add(v) }
+func (c *Counter) Load() uint64 { return c.value.Load() }
 
 // Gauge is a signed point-in-time value, used for active connections and other
 // quantities that can move in both directions.
@@ -52,7 +52,7 @@ func (m *CounterMap) counter(key string) *Counter {
 	return counter
 }
 
-func (m *CounterMap) Inc(key string)         { m.counter(key).Inc() }
+func (m *CounterMap) Inc(key string)           { m.counter(key).Inc() }
 func (m *CounterMap) Add(key string, v uint64) { m.counter(key).Add(v) }
 
 func (m *CounterMap) Snapshot() map[string]uint64 {
@@ -208,19 +208,19 @@ func (h *Histogram) Snapshot() HistogramSnapshot {
 type Metrics struct {
 	startedAt time.Time
 
-	Commands         CounterMap
-	CommandErrors    CounterMap
-	ProtocolRequests CounterMap
-	ProtocolReplies  CounterMap
-	Connections      CounterMap
+	Commands          CounterMap
+	CommandErrors     CounterMap
+	ProtocolRequests  CounterMap
+	ProtocolReplies   CounterMap
+	Connections       CounterMap
 	ActiveConnections GaugeMap
-	BytesRead        CounterMap
-	BytesWritten     CounterMap
-	Backpressure     CounterMap
+	BytesRead         CounterMap
+	BytesWritten      CounterMap
+	Backpressure      CounterMap
 
-	CommandLatency  *Histogram
-	ReactorPollWait *Histogram
-	ReactorPollCalls Counter
+	CommandLatency    *Histogram
+	ReactorPollWait   *Histogram
+	ReactorPollCalls  Counter
 	ReactorPollEvents Counter
 
 	ExpiredKeys     Counter
@@ -228,33 +228,33 @@ type Metrics struct {
 	MaintenanceRuns Counter
 	RehashSteps     Counter
 
-	AOFAppendOps      Counter
-	AOFAppendBytes    Counter
-	AOFAppendFailures Counter
-	AOFAppendLatency  *Histogram
-	RDBSaveOps        Counter
-	RDBSaveBytes      Counter
-	RDBSaveFailures   Counter
-	RDBSaveLatency    *Histogram
+	AOFAppendOps       Counter
+	AOFAppendBytes     Counter
+	AOFAppendFailures  Counter
+	AOFAppendLatency   *Histogram
+	RDBSaveOps         Counter
+	RDBSaveBytes       Counter
+	RDBSaveFailures    Counter
+	RDBSaveLatency     *Histogram
 	AOFRewriteOps      Counter
 	AOFRewriteBytes    Counter
 	AOFRewriteFailures Counter
 	AOFRewriteLatency  *Histogram
 
-	ReplicationLinkFailures Counter
-	ReplicationFramesApplied Counter
-	ReplicationBytesApplied Counter
-	ReplicationFullSyncsApplied Counter
+	ReplicationLinkFailures        Counter
+	ReplicationFramesApplied       Counter
+	ReplicationBytesApplied        Counter
+	ReplicationFullSyncsApplied    Counter
 	ReplicationPartialSyncsApplied Counter
 }
 
 func NewMetrics() *Metrics {
 	return &Metrics{
-		startedAt:       time.Now(),
-		CommandLatency:  NewDurationHistogram(),
-		ReactorPollWait: NewDurationHistogram(),
-		AOFAppendLatency: NewDurationHistogram(),
-		RDBSaveLatency:   NewDurationHistogram(),
+		startedAt:         time.Now(),
+		CommandLatency:    NewDurationHistogram(),
+		ReactorPollWait:   NewDurationHistogram(),
+		AOFAppendLatency:  NewDurationHistogram(),
+		RDBSaveLatency:    NewDurationHistogram(),
 		AOFRewriteLatency: NewDurationHistogram(),
 	}
 }
@@ -273,33 +273,33 @@ type Snapshot struct {
 	BytesWritten      map[string]uint64 `json:"bytes_written"`
 	Backpressure      map[string]uint64 `json:"backpressure"`
 
-	CommandLatency   HistogramSnapshot `json:"command_latency"`
-	ReactorPollWait  HistogramSnapshot `json:"reactor_poll_wait"`
-	ReactorPollCalls uint64            `json:"reactor_poll_calls"`
-	ReactorPollEvents uint64           `json:"reactor_poll_events"`
+	CommandLatency    HistogramSnapshot `json:"command_latency"`
+	ReactorPollWait   HistogramSnapshot `json:"reactor_poll_wait"`
+	ReactorPollCalls  uint64            `json:"reactor_poll_calls"`
+	ReactorPollEvents uint64            `json:"reactor_poll_events"`
 
 	ExpiredKeys     uint64 `json:"expired_keys"`
 	EvictedKeys     uint64 `json:"evicted_keys"`
 	MaintenanceRuns uint64 `json:"maintenance_runs"`
 	RehashSteps     uint64 `json:"rehash_steps"`
 
-	AOFAppendOps      uint64            `json:"aof_append_ops"`
-	AOFAppendBytes    uint64            `json:"aof_append_bytes"`
-	AOFAppendFailures uint64            `json:"aof_append_failures"`
-	AOFAppendLatency  HistogramSnapshot `json:"aof_append_latency"`
-	RDBSaveOps        uint64            `json:"rdb_save_ops"`
-	RDBSaveBytes      uint64            `json:"rdb_save_bytes"`
-	RDBSaveFailures   uint64            `json:"rdb_save_failures"`
-	RDBSaveLatency    HistogramSnapshot `json:"rdb_save_latency"`
+	AOFAppendOps       uint64            `json:"aof_append_ops"`
+	AOFAppendBytes     uint64            `json:"aof_append_bytes"`
+	AOFAppendFailures  uint64            `json:"aof_append_failures"`
+	AOFAppendLatency   HistogramSnapshot `json:"aof_append_latency"`
+	RDBSaveOps         uint64            `json:"rdb_save_ops"`
+	RDBSaveBytes       uint64            `json:"rdb_save_bytes"`
+	RDBSaveFailures    uint64            `json:"rdb_save_failures"`
+	RDBSaveLatency     HistogramSnapshot `json:"rdb_save_latency"`
 	AOFRewriteOps      uint64            `json:"aof_rewrite_ops"`
 	AOFRewriteBytes    uint64            `json:"aof_rewrite_bytes"`
 	AOFRewriteFailures uint64            `json:"aof_rewrite_failures"`
 	AOFRewriteLatency  HistogramSnapshot `json:"aof_rewrite_latency"`
 
-	ReplicationLinkFailures      uint64 `json:"replication_link_failures"`
-	ReplicationFramesApplied     uint64 `json:"replication_frames_applied"`
-	ReplicationBytesApplied      uint64 `json:"replication_bytes_applied"`
-	ReplicationFullSyncsApplied  uint64 `json:"replication_full_syncs_applied"`
+	ReplicationLinkFailures        uint64 `json:"replication_link_failures"`
+	ReplicationFramesApplied       uint64 `json:"replication_frames_applied"`
+	ReplicationBytesApplied        uint64 `json:"replication_bytes_applied"`
+	ReplicationFullSyncsApplied    uint64 `json:"replication_full_syncs_applied"`
 	ReplicationPartialSyncsApplied uint64 `json:"replication_partial_syncs_applied"`
 }
 
@@ -311,41 +311,41 @@ func (m *Metrics) Snapshot(now time.Time) Snapshot {
 		now = time.Now()
 	}
 	return Snapshot{
-		StartedAtUnixMilli: m.startedAt.UnixMilli(),
-		UptimeMillis:       now.Sub(m.startedAt).Milliseconds(),
-		Commands:           m.Commands.Snapshot(),
-		CommandErrors:      m.CommandErrors.Snapshot(),
-		ProtocolRequests:   m.ProtocolRequests.Snapshot(),
-		ProtocolReplies:    m.ProtocolReplies.Snapshot(),
-		Connections:        m.Connections.Snapshot(),
-		ActiveConnections:  m.ActiveConnections.Snapshot(),
-		BytesRead:          m.BytesRead.Snapshot(),
-		BytesWritten:       m.BytesWritten.Snapshot(),
-		Backpressure:       m.Backpressure.Snapshot(),
-		CommandLatency:     m.CommandLatency.Snapshot(),
-		ReactorPollWait:    m.ReactorPollWait.Snapshot(),
-		ReactorPollCalls:   m.ReactorPollCalls.Load(),
-		ReactorPollEvents:  m.ReactorPollEvents.Load(),
-		ExpiredKeys:        m.ExpiredKeys.Load(),
-		EvictedKeys:        m.EvictedKeys.Load(),
-		MaintenanceRuns:    m.MaintenanceRuns.Load(),
-		RehashSteps:        m.RehashSteps.Load(),
-		AOFAppendOps:       m.AOFAppendOps.Load(),
-		AOFAppendBytes:     m.AOFAppendBytes.Load(),
-		AOFAppendFailures:  m.AOFAppendFailures.Load(),
-		AOFAppendLatency:   m.AOFAppendLatency.Snapshot(),
-		RDBSaveOps:         m.RDBSaveOps.Load(),
-		RDBSaveBytes:       m.RDBSaveBytes.Load(),
-		RDBSaveFailures:    m.RDBSaveFailures.Load(),
-		RDBSaveLatency:     m.RDBSaveLatency.Snapshot(),
-		AOFRewriteOps:      m.AOFRewriteOps.Load(),
-		AOFRewriteBytes:    m.AOFRewriteBytes.Load(),
-		AOFRewriteFailures: m.AOFRewriteFailures.Load(),
-		AOFRewriteLatency:  m.AOFRewriteLatency.Snapshot(),
-		ReplicationLinkFailures: m.ReplicationLinkFailures.Load(),
-		ReplicationFramesApplied: m.ReplicationFramesApplied.Load(),
-		ReplicationBytesApplied: m.ReplicationBytesApplied.Load(),
-		ReplicationFullSyncsApplied: m.ReplicationFullSyncsApplied.Load(),
+		StartedAtUnixMilli:             m.startedAt.UnixMilli(),
+		UptimeMillis:                   now.Sub(m.startedAt).Milliseconds(),
+		Commands:                       m.Commands.Snapshot(),
+		CommandErrors:                  m.CommandErrors.Snapshot(),
+		ProtocolRequests:               m.ProtocolRequests.Snapshot(),
+		ProtocolReplies:                m.ProtocolReplies.Snapshot(),
+		Connections:                    m.Connections.Snapshot(),
+		ActiveConnections:              m.ActiveConnections.Snapshot(),
+		BytesRead:                      m.BytesRead.Snapshot(),
+		BytesWritten:                   m.BytesWritten.Snapshot(),
+		Backpressure:                   m.Backpressure.Snapshot(),
+		CommandLatency:                 m.CommandLatency.Snapshot(),
+		ReactorPollWait:                m.ReactorPollWait.Snapshot(),
+		ReactorPollCalls:               m.ReactorPollCalls.Load(),
+		ReactorPollEvents:              m.ReactorPollEvents.Load(),
+		ExpiredKeys:                    m.ExpiredKeys.Load(),
+		EvictedKeys:                    m.EvictedKeys.Load(),
+		MaintenanceRuns:                m.MaintenanceRuns.Load(),
+		RehashSteps:                    m.RehashSteps.Load(),
+		AOFAppendOps:                   m.AOFAppendOps.Load(),
+		AOFAppendBytes:                 m.AOFAppendBytes.Load(),
+		AOFAppendFailures:              m.AOFAppendFailures.Load(),
+		AOFAppendLatency:               m.AOFAppendLatency.Snapshot(),
+		RDBSaveOps:                     m.RDBSaveOps.Load(),
+		RDBSaveBytes:                   m.RDBSaveBytes.Load(),
+		RDBSaveFailures:                m.RDBSaveFailures.Load(),
+		RDBSaveLatency:                 m.RDBSaveLatency.Snapshot(),
+		AOFRewriteOps:                  m.AOFRewriteOps.Load(),
+		AOFRewriteBytes:                m.AOFRewriteBytes.Load(),
+		AOFRewriteFailures:             m.AOFRewriteFailures.Load(),
+		AOFRewriteLatency:              m.AOFRewriteLatency.Snapshot(),
+		ReplicationLinkFailures:        m.ReplicationLinkFailures.Load(),
+		ReplicationFramesApplied:       m.ReplicationFramesApplied.Load(),
+		ReplicationBytesApplied:        m.ReplicationBytesApplied.Load(),
+		ReplicationFullSyncsApplied:    m.ReplicationFullSyncsApplied.Load(),
 		ReplicationPartialSyncsApplied: m.ReplicationPartialSyncsApplied.Load(),
 	}
 }
