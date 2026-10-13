@@ -1,211 +1,175 @@
-# mini-redis v0.7 — Transactions, WATCH and Pub/Sub
+# mini-redis v0.8 — Replication
 
 ## 1. Identity
 
-- Integrated branch after validation: `main`
-- Historical learning snapshot: `v0.7`
-- Version label: `v0.7.0`
-- Previous snapshot: `v0.6`
-- Status: implemented; freeze requires exact-SHA CI on `v0.7` and then the same SHA on `main`
+- Active development branch: `v0.8`
+- Previous snapshot: `v0.7`
+- Target version label: `v0.8.0`
+- Theme: full sync, ordered mutation propagation, replication offsets/backlog, partial resynchronization
 
 ## 2. Primary question
 
-**How can Redis queue commands, detect optimistic conflicts, execute a transaction as one ordered unit, and let a connection change role into a live Pub/Sub subscriber without turning transactions into database-style rollback?**
+**How can a replica establish one consistent base state, follow exactly the primary's accepted logical mutation order, and reconnect using only the missing suffix when that suffix is still retained?**
 
-v0.7 introduces explicit per-connection state above the existing command/store stack:
+v0.8 adds a replication plane beside the existing client plane:
 
 ```text
-TCP connection
+client RESP connections
+        ↓
+server command/session semantics
+        ↓
+Server.persistenceMu
+        ├── AOF ordering
+        └── canonical replication feed
+                 ↓
+          replication.Primary
+          ├── repl-id
+          ├── byte offset
+          ├── bounded frame backlog
+          └── live subscribers
+                 ↓
+         replication transport
+                 ↓
+               replica
+```
+
+The replication stream contains logical RESP reconstruction commands, not private Dict/Object memory layout.
+
+## 3. Roles
+
+v0.8 exposes three explicit roles:
+
+- `standalone`: no replication listener or upstream;
+- `primary`: accepts replica synchronization connections;
+- `replica`: connects to one configured primary and rejects client-side mutating commands.
+
+Replica persistence and local eviction policy are deliberately constrained in the first teaching version so the primary remains the source of mutation policy.
+
+## 4. Canonical replication stream
+
+The stream reuses the same logical mutation commands already produced for AOF reconstruction:
+
+- relative TTL becomes absolute `PEXPIREAT`;
+- eviction-generated `DEL` is included;
+- read-only / failed commands emit no replication bytes;
+- one normal accepted logical mutation becomes one replication frame;
+- one successful `EXEC` becomes one frame containing `MULTI ... EXEC`.
+
+Offsets count canonical RESP payload bytes. They do not count TCP framing bytes.
+
+## 5. Backlog invariant
+
+The backlog is bounded in bytes but evicts **whole replication frames** rather than arbitrary byte prefixes. Therefore a resumable offset always begins at a valid frame boundary.
+
+```text
+frame A     frame B      frame C
+[1..40]     [41..90]     [91..140]
+
+replica offset=90
+        ↓
+resume with frame C
+```
+
+If capacity pressure removes frame B, an offset inside/behind the removed history cannot partial-resync and must full-sync.
+
+## 6. Full synchronization boundary
+
+Primary full sync must establish:
+
+```text
+lock persistenceMu
     ↓
-clientSession
-  ├── WATCH tokens
-  ├── MULTI queue / dirty flag
-  └── subscriptions
+logical SnapshotEntry snapshot
     ↓
-server coordination
-  ├── persistenceMu
-  ├── key version table
-  └── Pub/Sub hub
+capture replication base offset
     ↓
-command.Registry → memory policy → Store
+attach live subscriber at that exact offset
+    ↓
+unlock
+    ↓
+transfer snapshot
+    ↓
+drain buffered post-snapshot frames
+    ↓
+continue live
 ```
 
-Session state is not keyspace state and is never serialized into RDB/AOF.
+The subscriber is attached while the mutation-ordering lock is still held, so writes after the snapshot boundary cannot fall into a gap.
 
-## 3. MULTI/EXEC is queueing, not rollback
+The snapshot wire representation is logical `SnapshotEntry` data, never physical encodings.
 
-`MULTI` switches one client into queue mode. Normal registry commands are validated for command existence/arity and return `QUEUED` instead of executing. `EXEC` then runs queued commands in order while holding `Server.persistenceMu`.
+## 7. Partial resynchronization
 
-Execution-time errors are returned as elements of the EXEC response and do **not** roll back earlier successful commands. This intentionally models Redis' transaction mental model rather than SQL-style rollback.
+Replica reconnect request carries its known replication identity and last completely applied stream offset.
 
-Queue-time validation errors mark the transaction dirty. A later `EXEC` returns `EXECABORT` and executes none of the queued commands.
+Primary returns partial continuation only when:
 
-`DISCARD` clears the queue and WATCH state.
+1. replication identity still matches;
+2. requested offset is a retained frame boundary;
+3. backlog contains every byte after that offset.
 
-## 4. WATCH is optimistic conflict detection
+Otherwise it falls back to full sync.
 
-A WATCH token records:
+A new primary process generates a new replication identity, intentionally forcing full sync after primary restart in v0.8.
+
+## 8. Replica apply rules
+
+- full snapshot is restored before any suffix frame is applied;
+- a frame is applied while holding `persistenceMu`;
+- `MULTI ... EXEC` feed frames apply as one non-interleaved unit;
+- replica offset advances only after a complete frame applies successfully;
+- replicated commands bypass the client READONLY gate but do not execute local eviction decisions;
+- absolute expiry deadlines preserve the primary's logical lifetime semantics;
+- client mutating commands on replicas return READONLY.
+
+## 9. Transport scope
+
+Client traffic keeps the v0.2 reactor/legacy engines. Replication uses a separate educational TCP connection so client event-loop mechanics do not obscure synchronization semantics.
+
+Handshake is Redis-inspired:
 
 ```text
-(global epoch, per-key write version, existence)
+PSYNC <repl-id-or-?> <offset>
+
+FULLRESYNC <new-id> <base-offset>
+  + logical snapshot payload
+  + live mutation frames
+
+or
+
+CONTINUE <id> <current-offset>
+  + retained backlog suffix
+  + live mutation frames
 ```
 
-Successful writes to a key advance its version. `FLUSHDB` advances the global epoch. Memory-pressure evictions advance affected key versions. At EXEC, the server also rechecks key existence, so a watched key that expires between WATCH and EXEC aborts the transaction even though TTL cleanup is not represented as a normal client write.
+Transport frames carry canonical RESP mutation payloads; replication offsets count the payload bytes only.
 
-Changing a value and later changing it back still conflicts because the write version changed. WATCH therefore detects intervening writes, not only final-value inequality.
+## 10. Required validation
 
-Conflict result is RESP2 null array (`*-1`).
+- backlog append/whole-frame eviction/boundary lookup;
+- matching identity + retained suffix → partial resync;
+- stale identity or wrapped backlog → full sync;
+- writes during snapshot transfer are delivered after the base snapshot;
+- replica converges after full sync;
+- disconnect/reconnect converges through partial resync;
+- transaction order/framing survives replication;
+- replica rejects direct mutating client commands;
+- primary/replica tests run under `go test -race`;
+- deterministic replication demo distinguishes FULLRESYNC from CONTINUE.
 
-## 5. EXEC coordination boundary
+## 11. Non-goals
 
-`EXEC` holds `persistenceMu` across:
+- no Sentinel health/quorum/election;
+- no automatic replica promotion;
+- no multi-primary;
+- no Cluster slots/MOVED/ASK;
+- no diskless production tuning claim;
+- no cross-process persistence of replication offset in v0.8.
 
-```text
-WATCH validation
-      ↓
-command 1
-command 2
-...
-command N
-      ↓
-transaction AOF append
-```
+## 12. Definition of Done
 
-Normal mutations also use this lock. v0.7 extends the same boundary to active expiration maintenance and RDB snapshot capture so the legacy maintenance goroutine and persistence observers cannot see or create a half-EXEC state.
-
-The Store's own mutex still protects its internal structures; `persistenceMu` is the higher-level logical sequencing boundary.
-
-## 6. Crash-safe AOF transaction framing
-
-Persisting each EXEC mutation independently would create a restart anomaly: a crash could leave only a durable prefix of the transaction.
-
-v0.7 therefore writes successful EXEC mutations as:
-
-```text
-MULTI
-  <mutation reconstruction command 1>
-  <mutation reconstruction command 2>
-  ...
-EXEC
-```
-
-AOF replay buffers commands inside this frame and applies them only after a complete `EXEC` marker is present. A truncated final transaction is discarded as a unit.
-
-Read-only commands are not written to AOF. Execution-time failed commands produce no mutation command. Eviction-generated `DEL` commands remain part of the same transaction frame.
-
-AOF rewrite continues to emit compact logical reconstruction state; post-snapshot transaction frames enter the rewrite buffer exactly as written.
-
-## 7. Pub/Sub is connection-role state
-
-`SUBSCRIBE channel` registers a `clientSession` in an in-memory hub. `PUBLISH channel payload` copies the current subscriber set and pushes RESP2 arrays:
-
-```text
-["message", channel, payload]
-```
-
-A subscribed connection changes role: in this teaching subset it accepts `SUBSCRIBE`, `UNSUBSCRIBE`, and `PING`; ordinary key commands are rejected until subscription count returns to zero.
-
-Pub/Sub data is deliberately not stored in the keyspace, RDB, or AOF. There is no history or replay: subscribers receive live messages only.
-
-The hub counts subscribed targets, not confirmed socket delivery. A disconnected session is removed from the hub during connection cleanup.
-
-## 8. Transport integration
-
-Both networking models share the same session semantics:
-
-- legacy engine: each connection goroutine owns a session; a write mutex prevents push/reply byte interleaving;
-- reactor engine: each `reactorClient` owns a session; Pub/Sub push queues bytes into that client's output buffer and enables writable interest.
-
-Network tests exercise transaction pipelines and Pub/Sub fan-out on legacy and, on Linux, epoll reactor transport.
-
-## 9. Commands introduced at the session layer
-
-```text
-WATCH key [key ...]
-UNWATCH
-MULTI
-EXEC
-DISCARD
-SUBSCRIBE channel [channel ...]
-UNSUBSCRIBE [channel ...]
-PUBLISH channel message
-```
-
-These commands are intentionally handled above the ordinary command registry because their primary state belongs to the client connection/server coordination layer rather than the keyspace Store.
-
-## 10. Deliberate v0.7 simplifications
-
-- `PUBLISH` is not queued inside MULTI; attempting it marks the transaction dirty;
-- `SUBSCRIBE` / `UNSUBSCRIBE` are not allowed inside MULTI;
-- `UNWATCH` inside MULTI is rejected in this teaching subset;
-- key write-version tracking is conservative: a successful write-shaped command may invalidate WATCH even when its final logical effect is a no-op;
-- no Lua/scripts;
-- no replication yet;
-- no durable Pub/Sub backlog or Streams.
-
-These restrictions keep the version focused on session state, optimistic conflict detection and transaction ordering.
-
-## 11. Validation
-
-The exact v0.7 candidate must pass:
-
-```bash
-gofmt -d .
-go vet ./...
-go test -race ./...
-go build ./cmd/mini-redis-server
-make rehash-demo
-make encodings-demo
-make persistence-demo
-make eviction-demo
-make session-demo
-make smoke
-NETWORK_ENGINE=legacy PORT=16380 make smoke
-```
-
-Mechanism tests cover:
-
-- queue order and `QUEUED` responses;
-- queue-time error → `EXECABORT`;
-- execution-time error without rollback;
-- unrelated writes not aborting WATCH;
-- write-then-write-back still aborting WATCH;
-- TTL expiration invalidating WATCH;
-- RESP2 null-array conflict reply;
-- complete EXEC AOF framing and restart;
-- crash-truncated transaction frames discarded as a unit;
-- invalid `EXEC` AOF framing rejected;
-- two-subscriber Pub/Sub fan-out;
-- subscribed-mode command restriction;
-- transaction and Pub/Sub protocol behavior on both network engines.
-
-## 12. Important source files
-
-```text
-internal/server/session.go
-internal/server/server.go
-internal/server/legacy.go
-internal/server/reactor_linux.go
-internal/aof/aof.go
-internal/resp/value.go
-internal/command/registry.go
-examples/sessions/main.go
-```
+The exact v0.8 SHA must pass repository baseline validation plus replication-specific unit/integration/demo tests. Only then may `main` fast-forward to the same SHA.
 
 ## 13. Next version
 
-v0.8 introduces replication:
-
-```text
-primary logical mutations
-       ↓
-replication stream + offset
-       ↓
-replica
-
-reconnect:
-replica offset ── backlog contains gap? ── yes → partial resync
-                                 └── no  → full sync snapshot
-```
-
-Primary question: **how does a replica establish a consistent base state, continue from an ordered mutation stream, and reconnect without always copying the full database?**
+v0.9 will build Sentinel-inspired failover on top of the replication topology established here: health observation, subjective/objective failure, quorum/election, promotion, and reconfiguration.
