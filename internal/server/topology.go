@@ -92,6 +92,15 @@ func (s *Server) FollowPrimary(upstream string) error {
 	if upstream == "" {
 		return errors.New("upstream replication address is required")
 	}
+	// v0.8 replica semantics deliberately disable local AOF and local eviction.
+	// Dynamic demotion must preserve the same invariant: otherwise an old primary
+	// could retain a stale AOF or independently evict keys after becoming replica.
+	if s.aof != nil {
+		return errors.New("v0.9 dynamic demotion requires appendonly=false")
+	}
+	if s.cfg.MaxMemory > 0 {
+		return errors.New("v0.9 dynamic demotion requires maxmemory=0")
+	}
 	root, err := s.replicationRootContext()
 	if err != nil {
 		return err
