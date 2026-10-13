@@ -65,83 +65,95 @@ Monitor-local SDOWN, quorum-backed ODOWN, failover epoch, deterministic candidat
 16384 CRC16/XMODEM slots, hash tags, CROSSSLOT, MOVED, ASK/ASKING, logical SnapshotEntry migration, resumable partial migration and bounded topology dissemination.
 
 ### v0.11 — RESP3
+Connection-local HELLO 2/3 negotiation, richer logical reply types, explicit RESP2 downgrade, Pub/Sub Push, nested incremental value parsing and unchanged command/Cluster semantics.
+
+### v0.12 — Observability / performance
 
 Primary question:
 
-> How can a connection negotiate richer response types and asynchronous Push frames without changing the storage, persistence, replication, failover or Cluster mechanisms underneath it?
+> Once the mechanisms are explicit, how can they be measured without allowing instrumentation to become database state or policy?
 
 Implemented:
 
-- connection-local `Protocol2` / `Protocol3` state;
-- default RESP2 compatibility;
-- `HELLO 3` / `HELLO 2` negotiation;
-- HELLO metadata as logical Map with RESP2 flat-array downgrade;
-- richer `resp.Value` variants for Null, Boolean, Double, Big Number, Verbatim String, Map, Set and Push;
-- protocol-aware encoding shared by legacy and reactor transports;
-- explicit RESP2 downgrade for richer logical values;
-- response-view adaptation after command execution for HGETALL/SMEMBERS/SISMEMBER/ZSCORE;
-- Pub/Sub Push frames in RESP3 while retaining RESP2 array behavior;
-- ordinary commands while subscribed in RESP3 mode;
-- incremental nested RESP2/RESP3 value parser with bounded depth;
-- byte-boundary fragmentation tests;
-- Cluster endpoint HELLO negotiation while retaining MOVED/ASK/CROSSSLOT authorization order;
-- deterministic `make resp3-demo` using a real TCP session;
-- regression validation for every prior demo and both network engines.
+- `internal/observability` atomic Counter/Gauge primitives;
+- dynamic counter/gauge maps with synchronized label creation and copy-based snapshots;
+- fixed-bucket bounded duration histograms with count/sum/max;
+- server command count/error/latency metrics;
+- RESP2/RESP3 request/reply and Push counters;
+- accepted/active connection metrics;
+- actual legacy `net.Conn` read/write byte metrics;
+- actual reactor `syscall.Read/Write` byte metrics;
+- reactor poll call/event/wait duration metrics;
+- input/output backpressure events;
+- expiration, eviction, maintenance and rehash-work counters;
+- AOF append, RDB save and AOF rewrite operations/bytes/failures/durations;
+- primary replication identity/offset/backlog/full/partial-sync/subscriber snapshot;
+- replica-local link failures, sync mode, applied frame/byte/offset evidence;
+- Cluster routing, MOVED/ASK/CROSSSLOT, migration and bounded gossip metrics;
+- Sentinel Tick/probe/failover/promotion/reconfiguration metrics and bounded latency histograms;
+- immutable `Server.MetricsSnapshot`, `Topology.MetricsSnapshot` and `Controller.MetricsSnapshot` surfaces;
+- read-only `INFO [section]` teaching view;
+- real TCP legacy/reactor observability tests;
+- control-plane Cluster/Sentinel metric tests against real decision paths;
+- `make observability-demo` cross-layer teaching demo;
+- `make benchmark-observability` microbenchmarks;
+- `docs/PERFORMANCE.md` workload/profile discipline and pprof workflow.
 
 Critical invariants:
 
-- each connection starts RESP2;
-- HELLO changes only the current connection;
-- command requests and canonical mutation frames remain independent of client response protocol;
-- Store/SnapshotEntry/AOF/replication/topology never contain negotiated protocol state;
-- protocol adaptation occurs after command and Cluster semantics;
-- RESP3 cannot bypass wrong-owner routing;
-- asynchronous Pub/Sub delivery remains one mechanism; only its representation changes;
-- RESP2 wire behavior remains backward compatible;
-- incomplete nested RESP frames are never partially consumed.
+- metrics never enter Store, SnapshotEntry, AOF, RDB, replication frames or slot metadata;
+- metrics never participate in success/failure, eviction, persistence, routing or failover decisions;
+- established mechanisms still work when instrumentation is absent;
+- snapshots expose copies/atomic loads, not mutable internal metric maps;
+- histogram memory is bounded independent of request count;
+- network byte counters reflect actual transport reads/writes rather than encoded-size estimates;
+- persistence timing wraps real persistence calls;
+- replication reports only information the v0.8 protocol can truthfully know;
+- because v0.8 has no replica ACK, the primary does not claim authoritative remote applied-offset lag;
+- benchmarks state workload/configuration instead of making context-free speed claims.
 
 Intentional teaching simplifications:
 
-- not every RESP3 type or streamed aggregate is implemented;
-- no complete Redis HELLO AUTH/SETNAME option set;
-- no client tracking/invalidation Push subsystem;
-- no claim of edge-case production Redis protocol compatibility.
+- no Prometheus/OpenTelemetry exporter;
+- no distributed metric aggregation;
+- no production alerting/SLO system;
+- no claim of zero instrumentation overhead;
+- no production Redis performance-parity claim.
 
-## 3. v0.12 — Observability / performance
+## 3. Original learning arc complete
 
-### Primary question
+v0.1–v0.12 now form one complete mechanism chain:
 
-**Once every major Redis mechanism is explicit, how can we measure where latency, memory, queueing, durability cost, replication lag and topology work are actually spent?**
+```text
+request/protocol
+  ↓
+network scheduling
+  ↓
+dictionary + object encodings
+  ↓
+persistence + memory pressure
+  ↓
+sessions / transactions / PubSub
+  ↓
+replication / HA / sharding
+  ↓
+richer protocol representation
+  ↓
+measurement / profiling
+```
 
-### Required implementation
+A future v0.13 should not be chosen merely because the number follows v0.12. It should start a new arc from one measured bottleneck or one explicit new systems question.
 
-- command counters and latency histograms;
-- per-network-engine connection/read/write/backpressure counters;
-- key expiration and eviction counters;
-- AOF/RDB operation duration/bytes/failure metrics;
-- replication full/partial sync counts, backlog state and replica lag;
-- Sentinel probe/failover timing and decisions;
-- Cluster redirect/migration/gossip counters and migration duration;
-- protocol-mode / RESP3 Push counters where useful;
-- an inspectable `INFO`/metrics-style snapshot that does not leak mutable internals;
-- repeatable benchmarks for command path, reactor vs legacy, Dict and selected end-to-end workloads;
-- pprof/profiling workflow and documentation;
-- explicit separation of measurement overhead from measured mechanisms;
-- deterministic observability/performance demo.
+Potential future arcs, only after evidence:
 
-### Critical invariants
+- active defragmentation / allocator behavior;
+- IO threads and command-execution ownership;
+- replica ACK and authoritative lag tracking;
+- production-style Cluster bus/failure detection;
+- Lua/functions and deterministic replication semantics;
+- storage tiering or disk-backed structures.
 
-- instrumentation must not become business/database state;
-- metrics observation must not alter command semantics or mutation ordering;
-- counters must name their synchronization boundary;
-- benchmarks must report workload/configuration, not context-free numbers;
-- performance claims require repeatable evidence rather than anecdotes.
-
-### Non-goals
-
-- no production monitoring stack;
-- no promise that this educational implementation competes with Redis performance;
-- no optimization that hides or removes the mechanisms the project exists to teach.
+None of these are part of v0.12.
 
 ## 4. Version completion rule
 
@@ -165,6 +177,6 @@ same SHA passes CI on main
 
 ## 5. Current directive
 
-Freeze candidate: **v0.11 — RESP3 negotiation, richer views, RESP2 downgrade and Push messages**.
+Freeze candidate: **v0.12 — observer-only bounded metrics, immutable snapshots/INFO and repeatable profiling workflow**.
 
-Next milestone after exact-SHA validation: **v0.12 — Observability / Performance**.
+After v0.12 is green on one identical branch/main SHA, treat the original mini-redis learning roadmap as complete.
