@@ -18,6 +18,14 @@ const (
 	NetworkLegacy  NetworkEngine = "legacy"
 )
 
+type ReplicationRole string
+
+const (
+	ReplicationStandalone ReplicationRole = "standalone"
+	ReplicationPrimary    ReplicationRole = "primary"
+	ReplicationReplica    ReplicationRole = "replica"
+)
+
 type Config struct {
 	ShowVersion             bool
 	Addr                    string
@@ -37,28 +45,40 @@ type Config struct {
 	MaxMemorySamples        int
 	LFUDecay                time.Duration
 	EvictionSeed            int64
+
+	ReplicationRole             ReplicationRole
+	ReplicationAddr             string
+	ReplicaOf                   string
+	ReplicationBacklogBytes     int
+	ReplicationSubscriberFrames int
+	ReplicationReconnectDelay   time.Duration
 }
 
 func Default() Config {
 	memory := store.DefaultMemoryConfig()
 	return Config{
-		Addr:                    "127.0.0.1:6379",
-		NetworkEngine:           NetworkAuto,
-		ClientInputBufferLimit:  64 << 20, // aligned with the RESP bulk-string teaching cap
-		ClientOutputBufferLimit: 8 << 20,
-		AppendOnly:              true,
-		AppendFilename:          "appendonly.aof",
-		AppendFsync:             aof.FsyncEverySec,
-		RDBFilename:             "dump.mrdb",
-		ActiveExpireEvery:       100 * time.Millisecond,
-		ActiveExpireSample:      64,
-		RehashWorkPerCycle:      64,
-		IdleTimeout:             0,
-		MaxMemory:               memory.MaxBytes,
-		MaxMemoryPolicy:         memory.Policy,
-		MaxMemorySamples:        memory.Samples,
-		LFUDecay:                memory.LFUDecay,
-		EvictionSeed:            memory.RandomSeed,
+		Addr:                        "127.0.0.1:6379",
+		NetworkEngine:               NetworkAuto,
+		ClientInputBufferLimit:      64 << 20,
+		ClientOutputBufferLimit:     8 << 20,
+		AppendOnly:                  true,
+		AppendFilename:              "appendonly.aof",
+		AppendFsync:                 aof.FsyncEverySec,
+		RDBFilename:                 "dump.mrdb",
+		ActiveExpireEvery:           100 * time.Millisecond,
+		ActiveExpireSample:          64,
+		RehashWorkPerCycle:          64,
+		IdleTimeout:                 0,
+		MaxMemory:                   memory.MaxBytes,
+		MaxMemoryPolicy:             memory.Policy,
+		MaxMemorySamples:            memory.Samples,
+		LFUDecay:                    memory.LFUDecay,
+		EvictionSeed:                memory.RandomSeed,
+		ReplicationRole:             ReplicationStandalone,
+		ReplicationAddr:             "127.0.0.1:6380",
+		ReplicationBacklogBytes:     1 << 20,
+		ReplicationSubscriberFrames: 1024,
+		ReplicationReconnectDelay:   200 * time.Millisecond,
 	}
 }
 
@@ -88,6 +108,7 @@ func ParseFlags() (Config, error) {
 	fsync := string(cfg.AppendFsync)
 	engine := string(cfg.NetworkEngine)
 	policy := string(cfg.MaxMemoryPolicy)
+	role := string(cfg.ReplicationRole)
 
 	flag.BoolVar(&cfg.ShowVersion, "version", false, "print version and exit")
 	flag.StringVar(&cfg.Addr, "addr", cfg.Addr, "listen address")
@@ -107,6 +128,13 @@ func ParseFlags() (Config, error) {
 	flag.IntVar(&cfg.MaxMemorySamples, "maxmemory-samples", cfg.MaxMemorySamples, "candidate sample size for approximate LRU/LFU")
 	flag.DurationVar(&cfg.LFUDecay, "lfu-decay", cfg.LFUDecay, "LFU counter decay period")
 	flag.Int64Var(&cfg.EvictionSeed, "eviction-seed", cfg.EvictionSeed, "deterministic teaching RNG seed for eviction sampling")
+
+	flag.StringVar(&role, "replication-role", role, "replication role: standalone|primary|replica")
+	flag.StringVar(&cfg.ReplicationAddr, "replication-addr", cfg.ReplicationAddr, "primary replication listen address")
+	flag.StringVar(&cfg.ReplicaOf, "replicaof", cfg.ReplicaOf, "upstream primary replication address for replica role")
+	flag.IntVar(&cfg.ReplicationBacklogBytes, "repl-backlog-bytes", cfg.ReplicationBacklogBytes, "bounded primary replication backlog size in canonical stream bytes")
+	flag.IntVar(&cfg.ReplicationSubscriberFrames, "repl-subscriber-frames", cfg.ReplicationSubscriberFrames, "max buffered live replication frames per replica connection")
+	flag.DurationVar(&cfg.ReplicationReconnectDelay, "repl-reconnect-delay", cfg.ReplicationReconnectDelay, "delay before replica reconnect attempts")
 	flag.Parse()
 
 	cfg.NetworkEngine = NetworkEngine(engine)
@@ -138,6 +166,42 @@ func ParseFlags() (Config, error) {
 	cfg.MaxMemoryPolicy = store.EvictionPolicy(policy)
 	if err := cfg.MemoryConfig(store.RealClock{}).Validate(); err != nil {
 		return Config{}, err
+	}
+
+	cfg.ReplicationRole = ReplicationRole(role)
+	switch cfg.ReplicationRole {
+	case ReplicationStandalone:
+		if cfg.ReplicaOf != "" {
+			return Config{}, fmt.Errorf("replicaof requires replication-role=replica")
+		}
+	case ReplicationPrimary:
+		if cfg.ReplicationAddr == "" {
+			return Config{}, fmt.Errorf("replication-addr is required for primary role")
+		}
+		if cfg.ReplicaOf != "" {
+			return Config{}, fmt.Errorf("primary role cannot configure replicaof")
+		}
+	case ReplicationReplica:
+		if cfg.ReplicaOf == "" {
+			return Config{}, fmt.Errorf("replicaof is required for replica role")
+		}
+		if cfg.AppendOnly {
+			return Config{}, fmt.Errorf("v0.8 replica role requires appendonly=false; replicated state is memory-only in this teaching version")
+		}
+		if cfg.MaxMemory > 0 {
+			return Config{}, fmt.Errorf("v0.8 replica role requires maxmemory=0 so local eviction cannot diverge from primary policy")
+		}
+	default:
+		return Config{}, fmt.Errorf("invalid replication-role %q", role)
+	}
+	if cfg.ReplicationBacklogBytes <= 0 {
+		return Config{}, fmt.Errorf("repl-backlog-bytes must be positive")
+	}
+	if cfg.ReplicationSubscriberFrames <= 0 {
+		return Config{}, fmt.Errorf("repl-subscriber-frames must be positive")
+	}
+	if cfg.ReplicationReconnectDelay <= 0 {
+		return Config{}, fmt.Errorf("repl-reconnect-delay must be positive")
 	}
 	return cfg, nil
 }
