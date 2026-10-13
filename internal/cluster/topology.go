@@ -47,14 +47,15 @@ type RouteDecision struct {
 }
 
 type Topology struct {
-	mu    sync.RWMutex
-	epoch uint64
-	nodes map[string]NodeInfo
-	slots [SlotCount]SlotState
+	mu      sync.RWMutex
+	epoch   uint64
+	nodes   map[string]NodeInfo
+	slots   [SlotCount]SlotState
+	metrics *metrics
 }
 
 func NewTopology() *Topology {
-	return &Topology{nodes: make(map[string]NodeInfo)}
+	return &Topology{nodes: make(map[string]NodeInfo), metrics: newMetrics()}
 }
 
 func (t *Topology) nextEpochLocked() uint64 {
@@ -184,6 +185,11 @@ func (t *Topology) CommitMigration(slot int, sourceID, targetID string) error {
 	return nil
 }
 
+func (t *Topology) observed(decision RouteDecision) RouteDecision {
+	t.observeRoute(decision.Action)
+	return decision
+}
+
 // Route evaluates one key from one node's point of view. During migration the
 // source keeps serving keys it still owns physically, while a missing key gets
 // a temporary ASK to the importing target. The target may execute only after a
@@ -197,26 +203,26 @@ func (t *Topology) Route(localID, key string, keyExists, asking bool) RouteDecis
 	t.mu.RUnlock()
 
 	if state.OwnerID == "" {
-		return RouteDecision{Action: RouteClusterDown, Slot: slot}
+		return t.observed(RouteDecision{Action: RouteClusterDown, Slot: slot})
 	}
 	if state.MigrationTarget != "" {
 		if localID == state.OwnerID {
 			if keyExists {
-				return RouteDecision{Action: RouteExecute, Slot: slot, NodeID: localID}
+				return t.observed(RouteDecision{Action: RouteExecute, Slot: slot, NodeID: localID})
 			}
-			return RouteDecision{Action: RouteAsk, Slot: slot, NodeID: target.ID, Addr: target.Addr}
+			return t.observed(RouteDecision{Action: RouteAsk, Slot: slot, NodeID: target.ID, Addr: target.Addr})
 		}
 		if localID == state.MigrationTarget {
 			if asking {
-				return RouteDecision{Action: RouteExecute, Slot: slot, NodeID: localID}
+				return t.observed(RouteDecision{Action: RouteExecute, Slot: slot, NodeID: localID})
 			}
-			return RouteDecision{Action: RouteMoved, Slot: slot, NodeID: owner.ID, Addr: owner.Addr}
+			return t.observed(RouteDecision{Action: RouteMoved, Slot: slot, NodeID: owner.ID, Addr: owner.Addr})
 		}
 	}
 	if localID == state.OwnerID {
-		return RouteDecision{Action: RouteExecute, Slot: slot, NodeID: localID}
+		return t.observed(RouteDecision{Action: RouteExecute, Slot: slot, NodeID: localID})
 	}
-	return RouteDecision{Action: RouteMoved, Slot: slot, NodeID: owner.ID, Addr: owner.Addr}
+	return t.observed(RouteDecision{Action: RouteMoved, Slot: slot, NodeID: owner.ID, Addr: owner.Addr})
 }
 
 // GossipPage returns a bounded deterministic slice of the slot table. Repeated
@@ -230,7 +236,6 @@ func (t *Topology) GossipPage(start, limit int) (GossipPage, error) {
 		return GossipPage{}, errors.New("cluster: gossip limit must be positive")
 	}
 	t.mu.RLock()
-	defer t.mu.RUnlock()
 	end := start + limit
 	if end > SlotCount {
 		end = SlotCount
@@ -251,6 +256,8 @@ func (t *Topology) GossipPage(start, limit int) (GossipPage, error) {
 	for _, id := range ids {
 		page.Nodes = append(page.Nodes, t.nodes[id])
 	}
+	t.mu.RUnlock()
+	t.observeGossipPage(len(page.Slots))
 	return page, nil
 }
 
@@ -263,9 +270,9 @@ func slotTieKey(state SlotState) string {
 // teaching mechanism, not a distributed-consensus claim.
 func (t *Topology) MergePage(page GossipPage) error {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	for _, n := range page.Nodes {
 		if n.ID == "" || n.Addr == "" {
+			t.mu.Unlock()
 			return errors.New("cluster: invalid gossip node")
 		}
 		current, ok := t.nodes[n.ID]
@@ -278,6 +285,7 @@ func (t *Topology) MergePage(page GossipPage) error {
 	}
 	for _, record := range page.Slots {
 		if err := validateSlot(record.Slot); err != nil {
+			t.mu.Unlock()
 			return err
 		}
 		current := t.slots[record.Slot]
@@ -289,5 +297,7 @@ func (t *Topology) MergePage(page GossipPage) error {
 			t.epoch = incoming.Epoch
 		}
 	}
+	t.mu.Unlock()
+	t.observeGossipMerge(len(page.Slots))
 	return nil
 }
