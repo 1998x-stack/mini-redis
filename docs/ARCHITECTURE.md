@@ -1,484 +1,274 @@
-# Architecture — v0.9
+# Architecture — v0.10
 
 ## 1. Current stack
 
 ```text
-                         Sentinel-inspired control plane
-                    ┌──────────┬──────────┬──────────┐
-                    │ monitor  │ monitor  │ monitor  │
-                    │    s1    │    s2    │    s3    │
-                    └────┬─────┴────┬─────┴────┬─────┘
-                         │ health observations │
-                         └──────────┬───────────┘
-                                    ↓
-                           SDOWN → quorum ODOWN
-                                    ↓
-                              failover epoch
-                                    ↓
-                           candidate selection
-                                    ↓
-                           topology operations
-                                    │
-        ┌───────────────────────────┼───────────────────────────┐
-        ↓                           ↓                           ↓
-   data node P                  data node R1                data node R2
- client RESP plane             client RESP plane           client RESP plane
-        │                           │                           │
-        └────────────── v0.8 replication data plane ───────────┘
-                  SnapshotEntry base + RESP mutation frames
+client / teaching cluster endpoint
+              ↓
+      key extraction + CROSSSLOT
+              ↓
+       CRC16 / hash tag
+              ↓
+       slot ∈ [0, 16383]
+              ↓
+       cluster.Topology
+       ├── stable owner
+       └── migration target
+              ↓
+      routing decision
+   ┌──────────┼───────────┐
+   ↓          ↓           ↓
+ execute     MOVED        ASK
+   ↓                      ↓
+Server.persistenceMu     target + ASKING
+   ↓                      ↓
+existing command / persistence / replication path
 ```
 
-v0.9's central lesson is:
+v0.10's central lesson is:
 
-> **Replication answers “how does another node get the data?” Sentinel answers “which replication topology should be active?”**
+> **Store answers what a key contains. Cluster answers which primary is authoritative for that key's slot.**
 
-Those layers are deliberately separate.
+The slot table is runtime topology state, not database state.
 
-## 2. Why Sentinel does not live inside Store
+## 2. Hash slots
 
-Failure detection, election epoch and primary identity are not key/value data:
+There are exactly 16384 logical slots. `HashSlot` uses CRC-16/XMODEM modulo 16384.
+
+For a key containing a non-empty `{...}` tag, only the first non-empty tagged substring is hashed. This lets applications place related keys together intentionally.
 
 ```text
-Store database state
-  keys / values / TTLs
-
-Sentinel runtime state
-  monitor observations
-  SDOWN flags
-  current chosen primary
-  failover epoch
-  last decision
+user:{42}:name  ┐
+order:{42}:1    ├─ hash "42" → slot 8000
+cart:{42}       ┘
 ```
 
-Persisting monitor state inside the database would incorrectly make failover metadata subject to ordinary Redis commands, TTL, snapshots and replication.
+Empty or malformed tags fall back to hashing the whole key.
 
-The `internal/sentinel` package therefore depends on a small `Node` control interface rather than Store internals.
+## 3. Slot ownership is separate from Store
 
-## 3. The Node control-plane boundary
-
-Sentinel sees:
-
-```go
-ID()
-Probe(ctx) -> NodeStatus
-Promote(ctx)
-Follow(ctx, upstream)
-```
-
-`NodeStatus` exposes only logical topology facts:
+`cluster.Topology` owns:
 
 ```text
-node ID
-role
-client address
-replication address
-upstream
-replication identity
-offset
+node ID → advertised cluster address
+slot    → stable owner ID
+slot    → optional migration target ID
+topology epoch
 ```
 
-The adapter for a real mini-redis node is `ServerNode`.
+It does not contain values, TTLs, Object encodings, AOF records or replication frames.
 
-A health probe first performs a real client-plane TCP `PING`. Only after that succeeds does it read the node's explicit replication topology state. Thus “healthy” means the data-serving endpoint is reachable, not merely that an in-process Go object exists.
+That separation matters because changing slot ownership must not rewrite every key merely to annotate where it belongs.
 
-## 4. Subjective failure: SDOWN
+## 4. Routing gate
 
-Each monitor owns an independent state record per node:
+`Server.ClusterExecute` validates command arity, extracts routed keys and computes one common slot before touching Store.
+
+Multi-key requests whose keys map to different slots fail with:
 
 ```text
-last success
-last failure
-failure since
-subjective-down flag
-last successful NodeStatus
+CROSSSLOT Keys in request don't hash to the same slot
 ```
 
-On the first failed probe:
+For routed commands, the server holds `Server.persistenceMu` across:
 
 ```text
-failureSince = now
-SDOWN = false
-```
-
-Only when:
-
-```text
-now >= failureSince + downAfter
-```
-
-that monitor marks the node SDOWN.
-
-A successful probe clears `failureSince` and SDOWN.
-
-This state is intentionally monitor-local. If s1 is partitioned from the primary but s2 and s3 are healthy, only s1 has SDOWN.
-
-## 5. Objective failure: ODOWN
-
-The controller counts current monitor SDOWN states for the **current chosen primary**:
-
-```text
-SDOWN voters >= quorum ?
-      │
-   no │ yes
-      ↓
- no failover       ODOWN
-                    ↓
-              candidate election
-```
-
-One timeout never implies objective failure.
-
-With three monitors and quorum two:
-
-```text
-s1 SDOWN
-s2 SDOWN
-s3 healthy
-   ↓
-ODOWN
-```
-
-This makes the local-versus-shared-failure distinction observable and testable.
-
-## 6. One controller Tick is one serialized decision boundary
-
-`Controller.tickMu` serializes Tick calls.
-
-One Tick performs:
-
-```text
-probe monitor × node matrix
-       ↓
-update monitor-local state
-       ↓
-compute current-primary SDOWN voters
-       ↓
-ODOWN?
-  ├── no → optional topology repair
-  └── yes
+local key-existence observation
         ↓
-     candidate ranking
+Topology.Route(...)
         ↓
-     next epoch
+command execution when authorized
+```
+
+This is essential on a migrating source. A concurrent delete cannot slip between “this key still exists here” and the command that was authorized because of that fact.
+
+## 5. Stable ownership: MOVED
+
+When slot S has stable owner A:
+
+```text
+request on A → execute
+request on B → MOVED S A-address
+```
+
+`MOVED` means stable routing metadata says the client should update its durable routing view.
+
+An unassigned slot returns `CLUSTERDOWN Hash slot not served`.
+
+## 6. Explicit migration state
+
+Migration does not immediately change the stable owner.
+
+```text
+slot.owner           = source
+slot.migrationTarget = target
+```
+
+While this state exists:
+
+### Source
+
+- if the source still physically contains the requested key, it executes locally;
+- if the key is no longer present, it returns `ASK slot target-address`.
+
+### Target
+
+- without ASKING, it still returns MOVED to the stable source;
+- with a one-request ASKING grant, it may execute the routed request.
+
+This distinguishes temporary migration routing from stable ownership.
+
+## 7. ASKING is connection-local and one-shot
+
+`cluster.Session` owns one boolean grant.
+
+```text
+ASKING
+  ↓ grant = true
+next command
+  ↓ consume grant
+following command
+  ↓ grant = false again
+```
+
+`Server.ServeCluster` creates one cluster Session per RESP/TCP connection, so ASKING is not global process state and cannot authorize unrelated clients.
+
+## 8. Cluster-aware RESP endpoint
+
+`Server.ServeCluster(ctx, listener, topology, localID)` is a v0.10 teaching endpoint separate from the historical standalone listener.
+
+It reuses the existing RESP2 reader/writer but routes every command through `ClusterExecute`. Wire tests prove actual RESP errors such as:
+
+```text
+-MOVED 8000 node-b:6379
+-ASK 8000 node-c:6379
+```
+
+and prove that ASKING authorizes exactly one following request on the same connection.
+
+## 9. Slot migration and SnapshotEntry
+
+Cluster migration never copies private Object payloads.
+
+`ClusterNode` exports logical `store.SnapshotEntry` values, the same stable boundary introduced for persistence/replication.
+
+For each key, source transfer holds the source `persistenceMu` across:
+
+```text
+capture logical SnapshotEntry
         ↓
-     promotion
-        ↓
-     replica reconfiguration
-        ↓
-     commit chosen primary
+target ImportKey
+        ↓ success acknowledgement
+source DEL through ordinary mutation path
 ```
 
-This prevents two goroutines using the same Controller instance from overlapping promotions.
+Therefore a source-side write cannot occur after export but before delete.
 
-It is not a claim that independent controller processes have reached consensus.
+The target reconstructs the key using ordinary commands generated by `persistence.Commands`. It first logically deletes any stale target copy, reconstructs the value and absolute TTL, then publishes the import as one local AOF/replication transaction frame when those mechanisms are enabled.
 
-## 7. Failover epoch and deterministic leader
+## 10. Partial migration failure
 
-Every failover attempt increments a monotonically increasing in-memory epoch.
+A failed key transfer does **not** pretend the slot became stable again.
 
-For an educational deterministic rule, SDOWN voter IDs are sorted and the first voter is recorded as the leader/coordinator for the attempt.
+Some earlier keys may already be present on the target. Therefore failure leaves:
 
 ```text
-SDOWN voters = [s1, s2, s3]
-leader = s1
-epoch = previous + 1
+owner = source
+migrationTarget = target
 ```
 
-Why have an epoch at all?
+A later `MigrateSlot` call recognizes the same source→target migration and resumes from the source's remaining keys.
 
-Without one, logs/tests cannot distinguish:
+Stable ownership changes only after all remaining source keys transfer successfully.
 
-```text
-one failover retried internally
-```
+## 11. Commit
 
-from:
+After the source has no remaining keys for the slot:
 
 ```text
-a later, separate failover decision
-```
-
-The epoch creates an explicit identity for topology-changing decisions.
-
-Production Redis Sentinel uses richer peer/election behavior. v0.9's deterministic rule is intentionally not presented as equivalent.
-
-## 8. Candidate eligibility and ranking
-
-For every non-primary node the controller evaluates the current probe matrix.
-
-Eligibility requires:
-
-```text
-reachable votes >= quorum
-AND
-votes observing RoleReplica >= quorum
-```
-
-Then ranking is:
-
-```text
-1. reachable votes DESC
-2. replication offset DESC
-3. node ID ASC
-```
-
-This produces a stable teaching policy:
-
-- a replica visible to only one of three monitors cannot be promoted when quorum is two;
-- among equally reachable replicas, the fresher replication offset wins;
-- exact ties are deterministic.
-
-The policy is deliberately inspectable rather than trying to reproduce every Redis Sentinel candidate-priority rule.
-
-## 9. Runtime promotion required a new server abstraction
-
-v0.8 treated replication role as startup configuration. Sentinel cannot work if role is immutable.
-
-v0.9 adds runtime topology state:
-
-```text
-replControlMu
-  replRole
-  replUpstream
-  replPrimary
-  replRoleCancel
-  replRootCtx
-```
-
-The old static `cfg.ReplicationRole` still supplies startup intent, but request authorization and replication behavior consult runtime state.
-
-### Promotion
-
-```text
-lock persistenceMu
-   ↓
-cancel replica-follow role
-close old upstream connection
-   ↓
-create fresh replication.Primary
-  → fresh repl-id
-  → empty backlog / offset 0
-   ↓
-open replication listener
-   ↓
-role = primary
-unlock
-```
-
-The promoted node is then writable because the client READONLY gate reads the runtime role.
-
-The data itself is not reconstructed during promotion; the replica already owns its v0.8 synchronized state.
-
-## 10. Role-scoped goroutines
-
-A subtle failover bug would be:
-
-```text
-replica promoted
-    ↓
-old runReplicaLoop still alive
-    ↓
-it reconnects to old primary later
-```
-
-v0.9 prevents this with a role-specific context. Promotion/demotion cancels the previous role context and closes the old connection/listener.
-
-Likewise, primary replication handlers capture the concrete `replication.Primary` instance that accepted them, rather than repeatedly dereferencing a server field that may have been replaced by promotion.
-
-## 11. Runtime demotion / FollowPrimary
-
-A node following a different primary performs:
-
-```text
-lock persistenceMu
+CommitMigration
   ↓
-cancel old replication role
-close old primary listener / upstream connection
-  ↓
-role = replica
-upstream = promoted primary address
-current primary feed = nil
-remembered repl-id/offset = empty
-  ↓
-unlock
-  ↓
-run v0.8 replica loop
-  ↓
-PSYNC ? -1
-  ↓
-FULLRESYNC
+owner = target
+migrationTarget = ""
+new topology epoch
 ```
 
-Resetting repl-id/offset is intentional. An offset from the old primary's replication identity must never be interpreted inside a new primary's stream.
+After commit:
 
-## 12. Why dynamic demotion rejects AOF/maxmemory in v0.9
+- old source returns MOVED to target;
+- target executes normally without ASKING.
 
-v0.8 replica semantics intentionally disable:
+## 12. Bounded topology dissemination
+
+A full topology contains 16384 slot records, so v0.10 avoids pretending gossip is free.
+
+`GossipPage(start, limit)` emits at most `limit` slot records. A peer repeatedly consumes pages and calls `MergePage`.
+
+Merge policy is explicit:
 
 ```text
-local AOF
-local maxmemory eviction policy
+higher topology epoch wins
+same epoch → deterministic stable-ID/address tie break
 ```
 
-A dynamically demoted old primary may have started with primary-only policies. Silently keeping them would be incorrect:
+This makes dissemination bounded and testable, but it is not consensus. Independent writers can still conflict.
 
-- its old AOF would no longer represent the new upstream mutation stream;
-- local eviction could independently remove a different key from the chosen primary.
+## 13. Relationship to v0.8/v0.9
 
-Therefore `FollowPrimary` in v0.9 explicitly refuses dynamic demotion when:
+The layers now answer three different questions:
 
 ```text
-appendonly is active
-OR
-maxmemory > 0
+v0.8 replication:
+  how does a replica obtain one primary's data?
+
+v0.9 Sentinel:
+  which replica becomes primary for one replicated dataset?
+
+v0.10 Cluster:
+  which primary owns this key's slot?
 ```
 
-The Sentinel demo/tests run failover-capable nodes with `appendonly=false` and `maxmemory=0`.
+Cluster migration reuses SnapshotEntry and ordinary mutation publication rather than creating a private value-copy representation.
 
-This is a deliberate capability boundary, not production Redis behavior.
+v0.10 does not automatically combine Sentinel failover with slot-owner reassignment. That coupling is intentionally left outside this milestone.
 
-## 13. Topology repair
+## 14. Validation model
 
-After a successful promotion the controller reconfigures reachable surviving replicas immediately.
+Pure cluster tests prove:
 
-The failed old primary is skipped while unreachable.
+- CRC16 known vectors;
+- non-empty hash-tag semantics;
+- CROSSSLOT rejection;
+- stable MOVED;
+- migration-time ASK;
+- ASKING target authorization;
+- migration commit;
+- bounded gossip reconstruction;
+- retry-safe partial migration contract.
 
-On a later Tick, if the chosen primary is healthy, `repairTopology` checks every reachable node:
+Real server tests prove:
 
-```text
-already replica of chosen primary?
-  yes → nothing
-  no  → FollowPrimary(chosen primary)
-```
+- wrong-owner routing before Store execution;
+- one-shot ASKING behavior;
+- real logical key + TTL migration;
+- source key removal after target import;
+- post-commit MOVED/execute behavior;
+- RESP/TCP MOVED and ASKING semantics.
 
-If that node still reports `RolePrimary`, the event is recorded as `rejoined`.
+`make cluster-demo` demonstrates the complete learning sequence.
 
-There is no attempt to merge divergent histories. The returning old primary becomes a replica and receives the chosen primary's state via v0.8 synchronization.
+## 15. Explicit limitations
 
-## 14. The fencing / split-brain boundary
+v0.10 does not claim:
 
-This is the most important limitation of v0.9.
+- production Redis Cluster protocol compatibility;
+- distributed consensus for topology epochs;
+- fencing against concurrent/conflicting slot owners;
+- production gossip failure detection or anti-entropy;
+- automatic Sentinel-to-Cluster failover integration;
+- transparent MULTI/EXEC routing across cluster nodes;
+- atomic migration of multiple slots at once.
 
-Suppose monitors cannot reach P but some clients still can:
+## 16. Next architectural layer
 
-```text
-monitor quorum ──X──> P
-clients A ──────────> P
-
-Sentinel promotes R1
-
-clients B ──────────> R1
-```
-
-Nothing in v0.9 remotely disables writes on unreachable P. Therefore two writable nodes can exist during the partition.
-
-Sentinel-style health observation alone is not a fencing mechanism.
-
-v0.9 does not claim:
-
-- linearizability;
-- split-brain prevention;
-- leases;
-- quorum writes;
-- a replicated consensus log;
-- production Redis Sentinel protocol compatibility.
-
-When P becomes reachable to the control plane again, topology repair demotes it and FULLRESYNC makes it follow the chosen primary.
-
-## 15. Failure simulation
-
-The core controller accepts a `ProbeFunc` containing `monitorID`.
-
-Tests can therefore model asymmetric reachability:
-
-```text
-s1 cannot reach P
-s2 can reach P
-s3 can reach P
-```
-
-without stopping P itself.
-
-This distinction is essential for testing SDOWN separately from ODOWN.
-
-## 16. Validation model
-
-### Pure control-plane tests
-
-- isolated monitor reaches SDOWN without ODOWN;
-- quorum ODOWN promotes exactly once;
-- freshest eligible replica wins;
-- fresher but quorum-unreachable replica loses;
-- repeated Tick after failover does not advance epoch;
-- old primary rejoin is observable.
-
-### Real server tests
-
-- running replica can promote to writable primary;
-- promotion creates a new repl-id/listener;
-- old primary can become READONLY replica;
-- old primary and surviving replica converge through v0.8 replication;
-- three real data nodes complete an end-to-end Sentinel failover under `go test -race`.
-
-### Demo
-
-```bash
-make sentinel-demo
-```
-
-prints:
-
-```text
-single observer → SDOWN only
-quorum observers → ODOWN
-epoch / deterministic leader
-promotion
-surviving replica follows new primary
-old primary rejoin
-post-repair convergence
-split-brain/fencing warning
-```
-
-## 17. Runtime state versus database state
-
-Database/logical state:
-
-```text
-keys
-values
-absolute expiry deadlines
-```
-
-Replication runtime state:
-
-```text
-repl-id
-offset
-backlog
-upstream connection
-```
-
-Sentinel runtime state:
-
-```text
-monitor observations
-SDOWN
-ODOWN view
-chosen primary
-failover epoch
-last decision
-```
-
-None of the Sentinel state is serialized as database content.
-
-## 18. Next architectural layer
-
-v0.10 changes the topology question again:
-
-```text
-v0.9: which node is primary for this replicated dataset?
-
-v0.10: which primary owns this key's hash slot?
-```
-
-The next mechanisms are 16384 logical slots, key→slot routing, stable `MOVED`, migration-time `ASK`, and explicit slot ownership state.
+v0.11 returns to protocol evolution: RESP3 negotiation, richer scalar/container replies and push messages while preserving all previous mechanism boundaries.
