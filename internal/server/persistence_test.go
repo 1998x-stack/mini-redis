@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -70,6 +71,52 @@ func TestRDBStartupWhenAOFDisabled(t *testing.T) {
 	}
 }
 
+func TestServerSaveRDBThenRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dump.mrdb")
+	cfg := config.Default()
+	cfg.AppendOnly = false
+	cfg.RDBFilename = path
+
+	original := versionedmemory.New(store.RealClock{})
+	srv := newPersistenceServer(t, cfg, original) // missing RDB -> empty database
+	if reply := srv.executeCommand([]string{"SET", "name", "mini"}); reply.IsError() {
+		t.Fatalf("SET failed: %#v", reply)
+	}
+	if reply := srv.executeCommand([]string{"RPUSH", "jobs", "snapshot", "restore"}); reply.IsError() {
+		t.Fatalf("RPUSH failed: %#v", reply)
+	}
+	deadline := time.Now().Add(30 * time.Minute).UnixMilli()
+	if reply := srv.executeCommand([]string{"PEXPIREAT", "jobs", strconv.FormatInt(deadline, 10)}); reply.IsError() {
+		t.Fatalf("PEXPIREAT failed: %#v", reply)
+	}
+	if err := srv.SaveRDB(); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restored := versionedmemory.New(store.RealClock{})
+	srv2 := newPersistenceServer(t, cfg, restored)
+	defer srv2.Close()
+	obj, ok := restored.Get("name")
+	if !ok {
+		t.Fatal("missing name")
+	}
+	value, _ := obj.StringValue()
+	if value != "mini" {
+		t.Fatalf("name=%q", value)
+	}
+	values, err := restored.ListRange("jobs", 0, -1)
+	if err != nil || len(values) != 2 || values[1] != "restore" {
+		t.Fatalf("jobs=%v err=%v", values, err)
+	}
+	ttl := restored.TTL("jobs")
+	if !ttl.Exists || !ttl.HasExpiry || ttl.Remaining <= 0 || ttl.Remaining > 30*time.Minute {
+		t.Fatalf("unexpected restored ttl: %#v", ttl)
+	}
+}
+
 func TestAOFIsAuthoritativeWhenBothFilesExist(t *testing.T) {
 	dir := t.TempDir()
 	rdbPath := filepath.Join(dir, "dump.mrdb")
@@ -131,6 +178,10 @@ func TestRewriteAOFCompactsHistoryAndRestartsCorrectly(t *testing.T) {
 	if reply := srv.executeCommand([]string{"RPUSH", "list", "a", "b", "c"}); reply.IsError() {
 		t.Fatalf("RPUSH failed: %#v", reply)
 	}
+	deadline := time.Now().Add(30 * time.Minute).UnixMilli()
+	if reply := srv.executeCommand([]string{"PEXPIREAT", "list", strconv.FormatInt(deadline, 10)}); reply.IsError() {
+		t.Fatalf("PEXPIREAT failed: %#v", reply)
+	}
 	before, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
@@ -163,5 +214,9 @@ func TestRewriteAOFCompactsHistoryAndRestartsCorrectly(t *testing.T) {
 	values, err := restored.ListRange("list", 0, -1)
 	if err != nil || len(values) != 3 || values[2] != "c" {
 		t.Fatalf("list=%v err=%v", values, err)
+	}
+	ttl := restored.TTL("list")
+	if !ttl.Exists || !ttl.HasExpiry || ttl.Remaining <= 0 || ttl.Remaining > 30*time.Minute {
+		t.Fatalf("unexpected rewritten ttl: %#v", ttl)
 	}
 }
