@@ -30,16 +30,24 @@ type Server struct {
 	aof      *aof.Log
 	logger   *slog.Logger
 
-	// persistenceMu is the canonical logical-order boundary. v0.8 couples the
-	// primary replication feed to the same order already used by commands, EXEC,
-	// snapshots and AOF publication.
+	// persistenceMu is the canonical logical-order boundary. v0.9 also uses it
+	// while changing replication roles so a client mutation or replica apply
+	// cannot cross a promotion/demotion boundary halfway through.
 	persistenceMu sync.Mutex
 
 	versions   *keyVersionTable
 	hub        *pubSubHub
 	sessionSeq atomic.Uint64
 
-	replPrimary   *replication.Primary
+	// replControlMu owns the runtime topology role. v0.8 treated role as static
+	// configuration; v0.9 must change it safely during Sentinel-style failover.
+	replControlMu sync.RWMutex
+	replRootCtx   context.Context
+	replRoleCancel context.CancelFunc
+	replRole       config.ReplicationRole
+	replUpstream   string
+	replPrimary    *replication.Primary
+
 	replStateMu   sync.Mutex
 	replicaID     string
 	replicaOffset int64
@@ -67,19 +75,14 @@ func New(cfg config.Config, st store.Store, registry *command.Registry, logger *
 	}
 
 	s := &Server{
-		cfg:      cfg,
-		store:    st,
-		registry: registry,
-		logger:   logger,
-		versions: newKeyVersionTable(),
-		hub:      newPubSubHub(),
-	}
-	if cfg.ReplicationRole == config.ReplicationPrimary {
-		primary, err := replication.NewPrimary(cfg.ReplicationBacklogBytes, cfg.ReplicationSubscriberFrames)
-		if err != nil {
-			return nil, fmt.Errorf("configure replication primary: %w", err)
-		}
-		s.replPrimary = primary
+		cfg:          cfg,
+		store:        st,
+		registry:     registry,
+		logger:       logger,
+		versions:     newKeyVersionTable(),
+		hub:          newPubSubHub(),
+		replRole:     cfg.ReplicationRole,
+		replUpstream: cfg.ReplicaOf,
 	}
 
 	// Recovery happens before installing the runtime memory-policy wrapper. LRU
@@ -222,7 +225,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	}()
 
 	engine := s.cfg.EffectiveNetworkEngine()
-	s.logger.Info("starting mini-redis", "network_engine", engine, "replication_role", s.cfg.ReplicationRole)
+	s.logger.Info("starting mini-redis", "network_engine", engine, "replication_role", s.currentReplicationRole())
 	if err := s.startReplication(runCtx); err != nil {
 		return err
 	}
@@ -253,7 +256,7 @@ func (s *Server) executeCommandDeferredLocked(argv []string) (resp.Value, [][]st
 }
 
 func (s *Server) executeCommandCoreLocked(argv []string, persistNow bool) (resp.Value, [][]string) {
-	if s.cfg.ReplicationRole == config.ReplicationReplica && len(argv) > 0 {
+	if s.currentReplicationRole() == config.ReplicationReplica && len(argv) > 0 {
 		if spec, ok := s.registry.Lookup(argv[0]); ok && spec.Mutating {
 			return resp.Error("READONLY You can't write against a read only replica."), nil
 		}
