@@ -179,3 +179,25 @@ type Store interface {
 type RehashStepper interface {
 	RehashStep(workUnits int) int
 }
+
+// SnapshotEntry is the stable logical persistence representation introduced in
+// v0.5. It intentionally contains no Object.Encoding or private payload data.
+// ExpireAtUnixMilli is zero for persistent keys and otherwise stores an
+// absolute deadline so downtime never extends a TTL.
+type SnapshotEntry struct {
+	Key               string         `json:"key"`
+	Type              ObjectType     `json:"type"`
+	ExpireAtUnixMilli int64          `json:"expire_at_ms,omitempty"`
+	StringValue       string         `json:"string,omitempty"`
+	ListValues        []string       `json:"list,omitempty"`
+	HashValues        []FieldValue   `json:"hash,omitempty"`
+	SetValues         []string       `json:"set,omitempty"`
+	ZSetValues        []ScoredMember `json:"zset,omitempty"`
+}
+
+// Snapshotter is optional so the command-facing Store contract stays focused
+// on Redis semantics. Persistence code can require this richer capability.
+type Snapshotter interface {
+	Snapshot() ([]SnapshotEntry, error)
+	RestoreSnapshot(entries []SnapshotEntry) error
+}
