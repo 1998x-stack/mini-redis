@@ -14,7 +14,8 @@ type Session struct {
 
 func (s *Session) GrantAsking() { s.asking = true }
 
-func (s *Session) consumeAsking() bool {
+// ConsumeAsking returns the current one-request grant and clears it.
+func (s *Session) ConsumeAsking() bool {
 	asking := s.asking
 	s.asking = false
 	return asking
