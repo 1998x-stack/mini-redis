@@ -3,6 +3,7 @@ package rdb
 import (
 	"encoding/binary"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -38,6 +39,31 @@ func TestEncodeIsDeterministicAndRoundTrips(t *testing.T) {
 	want := []store.SnapshotEntry{entries[1], entries[0]}
 	if !reflect.DeepEqual(decoded, want) {
 		t.Fatalf("decoded=%#v want=%#v", decoded, want)
+	}
+}
+
+func TestInfiniteScoresRoundTrip(t *testing.T) {
+	entries := []store.SnapshotEntry{{
+		Key:  "z",
+		Type: store.ObjectZSet,
+		ZSetValues: []store.ScoredMember{
+			{Member: "low", Score: math.Inf(-1)},
+			{Member: "high", Score: math.Inf(1)},
+		},
+	}}
+	data, err := Encode(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := Decode(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded) != 1 || len(decoded[0].ZSetValues) != 2 {
+		t.Fatalf("decoded=%#v", decoded)
+	}
+	if !math.IsInf(decoded[0].ZSetValues[0].Score, -1) || !math.IsInf(decoded[0].ZSetValues[1].Score, 1) {
+		t.Fatalf("scores=%#v", decoded[0].ZSetValues)
 	}
 }
 
