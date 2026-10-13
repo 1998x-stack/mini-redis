@@ -8,34 +8,50 @@ import (
 
 var (
 	ErrNotInteger = errors.New("value is not an integer or out of range")
+	ErrWrongType  = errors.New("operation against a key holding the wrong kind of value")
 )
 
-// ObjectType is the logical Redis value kind. v0.3 still implements only
-// strings; v0.4 will add collection types without changing the distinction
-// between logical type and physical encoding introduced here.
+// ObjectType is the logical Redis data type exposed by command semantics.
 type ObjectType uint8
 
 const (
 	ObjectString ObjectType = iota + 1
+	ObjectList
+	ObjectHash
+	ObjectSet
+	ObjectZSet
 )
 
 func (t ObjectType) String() string {
 	switch t {
 	case ObjectString:
 		return "string"
+	case ObjectList:
+		return "list"
+	case ObjectHash:
+		return "hash"
+	case ObjectSet:
+		return "set"
+	case ObjectZSet:
+		return "zset"
 	default:
 		return "unknown"
 	}
 }
 
-// ObjectEncoding describes how the logical object is physically represented.
-// A Redis string can be a raw byte/string payload or an integer payload while
-// preserving the same GET/SET semantics.
+// ObjectEncoding is the physical representation behind one logical type.
+// v0.4 intentionally reuses names familiar from Redis while implementing small
+// educational equivalents rather than byte-for-byte production structures.
 type ObjectEncoding uint8
 
 const (
 	EncodingRaw ObjectEncoding = iota + 1
 	EncodingInt
+	EncodingListPack
+	EncodingQuickList
+	EncodingHashTable
+	EncodingIntSet
+	EncodingSkipList
 )
 
 func (e ObjectEncoding) String() string {
@@ -44,23 +60,30 @@ func (e ObjectEncoding) String() string {
 		return "raw"
 	case EncodingInt:
 		return "int"
+	case EncodingListPack:
+		return "listpack"
+	case EncodingQuickList:
+		return "quicklist"
+	case EncodingHashTable:
+		return "hashtable"
+	case EncodingIntSet:
+		return "intset"
+	case EncodingSkipList:
+		return "skiplist"
 	default:
 		return "unknown"
 	}
 }
 
-// Object is deliberately small and explicit. Payload is encoding-specific;
-// constructors and accessors keep command handlers from depending on its
-// concrete Go representation.
+// Object separates the stable logical type from its replaceable physical
+// representation. Payload is package-owned so command handlers cannot couple
+// themselves to a concrete encoding.
 type Object struct {
 	Type     ObjectType
 	Encoding ObjectEncoding
 	payload  any
 }
 
-// NewString chooses integer encoding only when converting to int64 and back is
-// byte-for-byte canonical. That preserves values such as "001" or "+1" as raw
-// strings instead of silently changing what GET returns.
 func NewString(value string) Object {
 	if n, err := strconv.ParseInt(value, 10, 64); err == nil && strconv.FormatInt(n, 10) == value {
 		return Object{Type: ObjectString, Encoding: EncodingInt, payload: n}
@@ -95,19 +118,25 @@ func (o Object) Int64() (int64, bool) {
 	return v, ok
 }
 
-// TTLResult mirrors the three states Redis users care about:
-//   - key missing
-//   - key exists but has no expiration
-//   - key exists and has a remaining TTL
+type FieldValue struct {
+	Field string
+	Value string
+}
+
+type ScoredMember struct {
+	Member string
+	Score  float64
+}
+
 type TTLResult struct {
 	Exists    bool
 	HasExpiry bool
 	Remaining time.Duration
 }
 
-// Store is the stable data-engine boundary. v0.3 replaces the implementation's
-// Go maps with an explicit incremental-rehash dictionary without changing this
-// command-facing contract.
+// Store is the command-facing data-engine boundary. v0.4 adds collection
+// semantics here so atomicity and TTL preservation stay inside the engine
+// rather than leaking read-modify-write sequences into command handlers.
 type Store interface {
 	Get(key string) (Object, bool)
 	Set(key string, value Object, ttl *time.Duration)
@@ -119,16 +148,34 @@ type Store interface {
 	TTL(key string) TTLResult
 	Keys(pattern string) ([]string, error)
 	Flush()
-
-	// ExpireDue performs active expiration. limit <= 0 means full scan.
-	// It returns the number of keys physically removed.
 	ExpireDue(limit int) int
 	Len() int
+
+	ListPush(key string, left bool, values []string) (int, error)
+	ListPop(key string, left bool) (string, bool, error)
+	ListLen(key string) (int, error)
+	ListRange(key string, start, stop int) ([]string, error)
+
+	HashSet(key string, pairs []FieldValue) (int, error)
+	HashGet(key, field string) (string, bool, error)
+	HashDelete(key string, fields ...string) (int, error)
+	HashLen(key string) (int, error)
+	HashGetAll(key string) ([]FieldValue, error)
+
+	SetAdd(key string, members ...string) (int, error)
+	SetRemove(key string, members ...string) (int, error)
+	SetIsMember(key, member string) (bool, error)
+	SetMembers(key string) ([]string, error)
+	SetCard(key string) (int, error)
+
+	ZAdd(key string, pairs []ScoredMember) (int, error)
+	ZScore(key, member string) (float64, bool, error)
+	ZRank(key, member string) (int, bool, error)
+	ZRange(key string, start, stop int) ([]ScoredMember, error)
+	ZRemove(key string, members ...string) (int, error)
 }
 
-// RehashStepper is an optional maintenance capability. Server runtimes can
-// advance bounded dictionary work without coupling command semantics to the
-// concrete memory engine.
+// RehashStepper is an optional maintenance capability used by server timers.
 type RehashStepper interface {
 	RehashStep(workUnits int) int
 }
