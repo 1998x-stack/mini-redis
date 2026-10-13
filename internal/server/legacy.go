@@ -72,12 +72,17 @@ func (s *Server) handleBlockingConnection(ctx context.Context, conn net.Conn) {
 	reader := resp.NewReader(conn)
 	writer := resp.NewWriter(conn)
 	var writeMu sync.Mutex
+	var session *clientSession
 	writeReply := func(value resp.Value) error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
-		return writer.WriteValue(value)
+		protocol := resp.Protocol2
+		if session != nil {
+			protocol = session.protocolMode()
+		}
+		return writer.WriteValueProtocol(value, protocol)
 	}
-	session := s.newClientSession(writeReply)
+	session = s.newClientSession(writeReply)
 	defer s.closeClientSession(session)
 
 	for {
