@@ -97,8 +97,6 @@ func (p *Primary) RecordPartialSync() {
 	p.mu.Unlock()
 }
 
-// Append publishes one already-ordered canonical mutation frame. Slow live
-// subscribers are disconnected instead of blocking primary command execution.
 func (p *Primary) Append(payload []byte) Frame {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -118,28 +116,25 @@ func (p *Primary) Append(payload []byte) Frame {
 	return frame
 }
 
-// SubscribeAtCurrent attaches a live subscriber at exactly the current stream
-// end. Callers use this while holding the server mutation-ordering lock during
-// full-sync snapshot capture; later writes therefore cannot fall into a gap.
 func (p *Primary) SubscribeAtCurrent() (string, int64, *Subscription) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.id, p.backlog.EndOffset(), p.addSubscriberLocked()
 }
 
-// SubscribeFrom atomically captures the retained suffix and attaches the live
-// subscriber. No append can occur between suffix capture and subscription.
-func (p *Primary) SubscribeFrom(id string, offset int64) ([]byte, int64, *Subscription, bool) {
+// SubscribeFrom atomically snapshots retained complete frames after offset and
+// attaches the live subscriber. No append can fall between catch-up and live.
+func (p *Primary) SubscribeFrom(id string, offset int64) ([]Frame, int64, *Subscription, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if id != p.id {
 		return nil, p.backlog.EndOffset(), nil, false
 	}
-	suffix, ok := p.backlog.SuffixAfter(offset)
+	frames, ok := p.backlog.FramesAfter(offset)
 	if !ok {
 		return nil, p.backlog.EndOffset(), nil, false
 	}
-	return suffix, p.backlog.EndOffset(), p.addSubscriberLocked(), true
+	return frames, p.backlog.EndOffset(), p.addSubscriberLocked(), true
 }
 
 func (p *Primary) addSubscriberLocked() *Subscription {
