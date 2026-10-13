@@ -223,9 +223,19 @@ func (s *Server) executeCommand(argv []string) resp.Value {
 }
 
 // executeCommandLocked runs one command while persistenceMu is already held.
-// Normal requests enter through executeCommand; EXEC uses this form repeatedly
-// so its queued commands are ordered as one non-interleaved server unit.
+// Normal requests enter through executeCommand; EXEC uses the deferred-AOF form
+// repeatedly so its queued commands are ordered as one non-interleaved server
+// unit and persisted as one MULTI/EXEC AOF frame.
 func (s *Server) executeCommandLocked(argv []string) resp.Value {
+	reply, _ := s.executeCommandCoreLocked(argv, true)
+	return reply
+}
+
+func (s *Server) executeCommandDeferredLocked(argv []string) (resp.Value, [][]string) {
+	return s.executeCommandCoreLocked(argv, false)
+}
+
+func (s *Server) executeCommandCoreLocked(argv []string, persistNow bool) (resp.Value, [][]string) {
 	var (
 		controller    store.MemoryController
 		rollbackStore store.Snapshotter
@@ -247,11 +257,11 @@ func (s *Server) executeCommandLocked(argv []string) resp.Value {
 		var err error
 		rollbackStore, err = s.snapshotter()
 		if err != nil {
-			return resp.Error("ERR memory policy requires logical snapshots")
+			return resp.Error("ERR memory policy requires logical snapshots"), nil
 		}
 		rollbackState, err = rollbackStore.Snapshot()
 		if err != nil {
-			return resp.Error("ERR failed to capture memory rollback state")
+			return resp.Error("ERR failed to capture memory rollback state"), nil
 		}
 	}
 
@@ -267,14 +277,14 @@ func (s *Server) executeCommandLocked(argv []string) resp.Value {
 				if rollbackStore != nil {
 					if restoreErr := rollbackStore.RestoreSnapshot(rollbackState); restoreErr != nil {
 						s.logger.Error("restore after maxmemory failure", "error", restoreErr)
-						return resp.Error("MISCONF failed to rollback maxmemory rejection")
+						return resp.Error("MISCONF failed to rollback maxmemory rejection"), nil
 					}
 				}
 				if errors.Is(err, store.ErrOOM) {
-					return resp.Error("OOM command not allowed when used memory > 'maxmemory'")
+					return resp.Error("OOM command not allowed when used memory > 'maxmemory'"), nil
 				}
 				s.logger.Error("maxmemory enforcement failed", "error", err)
-				return resp.Error("ERR maxmemory enforcement failed")
+				return resp.Error("ERR maxmemory enforcement failed"), nil
 			}
 			if len(pressure.EvictedKeys) > 0 {
 				evicted = append(evicted, pressure.EvictedKeys...)
@@ -289,13 +299,13 @@ func (s *Server) executeCommandLocked(argv []string) resp.Value {
 		s.noteAcceptedMutation(argv, evicted)
 	}
 
-	if s.aof != nil && len(persist) > 0 {
+	if persistNow && s.aof != nil && len(persist) > 0 {
 		if err := s.aof.AppendBatch(persist); err != nil {
 			s.logger.Error("AOF append failed", "error", err)
-			return resp.Error("MISCONF AOF persistence failed")
+			return resp.Error("MISCONF AOF persistence failed"), nil
 		}
 	}
-	return result.Reply
+	return result.Reply, persist
 }
 
 func (s *Server) runMaintenance() {
