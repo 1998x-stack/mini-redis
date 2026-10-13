@@ -9,9 +9,9 @@ v0.3  Dict / bounded incremental rehash / Object metadata
 v0.4  List / Hash / Set / ZSet / adaptive encodings
 v0.5  logical snapshots / RDB / AOF rewrite
 v0.6  maxmemory / expiration vs eviction / sampled LRU-LFU
-v0.7  WATCH / MULTI-EXEC / PubSub                         ← current
-v0.8  replication / full sync / backlog / partial resync ← next
-v0.9  Sentinel-style failover
+v0.7  WATCH / MULTI-EXEC / PubSub
+v0.8  replication / full sync / repl-id+offset / backlog / partial resync ← current
+v0.9  Sentinel-style health / quorum / election / promotion             ← next
 v0.10 Cluster / hash slots
 v0.11 RESP3
 v0.12 observability / profiling
