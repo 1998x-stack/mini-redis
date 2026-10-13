@@ -23,29 +23,41 @@ type MigrationSource interface {
 	TransferKey(context.Context, string, MigrationTarget) error
 }
 
-// MigrateSlot makes migration state visible before any key moves. The stable
-// owner changes only after every source key transfers successfully.
+// MigrateSlot makes migration state visible before any key moves. If the same
+// source→target migration is already active, the operation resumes from the
+// source's remaining keys. The stable owner changes only after every remaining
+// source key transfers successfully.
 func MigrateSlot(ctx context.Context, topology *Topology, slot int, source MigrationSource, target MigrationTarget) error {
 	if topology == nil || source == nil || target == nil {
 		return fmt.Errorf("cluster: topology/source/target are required")
 	}
-	if err := topology.BeginMigration(slot, source.ID(), target.ID()); err != nil {
-		return err
+	state, ok := topology.Slot(slot)
+	if !ok {
+		return fmt.Errorf("cluster: slot %d is unassigned", slot)
 	}
+	if state.OwnerID != source.ID() {
+		return fmt.Errorf("cluster: slot %d owner is %q, not %q", slot, state.OwnerID, source.ID())
+	}
+	if state.MigrationTarget == "" {
+		if err := topology.BeginMigration(slot, source.ID(), target.ID()); err != nil {
+			return err
+		}
+	} else if state.MigrationTarget != target.ID() {
+		return fmt.Errorf("cluster: slot %d already migrates to %q", slot, state.MigrationTarget)
+	}
+
 	keys, err := source.KeysInSlot(ctx, slot)
 	if err != nil {
-		_ = topology.AbortMigration(slot, source.ID(), target.ID())
 		return fmt.Errorf("cluster: list slot %d keys: %w", slot, err)
 	}
 	for _, key := range keys {
 		if HashSlot(key) != slot {
-			_ = topology.AbortMigration(slot, source.ID(), target.ID())
 			return fmt.Errorf("cluster: source returned key %q outside slot %d", key, slot)
 		}
 		if err := source.TransferKey(ctx, key, target); err != nil {
 			// Keep the migration marker on partial transfer. Some keys may already
 			// live at the target, so pretending the slot returned to a pristine
-			// stable state would hide reality. The caller may retry safely.
+			// stable state would hide reality. A retry resumes from remaining keys.
 			return fmt.Errorf("cluster: transfer key %q: %w", key, err)
 		}
 	}
