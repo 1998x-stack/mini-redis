@@ -53,87 +53,95 @@ Stable logical `SnapshotEntry`, deterministic MRDB, crash-safe publication, AOF 
 Deterministic logical memory accounting, expiration/eviction separation, `noeviction`, random/LRU/LFU sampled policies, rollback boundary and eviction AOF persistence.
 
 ### v0.7 — Transactions, WATCH and Pub/Sub
+Per-client session state, optimistic WATCH versions, MULTI/EXEC ordering, queue-time versus execution-time failure semantics, AOF transaction framing, live Pub/Sub and both-engine push integration.
+
+### v0.8 — Replication
 
 Primary question:
 
-> How can Redis queue commands and detect optimistic conflicts while keeping transactions different from database rollback, and how does Pub/Sub turn a normal connection into a push-oriented session?
+> How can a replica establish one consistent base state, follow exactly the primary's logical mutation order, and reconnect from its last applied position without always copying the whole database again?
 
 Implemented:
 
-- explicit `clientSession` state shared by reactor and legacy transports;
-- `MULTI`, ordered queueing, `EXEC`, `DISCARD`;
-- queue-time validation and dirty-transaction `EXECABORT`;
-- execution-time errors as EXEC array elements without rollback;
-- `WATCH` / `UNWATCH` with key versions, global epoch and existence checks;
-- WATCH invalidation on intervening writes, eviction and TTL disappearance;
-- RESP2 null-array conflict reply;
-- `persistenceMu` as EXEC non-interleaving boundary;
-- maintenance and RDB snapshot capture serialized with EXEC;
-- AOF `MULTI ... EXEC` framing for crash-truncated transaction-tail recovery;
-- `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH` live fan-out;
-- subscribed connection mode and disconnect cleanup;
-- Pub/Sub output integration with legacy writer mutex and reactor output buffers;
-- direct semantics tests, AOF restart/crash tests and both-engine network tests;
-- `make session-demo`.
+- explicit `standalone`, `primary` and `replica` roles;
+- separate educational replication TCP plane beside normal client transport;
+- random primary replication identity (`repl-id`);
+- monotonically increasing byte offset over canonical RESP mutation bytes;
+- one primary mutation feed coupled to the existing `persistenceMu` logical-order boundary;
+- full synchronization from logical `SnapshotEntry[]` state;
+- snapshot/offset/live-subscriber capture under one mutation-ordering lock;
+- buffered post-snapshot live frames so writes cannot fall through the snapshot handoff gap;
+- frame-aware bounded backlog that evicts complete logical frames, never partial RESP commands;
+- `PSYNC <repl-id> <offset>` reconnect request;
+- `CONTINUE` partial resynchronization when identity and retained frame boundary match;
+- fallback `FULLRESYNC` when identity changed or backlog history wrapped;
+- replica-side full snapshot install plus ordered frame application;
+- replica offset advancement only after a complete frame applies;
+- read-only client gate on replicas;
+- absolute TTL reconstruction and eviction-generated DEL propagation through the canonical mutation stream;
+- MULTI/EXEC preserved as one replication frame;
+- full/live/partial/fallback/transaction integration tests under `go test -race`;
+- deterministic `make replication-demo` showing FULLRESYNC → live follow → CONTINUE → READONLY.
 
 Critical invariants:
 
-- MULTI queue state belongs to one client, not the Store;
-- EXEC commands cannot be interleaved with another logical mutation;
-- runtime command errors do not roll back successful siblings;
-- queue-time errors abort before execution;
-- WATCH detects intervening writes even if a value is later restored;
-- a watched key expiring before EXEC causes conflict;
-- RDB/AOF observers do not capture a half-EXEC state;
-- a truncated AOF transaction frame replays none of its commands;
-- Pub/Sub messages are ephemeral and never become persisted keyspace state;
-- disconnect removes subscriptions.
+- snapshot base + every post-boundary frame equals primary logical mutation order;
+- no write can occur between snapshot capture and live subscriber attachment;
+- replication offsets count only canonical mutation payload bytes, not TCP envelope bytes;
+- replicas request resume only from complete-frame boundaries;
+- backlog wrap changes availability of partial resync, never correctness;
+- a stale replication identity forces full sync;
+- a replica never applies a suffix before installing its base snapshot;
+- offset advances only after a whole frame succeeds;
+- successful EXEC mutations remain one frame across both live follow and catch-up;
+- replicated commands bypass the client READONLY gate but do not run an independent local eviction policy;
+- private Dict/Object physical representation never crosses the replication protocol.
 
-## 3. v0.8 — Replication
+Intentional teaching simplifications:
+
+- replica replication identity/offset is memory-only;
+- replica local AOF/maxmemory are disabled in v0.8;
+- a new primary process generates a new identity and therefore causes full sync;
+- slow replica handling favors disconnect/reconnect over production-grade output-buffer policy;
+- no acknowledgement quorum, WAIT semantics, promotion or failover yet.
+
+## 3. v0.9 — Sentinel-inspired HA
 
 ### Primary question
 
-**How can a replica establish a consistent starting state, follow an ordered mutation stream, and reconnect using only the missing suffix when the primary still has it?**
+**Once replication exists, how can multiple observers decide that a primary is actually unavailable, select a replica to promote, and reconfigure the topology without confusing a local network failure with a cluster-wide failure?**
 
 ### Required implementation
 
-- explicit primary/replica role configuration;
-- replication identity and monotonically increasing logical byte/stream offset;
-- primary replication feed coupled to acknowledged logical mutation order;
-- replica handshake and capability/state exchange;
-- full synchronization from one logical snapshot boundary;
-- buffering of primary mutations that occur after the full-sync snapshot boundary;
-- replica application path that does not re-append replicated commands as independent local client writes;
-- bounded backlog/ring buffer keyed by replication offset;
-- reconnect request containing replica's known identity + offset;
-- partial resynchronization when requested suffix remains in backlog;
-- fallback to full sync when identity/offset/backlog cannot satisfy request;
-- transaction framing preserved through replication as one ordered unit;
-- expiration semantics designed so replicas do not invent independent divergent lifetimes;
-- convergence tests under writes during full sync and disconnect/reconnect;
-- deterministic demo for full sync versus partial resync.
+- explicit Sentinel/monitor process or subsystem separated from data-serving state;
+- periodic health probes with observable last-success/last-failure state;
+- subjective-down state based on one monitor's timeout;
+- objective-down state requiring configured quorum agreement;
+- term/epoch-like election metadata to avoid repeated stale promotion decisions;
+- candidate replica ranking using health and replication freshness;
+- deterministic leader/election rule for one failover attempt;
+- replica promotion to writable primary;
+- surviving replicas reconfigured to follow the promoted primary;
+- old primary rejoined as replica when it returns;
+- failure simulation for primary loss, isolated monitor and stale replica;
+- deterministic demo distinguishing SDOWN, ODOWN, election, promotion and topology repair.
 
 ### Critical invariants
 
-- snapshot base + buffered suffix equals primary logical order;
-- replication offsets advance in exactly one canonical stream order;
-- replica never applies a suffix before its base state;
-- reconnect does not duplicate already-applied mutations;
-- backlog wrap only changes whether partial resync is possible, never correctness;
-- client writes are rejected on a read-only replica in the initial teaching model;
-- replication is not implemented by serializing private Object/Dict memory layout.
+- one monitor timing out a primary is insufficient for objective failure;
+- promotion never selects an unavailable/stale candidate when a healthier candidate exists under the teaching policy;
+- a failover decision belongs to one monotonically advancing election epoch;
+- topology reconfiguration follows the chosen promoted primary consistently;
+- replication correctness remains the v0.8 mechanism; Sentinel does not create a second data-copy path.
 
 ### Non-goals
 
-- no Sentinel/election yet;
-- no automatic promotion;
-- no Cluster/hash slots;
-- no diskless production optimization claims.
+- no Cluster hash-slot ownership yet;
+- no geographically distributed consensus claim;
+- no production-compatible Sentinel protocol completeness;
+- no client-side service discovery beyond what the teaching demo requires.
 
 ## 4. Later milestones
-
-### v0.9 — Sentinel-inspired HA
-Health monitoring, subjective/objective failure, quorum/election, replica promotion and topology reconfiguration.
 
 ### v0.10 — Cluster
 16384 hash slots, key→slot mapping, ownership, `MOVED`, migration/importing state, `ASK` and basic topology gossip.
@@ -168,8 +176,8 @@ main passes CI on same SHA
 
 ## 6. Current directive
 
-Current freeze candidate: **v0.7 — connection sessions, optimistic WATCH transactions and live Pub/Sub**.
+Current freeze candidate: **v0.8 — replication full sync, canonical mutation stream, offsets/backlog and partial resynchronization**.
 
-Next active version after v0.7 validation: **v0.8 — replication full sync, ordered propagation, offsets/backlog and partial resync**.
+Next active version after v0.8 exact-SHA validation: **v0.9 — Sentinel-inspired health, quorum, election, promotion and topology reconfiguration**.
 
-Do not begin Sentinel or Cluster work until replication convergence/reconnect semantics are explicit and tested.
+Do not begin Cluster/hash-slot work until failover builds cleanly on the v0.8 replication topology rather than bypassing it.
