@@ -28,13 +28,13 @@ type Manager struct {
 	base        store.Store
 	snapshotter store.Snapshotter
 
-	mu        sync.Mutex
-	cfg       store.MemoryConfig
-	meta      map[string]accessMeta
-	rng       *rand.Rand
-	evicted   uint64
-	expired   uint64
-	examined  uint64
+	mu       sync.Mutex
+	cfg      store.MemoryConfig
+	meta     map[string]accessMeta
+	rng      *rand.Rand
+	evicted  uint64
+	expired  uint64
+	examined uint64
 }
 
 func New(base store.Store, cfg store.MemoryConfig) (*Manager, error) {
