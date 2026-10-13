@@ -39,9 +39,9 @@ type Server struct {
 	hub        *pubSubHub
 	sessionSeq atomic.Uint64
 
-	replPrimary *replication.Primary
-	replStateMu sync.Mutex
-	replicaID   string
+	replPrimary   *replication.Primary
+	replStateMu   sync.Mutex
+	replicaID     string
 	replicaOffset int64
 
 	stateMu        sync.RWMutex
