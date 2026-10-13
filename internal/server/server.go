@@ -218,21 +218,24 @@ func (s *Server) executeCommand(argv []string) resp.Value {
 		memoryManaged = c.MemoryPolicyConfig().MaxBytes > 0
 	}
 
-	// noeviction must fail without a partially applied logical mutation. The
-	// educational reference path uses the already-established v0.5 logical
-	// snapshot boundary for rollback. Production Redis uses tighter internal
-	// accounting; here correctness and a visible atomicity boundary come first.
-	if memoryManaged && len(argv) > 0 && controller.MemoryPolicyConfig().Policy == store.PolicyNoEviction {
-		if spec, ok := s.registry.Lookup(argv[0]); ok && spec.Mutating {
-			var err error
-			rollbackStore, err = s.snapshotter()
-			if err != nil {
-				return resp.Error("ERR memory policy requires logical snapshots")
-			}
-			rollbackState, err = rollbackStore.Snapshot()
-			if err != nil {
-				return resp.Error("ERR failed to capture memory rollback state")
-			}
+	mayGrow := len(argv) > 0 && s.registry.MayGrowMemory(argv[0])
+	policy := store.PolicyNoEviction
+	if memoryManaged {
+		policy = controller.MemoryPolicyConfig().Policy
+	}
+
+	// noeviction must fail without a partially applied logical mutation. Only
+	// commands that may grow memory need rollback; DEL/POP/HDEL/SREM/ZREM and
+	// FLUSHDB remain usable to recover when a process starts above maxmemory.
+	if memoryManaged && policy == store.PolicyNoEviction && mayGrow {
+		var err error
+		rollbackStore, err = s.snapshotter()
+		if err != nil {
+			return resp.Error("ERR memory policy requires logical snapshots")
+		}
+		rollbackState, err = rollbackStore.Snapshot()
+		if err != nil {
+			return resp.Error("ERR failed to capture memory rollback state")
 		}
 	}
 
@@ -240,23 +243,29 @@ func (s *Server) executeCommand(argv []string) resp.Value {
 	persist := result.AOFCommands(time.Now())
 
 	if memoryManaged && result.Runnable && result.Spec.Mutating && !result.Reply.IsError() {
-		pressure, err := controller.EnforceMaxMemory()
-		if err != nil {
-			if rollbackStore != nil {
-				if restoreErr := rollbackStore.RestoreSnapshot(rollbackState); restoreErr != nil {
-					s.logger.Error("restore after maxmemory failure", "error", restoreErr)
-					return resp.Error("MISCONF failed to rollback maxmemory rejection")
+		// Under noeviction, removal-only mutations are always allowed. Policies
+		// with eviction still enforce after any mutation so a write that grows
+		// state can evict enough complete keys before acknowledgement.
+		shouldEnforce := policy != store.PolicyNoEviction || mayGrow
+		if shouldEnforce {
+			pressure, err := controller.EnforceMaxMemory()
+			if err != nil {
+				if rollbackStore != nil {
+					if restoreErr := rollbackStore.RestoreSnapshot(rollbackState); restoreErr != nil {
+						s.logger.Error("restore after maxmemory failure", "error", restoreErr)
+						return resp.Error("MISCONF failed to rollback maxmemory rejection")
+					}
 				}
+				if errors.Is(err, store.ErrOOM) {
+					return resp.Error("OOM command not allowed when used memory > 'maxmemory'")
+				}
+				s.logger.Error("maxmemory enforcement failed", "error", err)
+				return resp.Error("ERR maxmemory enforcement failed")
 			}
-			if errors.Is(err, store.ErrOOM) {
-				return resp.Error("OOM command not allowed when used memory > 'maxmemory'")
+			if len(pressure.EvictedKeys) > 0 {
+				del := append([]string{"DEL"}, pressure.EvictedKeys...)
+				persist = append(persist, del)
 			}
-			s.logger.Error("maxmemory enforcement failed", "error", err)
-			return resp.Error("ERR maxmemory enforcement failed")
-		}
-		if len(pressure.EvictedKeys) > 0 {
-			del := append([]string{"DEL"}, pressure.EvictedKeys...)
-			persist = append(persist, del)
 		}
 	}
 
