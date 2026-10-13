@@ -47,7 +47,8 @@ main ─────────────────────────
  ├── v0.7 transactions/PubSub
  ├── v0.8 replication
  ├── v0.9 Sentinel-inspired HA
- └── v0.10 Cluster/hash slots
+ ├── v0.10 Cluster/hash slots
+ └── v0.11 RESP3
 ```
 
 Create a version branch from current `main`. Definition of Done requires exact-SHA CI on the version branch, fast-forwarding `main` to that same SHA, then exact-SHA CI on `main`.
@@ -55,50 +56,60 @@ Create a version branch from current `main`. Definition of Done requires exact-S
 ## 4. Architecture direction
 
 ```text
-client / RESP
-      ↓
-connection/session layer
-      ↓
-v0.10 cluster routing gate
-      ↓
+client TCP
+   ↓
+RESP command parser
+   ↓
+connection/session state
+   ├── protocol 2/3
+   ├── transaction/WATCH
+   └── Pub/Sub
+   ↓
+v0.10 cluster routing gate when applicable
+   ↓
 Server.persistenceMu
-      ↓
+   ↓
 command registry / Store
-      ↓
+   ↓
 logical state + canonical mutation commands
-      ├── AOF/RDB
-      └── v0.8 replication
-             ↓
-       primary / replicas
-             ↑
-       v0.9 Sentinel topology control
+   ├── AOF/RDB
+   └── v0.8 replication
+          ↓
+    primary / replicas
+          ↑
+    v0.9 Sentinel control
 
-v0.10 orthogonal topology:
-key → CRC16/hash-tag → slot → primary owner
+logical reply
+   ↓
+v0.11 protocol view
+   ├── RESP2
+   └── RESP3
 ```
 
 Rules:
 
-- RESP does not depend on Store internals;
-- Store never owns network/failover/slot metadata;
+- protocol representation never owns database semantics;
+- RESP parsing/encoding does not depend on Store internals;
+- Store never owns network/failover/slot/protocol metadata;
 - command handlers do not inspect private encoding payloads;
-- persistence and replication serialize logical state, never unstable Go layout;
-- Sentinel monitors/reconfigures replication topology and does not copy database values;
-- Cluster slot ownership/migration state is separate from ordinary key/value Store state;
-- Cluster migration crosses nodes via `SnapshotEntry`, not private Object encodings.
+- persistence and replication serialize logical state/commands, never client protocol state;
+- Sentinel monitors/reconfigures replication topology and never copies database values;
+- Cluster ownership/migration remains separate from Store values;
+- Cluster migration crosses nodes via `SnapshotEntry`;
+- response adaptation occurs only after command and Cluster authorization.
 
 ## 5. Concurrency / atomicity
 
 - Store mutexes own in-memory value/TTL atomicity.
 - `Server.persistenceMu` is the canonical logical mutation-order boundary from v0.5 onward.
-- v0.7 holds it across WATCH validation and complete EXEC execution.
+- v0.7 holds it across WATCH validation and complete EXEC.
 - v0.8 uses it for mutation publication and snapshot/offset/subscriber handoff.
-- v0.9 uses it across runtime replication role transitions.
-- v0.10 cluster routing holds it across migration-sensitive existence observation, route authorization and command execution.
-- `ClusterNode.TransferKey` holds the source `persistenceMu` from logical export through target acknowledgement and source delete.
-- The v0.10 teaching migrator assumes one directed slot migration operation at a time; concurrent opposite-direction migrations are outside scope.
+- v0.9 uses it across runtime replication-role transitions.
+- v0.10 holds it across migration-sensitive existence observation, routing authorization and command execution.
+- `ClusterNode.TransferKey` holds source `persistenceMu` from export through target acknowledgement and source delete.
 - `cluster.Topology.mu` owns node/slot/epoch/migration metadata.
-- one cluster RESP connection serially owns its `cluster.Session`; ASKING is connection-local, not shared process state.
+- v0.11 protocol mode is connection-local session state protected by `clientSession.mu`.
+- transports may read protocol mode to encode bytes, but must not implement separate HELLO semantics.
 - never claim atomicity without naming its lock, filesystem or protocol boundary.
 
 ## 6. Established transaction / persistence / memory rules
@@ -122,7 +133,7 @@ Rules:
 - matching repl-id + retained frame boundary permits CONTINUE; otherwise FULLRESYNC;
 - replica offset advances only after complete frame application;
 - replica client writes are READONLY;
-- private Dict/Object encodings never cross replication.
+- client RESP2/RESP3 mode never changes replication frames.
 
 ## 8. Sentinel rules — v0.9
 
@@ -133,70 +144,68 @@ Rules:
 - candidate must be quorum-visible as replica;
 - teaching ranking is reachable votes DESC → replication offset DESC → node ID ASC;
 - promotion creates fresh replication identity/backlog/listener;
-- surviving replicas follow the promoted primary;
-- returning old primary becomes a replica of the chosen primary;
-- no fencing exists, so split-brain prevention/consensus/linearizability are not claimed.
+- returning old primary becomes replica of the chosen primary;
+- no fencing exists; consensus/linearizability are not claimed.
 
 ## 9. Cluster rules — v0.10
 
-### Slots and hashing
+- exactly 16384 logical slots using CRC-16/XMODEM modulo 16384;
+- first non-empty `{...}` hash tag replaces whole-key hash input;
+- multi-key routed commands must share one slot or fail CROSSSLOT before mutation;
+- stable wrong owner returns MOVED;
+- source→target migration exposes ASK/ASKING explicitly;
+- ASKING is one request on one connection;
+- values move as logical `SnapshotEntry` and preserve absolute TTL;
+- source deletes only after target import acknowledgement;
+- partial migration remains visible and retryable;
+- stable ownership switches only after migration completion;
+- bounded gossip + deterministic epoch/LWW merge is not consensus;
+- authoritative cluster traffic uses the cluster-aware facade/endpoint.
 
-- exactly `16384` logical slots;
-- key slot = CRC-16/XMODEM modulo 16384;
-- first non-empty `{...}` hash tag replaces the whole key as hash input;
-- malformed/empty hash tags fall back to the whole key;
-- every routed key deterministically maps to one slot.
+## 10. RESP3 rules — v0.11
 
-### Multi-key routing
+### Negotiation
 
-- routed keys are identified before Store execution;
-- all routed keys in one command must share one slot;
-- otherwise fail with `CROSSSLOT` before mutation;
-- v0.10 cluster facade deliberately rejects MULTI/EXEC rather than promise incomplete cross-command routing semantics.
+- every new connection starts in RESP2;
+- `HELLO 3` switches only that connection to RESP3;
+- `HELLO 2` switches only that connection back to RESP2;
+- protocol state never enters Store, SnapshotEntry, AOF, replication backlog or Cluster topology;
+- command requests remain canonical arrays of blob strings.
 
-### Stable routing
+### Logical value versus wire form
 
-- local stable owner executes;
-- wrong stable owner returns `MOVED <slot> <addr>`;
-- unassigned slot returns CLUSTERDOWN;
-- MOVED means stable ownership, not temporary migration state.
+- `resp.Value` may represent Null, Boolean, Double, Big Number, Verbatim String, Map, Set and Push;
+- the RESP3 encoder emits native markers;
+- RESP2 encoding explicitly downgrades richer values rather than changing command semantics;
+- selected command replies gain richer RESP3 views only after execution/authorization.
 
-### Migration routing
+Current view adaptations:
 
-For `owner=source, migrationTarget=target`:
+```text
+HGETALL    RESP2 Array  → RESP3 Map
+SMEMBERS   RESP2 Array  → RESP3 Set
+SISMEMBER  RESP2 0/1    → RESP3 Boolean
+ZSCORE      RESP2 bulk   → RESP3 Double
+null bulk/array          → RESP3 Null
+```
 
-- source + existing key → execute locally;
-- source + missing key → `ASK <slot> <target>`;
-- target without ASKING → MOVED to stable source;
-- target with ASKING → execute exactly one routed request;
-- ASKING is consumed by the next command on that same connection.
+### Push
 
-### Key transfer
+- Pub/Sub delivery remains one mechanism;
+- RESP3 represents subscription acknowledgements/messages as Push;
+- RESP2 downgrades Push to Array;
+- a RESP3 subscriber may issue ordinary commands because Push disambiguates asynchronous frames;
+- RESP2 subscribed-mode restrictions remain for backward compatibility.
 
-- slot migration state becomes visible before data moves;
-- values cross the node boundary as logical `SnapshotEntry`;
-- source deletes only after target import acknowledges success;
-- target import reconstructs through existing command/persistence/replication machinery;
-- absolute TTL is preserved;
-- partial transfer failure leaves the migration marker visible;
-- retry resumes from source's remaining keys;
-- stable owner switches only after all remaining source keys transfer successfully.
+### Parser / transport
 
-### Topology dissemination
+- `ParseValue` must not consume an incomplete nested frame;
+- nested value parsing has a bounded depth;
+- legacy and reactor engines share session-level HELLO/protocol semantics;
+- transports only encode the logical reply using the current session protocol;
+- Cluster HELLO negotiation must never bypass MOVED/ASK/CROSSSLOT routing.
 
-- gossip work is bounded by `GossipPage(start, limit)`;
-- merge prefers higher topology epoch;
-- equal epochs use a deterministic `(ownerID, migrationTarget)` tuple tie-break for slots and address tie-break for nodes;
-- this LWW rule is a teaching convergence mechanism, not distributed consensus;
-- do not claim fencing, authoritative conflict resolution, production anti-entropy or Redis Cluster bus compatibility.
-
-### Endpoint boundary
-
-- `Server.ServeCluster` is an explicit cluster-aware RESP2 endpoint;
-- the historical standalone endpoint intentionally remains outside cluster routing in v0.10;
-- authoritative cluster traffic must use the cluster facade/endpoint in tests and demos.
-
-## 10. Testing baseline
+## 11. Testing baseline
 
 Before reporting a version clean, run on the exact SHA:
 
@@ -213,28 +222,26 @@ make session-demo
 make replication-demo
 make sentinel-demo
 make cluster-demo
+make resp3-demo
 make smoke
 NETWORK_ENGINE=legacy PORT=16380 make smoke
 ```
 
-For v0.10 specifically prove:
+For v0.11 specifically prove:
 
-- CRC16/hash-tag vectors;
-- CROSSSLOT rejection before mutation;
-- stable MOVED;
-- ASK versus MOVED during migration;
-- ASKING one-shot semantics in direct and real TCP tests;
-- logical key + TTL migration;
-- source delete only after target success;
-- partial failure remains visibly migrating and retry resumes;
-- stable owner switches only after migration completion;
-- bounded gossip reconstructs topology;
-- equal-epoch gossip conflicts converge independent of arrival order;
-- all v0.8 replication and v0.9 Sentinel tests/demos remain green.
+- RESP3 native Map/Set/Boolean/Double/Null/Push encoding;
+- RESP2 downgrade of richer logical values;
+- fragmented nested value parsing at every split boundary;
+- HELLO 3 and HELLO 2 are connection-local;
+- rich command views on both legacy and reactor engines;
+- Pub/Sub Push and ordinary commands while subscribed in RESP3;
+- RESP2 historical Pub/Sub behavior remains green;
+- Cluster HELLO 3 does not bypass MOVED/ASK/CROSSSLOT;
+- all v0.8 replication, v0.9 Sentinel and v0.10 Cluster demos remain green.
 
 Do not claim a check passed unless it ran on the exact reported SHA.
 
-## 11. Documentation contract
+## 12. Documentation contract
 
 Every version keeps synchronized:
 
@@ -247,23 +254,23 @@ Every version keeps synchronized:
 
 `version.md` explains prior-version delta, mechanisms, invariants, non-goals, reading order and next dependency.
 
-## 12. Definition of Done
+## 13. Definition of Done
 
 - [ ] primary mental model explicit;
 - [ ] promised mechanism implemented;
 - [ ] invariant + error-path tests exist;
 - [ ] race/build/wire/demo/smoke validation passes;
-- [ ] persistence/replication/topology boundaries tested where changed;
+- [ ] persistence/replication/topology/protocol boundaries tested where changed;
 - [ ] docs and VERSION synchronized;
 - [ ] exact version SHA passes CI;
 - [ ] `main` fast-forwarded to same SHA;
 - [ ] same SHA passes CI on `main`;
 - [ ] next-version rationale documented.
 
-## 13. Current directive
+## 14. Current directive
 
-Freeze candidate: **v0.10 — 16384 slots, MOVED/ASK/ASKING, resumable SnapshotEntry migration and bounded topology dissemination**.
+Freeze candidate: **v0.11 — HELLO 2/3, connection-local protocol mode, richer response types, RESP2 downgrade and Pub/Sub Push**.
 
-Next milestone after exact-SHA validation: **v0.11 — RESP3 negotiation, richer types and push messages**.
+Next milestone after exact-SHA validation: **v0.12 — Observability / Performance**.
 
-Do not begin v0.11 until v0.10 branch and main are identical on one green exact SHA.
+Do not begin v0.12 until v0.11 and `main` are identical on one green exact SHA.
