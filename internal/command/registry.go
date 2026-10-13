@@ -57,6 +57,14 @@ func (r *Registry) Register(spec Spec) {
 	r.commands[name] = spec
 }
 
+// Lookup exposes immutable command metadata before execution. v0.6 uses this
+// to decide whether noeviction needs a logical rollback snapshot before a
+// potentially mutating command runs; it does not execute handlers.
+func (r *Registry) Lookup(name string) (Spec, bool) {
+	spec, ok := r.commands[strings.ToUpper(name)]
+	return spec, ok
+}
+
 func (r *Registry) Execute(ctx *Context, argv []string) Execution {
 	if len(argv) == 0 {
 		return Execution{Reply: resp.Error("ERR empty command")}

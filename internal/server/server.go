@@ -18,6 +18,7 @@ import (
 	"github.com/1998x-stack/mini-redis/internal/rdb"
 	"github.com/1998x-stack/mini-redis/internal/resp"
 	"github.com/1998x-stack/mini-redis/internal/store"
+	"github.com/1998x-stack/mini-redis/internal/store/memorypolicy"
 )
 
 type Server struct {
@@ -27,8 +28,9 @@ type Server struct {
 	aof      *aof.Log
 	logger   *slog.Logger
 
-	// persistenceMu names the v0.5 state/AOF boundary. A command's Store mutation
-	// and AOF append happen under the same lock relative to rewrite snapshotting.
+	// persistenceMu names the v0.5 state/AOF boundary. v0.6 also keeps one
+	// command, its memory-pressure decision and eviction DEL persistence inside
+	// this boundary so the legacy and reactor engines observe the same ordering.
 	persistenceMu sync.Mutex
 
 	stateMu        sync.RWMutex
@@ -52,10 +54,8 @@ func New(cfg config.Config, st store.Store, registry *command.Registry, logger *
 
 	s := &Server{cfg: cfg, store: st, registry: registry, logger: logger}
 
-	// Startup policy is deliberately explicit: when AOF is enabled it is the
-	// authoritative source and RDB is ignored. When AOF is disabled, an existing
-	// RDB is loaded; a missing RDB means an empty database. Corrupt/incompatible
-	// RDB and invalid complete AOF commands fail startup.
+	// Recovery happens before installing the runtime memory-policy wrapper. LRU
+	// and LFU heat are deliberately not reconstructed from AOF history or RDB.
 	if cfg.AppendOnly {
 		log, err := aof.Open(cfg.AppendFilename, cfg.AppendFsync)
 		if err != nil {
@@ -70,6 +70,17 @@ func New(cfg config.Config, st store.Store, registry *command.Registry, logger *
 		if err := s.loadRDBIfPresent(); err != nil {
 			return nil, err
 		}
+	}
+
+	if cfg.MaxMemory > 0 {
+		managed, err := memorypolicy.New(s.store, cfg.MemoryConfig(store.RealClock{}))
+		if err != nil {
+			if s.aof != nil {
+				_ = s.aof.Close()
+			}
+			return nil, fmt.Errorf("configure memory policy: %w", err)
+		}
+		s.store = managed
 	}
 	return s, nil
 }
@@ -114,9 +125,6 @@ func (s *Server) replayAOF() error {
 	})
 }
 
-// SaveRDB performs the v0.5 blocking reference snapshot. Memory.Snapshot owns
-// its Store lock while extracting logical state; file publication is then done
-// through fsync + atomic rename without serializing private encodings.
 func (s *Server) SaveRDB() error {
 	if s.cfg.RDBFilename == "" {
 		return errors.New("RDB filename is empty")
@@ -132,9 +140,6 @@ func (s *Server) SaveRDB() error {
 	return rdb.SaveFile(s.cfg.RDBFilename, entries)
 }
 
-// RewriteAOF compacts history into a logical snapshot command stream. The
-// persistence lock makes snapshot -> BeginRewrite a gap-free boundary; later
-// mutations are appended to the old AOF and buffered into the new one.
 func (s *Server) RewriteAOF() error {
 	if s.aof == nil {
 		return errors.New("AOF is disabled")
@@ -166,10 +171,6 @@ func (s *Server) RewriteAOF() error {
 	return nil
 }
 
-// ListenAndServe chooses the requested network engine. On Linux, auto selects
-// the v0.2 epoll reactor. On other platforms, auto keeps the v0.1 legacy path
-// so the project remains runnable while the Linux event-loop mechanism stays
-// explicit and inspectable.
 func (s *Server) ListenAndServe(ctx context.Context) error {
 	s.stateMu.Lock()
 	if s.started {
@@ -206,17 +207,63 @@ func (s *Server) executeCommand(argv []string) resp.Value {
 	s.persistenceMu.Lock()
 	defer s.persistenceMu.Unlock()
 
-	result := s.registry.Execute(&command.Context{Store: s.store}, argv)
-	if s.aof != nil {
-		persist := result.AOFCommands(time.Now())
-		if len(persist) > 0 {
-			// Append before acknowledging the mutation. v0.5 additionally keeps
-			// this command mutation + append inside persistenceMu relative to AOF
-			// rewrite snapshot boundaries.
-			if err := s.aof.AppendBatch(persist); err != nil {
-				s.logger.Error("AOF append failed", "error", err)
-				return resp.Error("MISCONF AOF persistence failed")
+	var (
+		controller     store.MemoryController
+		rollbackStore  store.Snapshotter
+		rollbackState  []store.SnapshotEntry
+		memoryManaged  bool
+	)
+	if c, ok := s.store.(store.MemoryController); ok {
+		controller = c
+		memoryManaged = c.MemoryPolicyConfig().MaxBytes > 0
+	}
+
+	// noeviction must fail without a partially applied logical mutation. The
+	// educational reference path uses the already-established v0.5 logical
+	// snapshot boundary for rollback. Production Redis uses tighter internal
+	// accounting; here correctness and a visible atomicity boundary come first.
+	if memoryManaged && len(argv) > 0 && controller.MemoryPolicyConfig().Policy == store.PolicyNoEviction {
+		if spec, ok := s.registry.Lookup(argv[0]); ok && spec.Mutating {
+			var err error
+			rollbackStore, err = s.snapshotter()
+			if err != nil {
+				return resp.Error("ERR memory policy requires logical snapshots")
 			}
+			rollbackState, err = rollbackStore.Snapshot()
+			if err != nil {
+				return resp.Error("ERR failed to capture memory rollback state")
+			}
+		}
+	}
+
+	result := s.registry.Execute(&command.Context{Store: s.store}, argv)
+	persist := result.AOFCommands(time.Now())
+
+	if memoryManaged && result.Runnable && result.Spec.Mutating && !result.Reply.IsError() {
+		pressure, err := controller.EnforceMaxMemory()
+		if err != nil {
+			if rollbackStore != nil {
+				if restoreErr := rollbackStore.RestoreSnapshot(rollbackState); restoreErr != nil {
+					s.logger.Error("restore after maxmemory failure", "error", restoreErr)
+					return resp.Error("MISCONF failed to rollback maxmemory rejection")
+				}
+			}
+			if errors.Is(err, store.ErrOOM) {
+				return resp.Error("OOM command not allowed when used memory > 'maxmemory'")
+			}
+			s.logger.Error("maxmemory enforcement failed", "error", err)
+			return resp.Error("ERR maxmemory enforcement failed")
+		}
+		if len(pressure.EvictedKeys) > 0 {
+			del := append([]string{"DEL"}, pressure.EvictedKeys...)
+			persist = append(persist, del)
+		}
+	}
+
+	if s.aof != nil && len(persist) > 0 {
+		if err := s.aof.AppendBatch(persist); err != nil {
+			s.logger.Error("AOF append failed", "error", err)
+			return resp.Error("MISCONF AOF persistence failed")
 		}
 	}
 	return result.Reply
