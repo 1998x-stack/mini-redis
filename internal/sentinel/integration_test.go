@@ -1,16 +1,22 @@
 package sentinel
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/1998x-stack/mini-redis/internal/command"
 	"github.com/1998x-stack/mini-redis/internal/config"
+	"github.com/1998x-stack/mini-redis/internal/resp"
 	"github.com/1998x-stack/mini-redis/internal/server"
 	"github.com/1998x-stack/mini-redis/internal/store"
 	"github.com/1998x-stack/mini-redis/internal/store/versionedmemory"
@@ -83,30 +89,74 @@ func waitSentinel(t *testing.T, timeout time.Duration, what string, fn func() bo
 	t.Fatalf("timeout waiting for %s", what)
 }
 
-func directSet(t *testing.T, srv *server.Server, key, value string) {
-	t.Helper()
-	conn, err := netDial(srv.Addr().String())
+func sendTestCommand(addr string, argv []string) (string, error) {
+	conn, err := net.DialTimeout("tcp", addr, 250*time.Millisecond)
 	if err != nil {
-		t.Fatal(err)
+		return "", err
 	}
 	defer conn.Close()
-	if err := writeCommand(conn, []string{"SET", key, value}); err != nil {
-		t.Fatal(err)
+	_ = conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
+	if _, err := conn.Write(resp.EncodeCommand(argv)); err != nil {
+		return "", err
+	}
+	reader := bufio.NewReader(conn)
+	prefix, err := reader.ReadByte()
+	if err != nil {
+		return "", err
+	}
+	readLine := func() (string, error) {
+		line, err := reader.ReadString('\n')
+		line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+		return line, err
+	}
+	switch prefix {
+	case '+', ':':
+		return readLine()
+	case '-':
+		line, _ := readLine()
+		return "", errors.New(line)
+	case '$':
+		line, err := readLine()
+		if err != nil {
+			return "", err
+		}
+		n, err := strconv.Atoi(line)
+		if err != nil {
+			return "", err
+		}
+		if n < 0 {
+			return "", nil
+		}
+		payload := make([]byte, n+2)
+		if _, err := io.ReadFull(reader, payload); err != nil {
+			return "", err
+		}
+		if payload[n] != '\r' || payload[n+1] != '\n' {
+			return "", errors.New("malformed bulk reply")
+		}
+		return string(payload[:n]), nil
+	default:
+		return "", fmt.Errorf("unexpected RESP prefix %q", prefix)
 	}
 }
 
-func directGet(t *testing.T, srv *server.Server, key string) string {
+func directSet(t *testing.T, srv *server.Server, key, value string) {
 	t.Helper()
-	conn, err := netDial(srv.Addr().String())
+	got, err := sendTestCommand(srv.Addr().String(), []string{"SET", key, value})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
-	value, err := roundTripBulk(conn, []string{"GET", key})
-	if err != nil {
-		t.Fatal(err)
+	if got != "OK" {
+		t.Fatalf("SET reply=%q", got)
 	}
-	return value
+}
+
+func tryGet(srv *server.Server, key string) (string, bool) {
+	if srv.Addr() == nil {
+		return "", false
+	}
+	value, err := sendTestCommand(srv.Addr().String(), []string{"GET", key})
+	return value, err == nil
 }
 
 func TestSentinelFailoverReusesReplicationAndRepairsOldPrimary(t *testing.T) {
@@ -125,7 +175,9 @@ func TestSentinelFailoverReusesReplicationAndRepairsOldPrimary(t *testing.T) {
 	r2 := startSentinelNode(t, "r2", r2Cfg)
 
 	waitSentinel(t, 3*time.Second, "initial replica convergence", func() bool {
-		return directGet(t, r1.node.Server, "seed") == "1" && directGet(t, r2.node.Server, "seed") == "1"
+		v1, ok1 := tryGet(r1.node.Server, "seed")
+		v2, ok2 := tryGet(r2.node.Server, "seed")
+		return ok1 && ok2 && v1 == "1" && v2 == "1"
 	})
 	waitSentinel(t, 2*time.Second, "replication offsets converge", func() bool {
 		_, _, pOffset := p.node.Server.ReplicationState()
@@ -172,7 +224,8 @@ func TestSentinelFailoverReusesReplicationAndRepairsOldPrimary(t *testing.T) {
 
 	directSet(t, r1.node.Server, "after-failover", "2")
 	waitSentinel(t, 3*time.Second, "surviving replica converges", func() bool {
-		return directGet(t, r2.node.Server, "after-failover") == "2"
+		value, ok := tryGet(r2.node.Server, "after-failover")
+		return ok && value == "2"
 	})
 
 	isolateOldPrimary.Store(false)
@@ -181,11 +234,14 @@ func TestSentinelFailoverReusesReplicationAndRepairsOldPrimary(t *testing.T) {
 	}
 	waitSentinel(t, 3*time.Second, "old primary rejoins new topology", func() bool {
 		topology := p.node.Server.ReplicationTopology()
-		return topology.Role == config.ReplicationReplica && topology.Upstream == newUpstream && directGet(t, p.node.Server, "after-failover") == "2"
+		value, ok := tryGet(p.node.Server, "after-failover")
+		return topology.Role == config.ReplicationReplica && topology.Upstream == newUpstream && ok && value == "2"
 	})
 
 	directSet(t, r1.node.Server, "post-repair", "3")
 	waitSentinel(t, 3*time.Second, "all replicas converge after repair", func() bool {
-		return directGet(t, p.node.Server, "post-repair") == "3" && directGet(t, r2.node.Server, "post-repair") == "3"
+		vp, okp := tryGet(p.node.Server, "post-repair")
+		v2, ok2 := tryGet(r2.node.Server, "post-repair")
+		return okp && ok2 && vp == "3" && v2 == "3"
 	})
 }
