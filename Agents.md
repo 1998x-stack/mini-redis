@@ -9,26 +9,12 @@ mini-redis is an educational Redis implementation in Go. Optimize for architectu
 Do not optimize for full Redis compatibility, production hardening, source-code imitation or feature count.
 
 ```text
-one version
-   ↓
-one primary mental model
-   ↓
-small explicit mechanism
-   ↓
-invariant tests
-   ↓
-end-to-end demonstration
+one version → one primary mental model → explicit mechanism → invariant tests → demo
 ```
 
 ## 2. Mandatory reading order
 
-On `main`:
-
-1. `Agents.md`
-2. `Plan.md`
-3. `version.md`
-4. `docs/ARCHITECTURE.md`
-5. relevant source/tests
+On `main`: `Agents.md` → `Plan.md` → `version.md` → `docs/ARCHITECTURE.md` → relevant source/tests.
 
 On `v0.x`: read `Agents.md`, then `version.md`, then subsystem docs/source/tests. Historical branches must not absorb later mechanisms.
 
@@ -43,6 +29,7 @@ main ─────────────────────────
  ├── v0.3 Dict/rehash
  ├── v0.4 collections/encodings
  ├── v0.5 RDB/AOF rewrite
+ ├── v0.6 memory pressure/eviction
  └── ...
 ```
 
@@ -57,17 +44,15 @@ RESP
       ↓
 command registry / semantics
       ↓
-Store contract
+server ordering + persistence boundary
       ↓
-Object{Type,Encoding,payload}
+memorypolicy.Manager          # runtime-only policy
       ↓
-Dict / collection encodings / TTL
+Store / Object / TTL / Dict
       ↓
 logical state / SnapshotEntry
       ↓
 AOF / RDB
-      ↓
-future memory-pressure / replication layers
 ```
 
 Rules:
@@ -78,85 +63,61 @@ Rules:
 - Store owns atomic value/TTL invariants;
 - Dict/SkipList implement mechanisms, not command policy;
 - persistence serializes logical state/history, never unstable Go memory layout;
-- later eviction policy must not become persistence-format state.
+- eviction heat/counters are runtime policy state and never persistence-format state.
 
-## 5. Version scope discipline
+## 5. Scope discipline
 
-Before adding anything ask:
-
-1. Does it explain this version's primary question?
-2. Is it needed by an acceptance criterion?
-3. Is it a dependency of the mechanism?
-4. Does it prematurely hide a more fundamental lesson?
-
-Record later work in `Plan.md`; do not smuggle it into the current version.
+Before adding anything ask whether it teaches the current mental model, is required by acceptance criteria, is a direct dependency, or hides a more fundamental lesson. Record later work in `Plan.md`; do not smuggle it into the current version.
 
 ## 6. Concurrency / atomicity
 
-- v0.1 legacy transport: one goroutine/client, Memory mutex.
-- v0.2+ reactor: client I/O/parse/output state belongs to one event-loop owner.
-- Memory mutex remains the Store synchronization boundary because the legacy engine still shares it.
-- Collection read-modify-write is one Store operation.
-- From v0.5, `Server.persistenceMu` names the command mutation + AOF append boundary relative to logical snapshot + rewrite start.
-- AOF `Log.mu` owns live file descriptor, rewrite buffer and final descriptor swap.
-- Never claim atomicity without naming the lock/file-system boundary that enforces it.
+- legacy transport: one goroutine/client with Memory mutex;
+- reactor: client I/O/parse/output state belongs to one event-loop owner;
+- collection read-modify-write is one Store operation;
+- `Server.persistenceMu` orders command mutation/AOF append against snapshot/rewrite start and v0.6 memory-pressure decisions;
+- AOF `Log.mu` owns the live descriptor, rewrite buffer and descriptor swap;
+- never claim atomicity without naming the lock/file-system boundary.
 
-## 7. Dictionary rule
+## 7. Dictionary / object rules
 
-The custom Dict is the canonical keyspace mechanism from v0.3 onward.
-
-Invariant requirements:
-
-- lookup/update/delete work while rehashing;
+- custom Dict remains the canonical top-level keyspace;
+- lookup/update/delete work during rehash;
 - no logical duplicate across `ht[0]/ht[1]`;
-- one `RehashStep(N)` has bounded work;
-- server schedules only through the optional `RehashStepper` boundary.
+- `RehashStep(N)` has bounded explicit work;
+- logical Type stays separate from physical Encoding;
+- representation changes preserve logical results and TTL.
 
-Do not silently replace it with Go map in the keyspace.
+## 8. Persistence rules
 
-## 8. Object/encoding rules
+Established through v0.5:
 
-From v0.4 onward, distinguish logical type from physical encoding.
+- only successful acknowledged mutations enter AOF;
+- relative TTL persists as absolute deadline;
+- `SnapshotEntry` is the stable logical state boundary;
+- RDB validates magic/version/length/checksum;
+- publication is temp → file fsync → atomic rename → directory fsync;
+- rewrite buffers every acknowledged mutation after the snapshot boundary;
+- AOF is authoritative at startup when enabled;
+- truncated final AOF frame is tolerated; corrupt/incompatible RDB fails startup.
 
-```text
-String : int/raw
-List   : listpack/quicklist
-Hash   : listpack/hashtable
-Set    : intset/hashtable
-ZSet   : listpack/skiplist
-```
+Any new runtime metadata must justify whether it is logical durable state. LRU/LFU heat is explicitly not durable.
 
-Requirements:
+## 9. Memory-pressure rules
 
-- commands validate Type, not payload implementation;
-- representation conversion preserves logical results and TTL;
-- `OBJECT ENCODING` may expose encoding for learning;
-- compact thresholds are policy, not public semantics;
-- do not serialize Go-private payload structures as persistence format.
+From v0.6:
 
-## 9. Persistence rules
-
-Established v0.1-v0.5 invariants:
-
-- only successful mutations are appended to AOF;
-- relative TTL persists as an absolute deadline;
-- `write()` is not equivalent to durable storage;
-- restart/replay must not resurrect expired state;
-- `SnapshotEntry` is the stable logical state boundary for state persistence;
-- RDB-like files include explicit magic/version/length/checksum validation;
-- RDB serialization must cover every value accepted by current command semantics;
-- persistence publication uses same-directory temp → file fsync → atomic rename → directory fsync;
-- failure before rename must leave the old persistence file intact;
-- AOF rewrite emits logical reconstruction commands, not physical encodings;
-- writes after the rewrite snapshot boundary must also enter the rewrite buffer;
-- when AOF is enabled it is authoritative at startup; RDB is loaded only when AOF is disabled;
-- truncated final AOF frames are ignored; corrupt/incompatible RDB fails startup.
-
-For future persistence changes, test corruption, crash windows, fsync boundaries, restart state and interactions with new logical types.
+- expiration is time validity; eviction is memory-pressure policy;
+- logical byte estimates are deterministic teaching estimates, not heap/RSS claims;
+- `noeviction` rejection cannot leave a partial logical mutation or AOF record;
+- removal-only commands remain usable above the limit;
+- one eviction removes value + expiry + runtime access metadata together;
+- random/LRU/LFU use bounded candidate scoring per victim selection;
+- sampled LRU/LFU do not maintain a globally sorted exact policy structure;
+- eviction is persisted as logical `DEL`, but LRU/LFU metadata is never serialized.
 
 ## 10. Testing baseline
 
-Before reporting a version clean, run on the exact code:
+Before reporting a version clean, run on the exact commit:
 
 ```bash
 gofmt -d .
@@ -166,59 +127,28 @@ go build ./cmd/mini-redis-server
 make rehash-demo
 make encodings-demo
 make persistence-demo
+make eviction-demo
 make smoke
 NETWORK_ENGINE=legacy PORT=16380 make smoke
 ```
 
-Add mechanism-specific tests, not only happy-path commands. Examples:
-
-- forced hash collision during rehash;
-- compact→general conversion with same logical results;
-- SkipList order/rank against a sorted reference;
-- `WRONGTYPE` errors and TTL survival;
-- logical snapshot round-trip independent of encoding;
-- corrupt/version-mismatched snapshot rejection;
-- crash before rename preserving old file;
-- post-snapshot AOF rewrite mutations preserved;
-- persistence restart/recovery.
-
-Do not claim a check passed unless it ran on the exact reported SHA.
+Mechanism tests are mandatory: collisions/rehash, encoding conversion, SkipList rank, TTL, persistence crash/recovery, expiration-vs-eviction, noeviction rollback/AOF invariance, bounded LRU/LFU sampling and restart state after eviction.
 
 ## 11. Documentation contract
 
-Every version must keep synchronized:
-
-- `Agents.md`
-- `Plan.md`
-- `version.md`
-- `docs/ARCHITECTURE.md`
-- README when user-visible behavior changes
-- CHANGELOG / VERSION
-
-`version.md` must explain what changed relative to the prior version, why, critical invariants, non-goals and the next dependency.
+Every version keeps `Agents.md`, `Plan.md`, `version.md`, `docs/ARCHITECTURE.md`, README, CHANGELOG and VERSION synchronized.
 
 ## 12. Commit discipline
 
-Prefer coherent architectural commits such as:
-
-```text
-feat(store): add logical snapshot boundary
-feat(rdb): add checksummed crash-safe logical snapshots
-feat(aof): add buffered crash-safe rewrite
-feat(server): integrate RDB startup and coordinated AOF rewrite
-test(persistence): add recovery invariant coverage
-docs: document v0.5 persistence boundary
-```
-
-Do not commit binaries, AOF/RDB runtime files, profiles or generated temporary data.
+Prefer coherent architectural commits. Do not commit runtime AOF/RDB files, binaries, benchmark profiles or temporary data. Do not rewrite unrelated historical mechanisms merely to make the current version look cleaner.
 
 ## 13. Definition of Done
 
 - [ ] primary mental model explicit;
 - [ ] promised mechanism implemented;
 - [ ] invariant/error-path tests exist;
-- [ ] race/build/smoke validation passes;
-- [ ] persistence recovery tested when changed;
+- [ ] race/build/demos/smoke pass;
+- [ ] persistence interaction tested when changed;
 - [ ] version/docs synchronized;
 - [ ] exact version SHA passes CI;
 - [ ] `main` fast-forwarded to same SHA;
@@ -227,16 +157,16 @@ Do not commit binaries, AOF/RDB runtime files, profiles or generated temporary d
 
 ## 14. Current directive
 
-Current milestone after integration: **v0.5 — logical snapshot boundary, RDB-like state persistence and buffered AOF rewrite**.
+Current milestone after integration: **v0.6 — approximate maxmemory accounting, expiration vs eviction, random/sampled LRU/sampled LFU policies**.
 
-Next milestone: **v0.6 — expiration vs maxmemory eviction, approximate memory accounting and sampled LRU/LFU**.
+Next milestone: **v0.7 — MULTI/EXEC/DISCARD, WATCH/UNWATCH and basic Pub/Sub**.
 
-For v0.6:
+For v0.7:
 
-1. preserve all v0.5 persistence semantics;
-2. keep expiration and eviction conceptually separate;
-3. establish memory accounting before policy complexity;
-4. make victim sampling bounded and testable with injected randomness/time;
-5. remove value + expiry metadata together;
-6. ensure `noeviction` failures cannot leave partial mutations;
-7. do not begin transactions or replication yet.
+1. preserve v0.6 memory/persistence behavior;
+2. define per-client transaction state outside Store values;
+3. validate queued command syntax before EXEC while deferring execution;
+4. add key versioning for optimistic WATCH conflicts;
+5. make EXEC one explicit ordered server boundary and define AOF behavior;
+6. model Pub/Sub connection state explicitly;
+7. do not begin replication yet.

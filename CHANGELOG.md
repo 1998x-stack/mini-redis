@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.6.0
+
+Architecture milestone: separate time-based expiration from pressure-based eviction and make sampled cache policies explicit.
+
+- add deterministic logical-byte memory estimation distinct from Go heap/RSS;
+- add runtime `memorypolicy.Manager` above the durable Store;
+- add `-maxmemory`, `-maxmemory-policy`, `-maxmemory-samples`, `-lfu-decay` and deterministic `-eviction-seed`;
+- implement `noeviction`, `allkeys-random`, sampled `allkeys-lru` and sampled `allkeys-lfu`;
+- add runtime last-access metadata and probabilistic LFU counters with time decay;
+- clean expired keys before pressure eviction and count them separately;
+- add logical snapshot rollback for rejected noeviction memory-growing commands;
+- keep removal-only commands usable above a noeviction limit;
+- persist selected evictions as logical AOF `DEL` commands;
+- keep LRU/LFU heat outside RDB/AOF and reset it on restore;
+- add deterministic policy, AOF restart and sampling-bound tests;
+- add `make eviction-demo` and CI coverage.
+
 ## v0.5.0
 
 Architecture milestone: make logical state serialization, snapshot persistence, AOF compaction and crash-safe file replacement explicit.
@@ -12,41 +29,22 @@ Architecture milestone: make logical state serialization, snapshot persistence, 
 - publish RDB and rewritten AOF files through same-directory temp file, file `fsync`, atomic rename and directory `fsync`;
 - add compact AOF rewrite from current logical state instead of replay history;
 - buffer mutations after the rewrite snapshot boundary and append them before the replacement AOF is published;
-- add a named server `persistenceMu` boundary around command mutation + AOF append versus snapshot + rewrite start;
 - define startup precedence: AOF is authoritative when enabled; RDB is loaded only when AOF is disabled;
-- retain the explicit truncated-final-AOF-command recovery policy and fail startup on corrupt/incompatible RDB;
-- add `Server.SaveRDB`, `Server.RewriteAOF`, recovery/crash-window tests and `make persistence-demo`;
-- keep persistence independent of quicklist, Dict bucket, intset and SkipList memory layout.
+- add persistence recovery/crash-window tests and `make persistence-demo`.
 
 ## v0.4.0
 
-Architecture milestone: make Redis logical data types and adaptive physical encodings explicit.
-
 - add List, Hash, Set and Sorted Set logical object types;
-- add `listpack`, `quicklist`, `hashtable`, `intset` and `skiplist` teaching encodings;
-- add a span-aware probabilistic SkipList with deterministic `(score, member)` ordering;
-- add List commands: `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LLEN`, `LRANGE`;
-- add Hash commands: `HSET`, `HGET`, `HDEL`, `HLEN`, `HGETALL`;
-- add Set commands: `SADD`, `SREM`, `SISMEMBER`, `SMEMBERS`, `SCARD`;
-- add ZSet commands: `ZADD`, `ZSCORE`, `ZRANK`, `ZRANGE`, `ZREM`;
-- add Redis-style `WRONGTYPE` checks;
-- keep collection mutations atomic inside Store and preserve TTL metadata;
-- delete key + expiry when a collection becomes empty;
-- add one-way compact→general encoding conversions with an educational threshold of eight entries;
-- add `make encodings-demo` and collection-aware smoke tests for both reactor and legacy engines;
-- keep AOF representation command-oriented and independent of physical encodings.
+- add adaptive listpack/quicklist/hashtable/intset/skiplist teaching encodings;
+- add span-aware SkipList, WRONGTYPE and atomic TTL-preserving collection mutation;
+- add core collection commands and `make encodings-demo`.
 
 ## v0.3.0
 
-Architecture milestone: make Redis' central dictionary and object encoding visible.
-
-- add generic educational `internal/dict` with explicit buckets and separate chaining;
-- add `ht[0]` / `ht[1]`, load-factor resize policy and bounded entry-level incremental rehash;
-- replace keyspace and expiry Go maps with independent Dict instances;
-- add timer-driven + opportunistic rehash;
-- evolve Object into logical `Type` + physical `Encoding` + payload;
-- add raw/canonical-int String encodings and `OBJECT ENCODING`;
-- add forced-collision rehash demo and randomized reference-model tests.
+- add explicit buckets/collision chains and bounded incremental rehash;
+- replace top-level Go maps with custom Dict;
+- add Object Type/Encoding and String raw/int encodings;
+- add `OBJECT ENCODING` and rehash demo/tests.
 
 ## v0.2.0
 

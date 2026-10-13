@@ -1,4 +1,4 @@
-# Architecture — v0.5
+# Architecture — v0.6
 
 ## 1. Current stack
 
@@ -9,271 +9,162 @@ RESP2 + reactor/legacy transport
       ↓
 command.Registry
       ↓
-store.Store
+Server.persistenceMu
+      ↓
+memorypolicy.Manager
       ↓
 versionedmemory.Memory
       ├── keyspace Dict[string → Object]
       └── expires  Dict[string → deadline]
                     │
                     ▼
-            Object{Type, Encoding, payload}
-                    │
-                    ▼
-              logical state
-                    │
-             SnapshotEntry[]
+            logical SnapshotEntry[]
                ┌────┴────┐
                ▼         ▼
-              RDB       AOF rewrite
+              RDB       AOF
 ```
 
-v0.5 adds persistence below logical state while keeping protocol, command semantics and physical collection encodings independent.
+v0.6 inserts runtime memory policy above the durable Store without changing the logical persistence representation.
 
-## 2. Why a new serialization boundary?
+## 2. Why not put LRU/LFU inside Object?
 
-Directly serializing the v0.4 payload would make disk compatibility depend on implementation accidents:
+Doing so would blur two layers:
 
 ```text
-bad persistence boundary:
-quickNode pointers
-Dict bucket count
-rehashIndex
-SkipList random levels/spans
+logical durable state: key, type, value, expiry
+runtime policy state: last access, LFU heat, sampling counters
 ```
 
-Instead `SnapshotEntry` contains only stable meaning:
+`memorypolicy.Manager` wraps the Store, while `Snapshot()` simply delegates to the underlying logical store. `RestoreSnapshot()` deliberately clears access metadata.
+
+Therefore restart preserves data but not historical access heat.
+
+## 3. Approximate memory accounting
+
+v0.6 estimates bytes from logical `SnapshotEntry` values plus small fixed teaching overheads for key/object/expiry/access metadata.
+
+This yields deterministic tests and demos. It does **not** equal Go allocator bytes, heap profiles or process RSS. Exact allocator accounting is intentionally deferred.
+
+## 4. Expiration vs eviction
 
 ```text
-Key
-Type
-logical values
-absolute expiry deadline
+expiration
+  cause: deadline passed
+  meaning: key is no longer valid
+
+ eviction
+  cause: used estimate > maxmemory
+  meaning: a still-valid key is sacrificed by policy
 ```
 
-Therefore:
+Pressure enforcement runs full expiry cleanup first. Expired keys are counted separately and are never reported as policy victims.
 
-```text
-process A: List encoded as quicklist
-              ↓ snapshot
-       logical [a,b,c,...]
-              ↓ restore
-process B: current policy chooses any valid List encoding
-```
+## 5. Policy model
 
-Logical equality, not pointer/layout equality, is the persistence invariant.
+### noeviction
 
-## 3. Snapshot extraction and restoration
+Memory-growing commands execute behind `Server.persistenceMu` with a pre-command logical snapshot available for rollback. If the result remains over maxmemory, the snapshot is restored, OOM is returned, and the rejected command never reaches AOF.
 
-`Memory.Snapshot()` holds the Memory lock while establishing a point-in-time state view. It first removes already-expired entries, then walks sorted keys and exports logical values.
+Removal-only mutations remain usable above the limit.
 
-`RestoreSnapshot()` constructs fresh top-level Dicts and rebuilds each value through normal object constructors/mutators. Expired absolute deadlines are skipped rather than restored.
+### allkeys-random
 
-This design intentionally makes restoration an encoding-policy decision rather than a disk-format decision.
+Choose one live key uniformly from the current candidate set.
 
-## 4. RDB-like file format
+### sampled LRU
 
-The project-specific v1 format is:
+Select at most `maxmemory-samples` candidates for one victim decision and choose the oldest `lastAccess` among them.
 
-```text
-0                                         N
-+------+---------+-------------+-----------+------+
-| MRDB | version | payload len | payload   | CRC  |
-+------+---------+-------------+-----------+------+
- 4 B      u16        u64         bytes      u32
-```
+No global exact LRU linked list/tree is maintained.
 
-The payload is canonical logical data. Keys, Hash fields, Set members and ZSet entries are placed in deterministic order. ZSet scores are wire strings parsed back to `float64`; this preserves finite values and infinities without relying on JSON's unsupported infinite numeric literals.
+### sampled LFU
 
-CRC32 is educational corruption detection, not authentication.
+Use the same bounded candidate sample, but prefer the lowest decayed frequency. The counter is 8-bit and increments probabilistically: hotter values become harder to increment. Elapsed decay periods reduce stale heat.
 
-## 5. Atomic persistence publication
+The exact constants are educational equivalents, not claims of production Redis tuning.
 
-The final path must never intentionally expose an in-progress file:
+## 6. Sampling boundary
 
-```text
-OLD VALID TARGET
-      │
-      │         create .target.tmp-XYZ
-      │                   ↓
-      │                  write
-      │                   ↓
-      │                fsync(file)
-      │                   ↓
-      └────────────── atomic rename
-                          ↓
-                     fsync(directory)
-                          ↓
-                    NEW VALID TARGET
-```
+The implementation may enumerate logical keys to construct the educational candidate set, but **scoring/comparison work for one victim selection is bounded by the configured sample count**. This is the explicit v0.6 bounded-work claim.
 
-Failure before rename means readers still see the old target. The temp file is best-effort cleaned up. The directory `fsync` exists because persisting file contents and persisting the renamed directory entry are separate durability concerns.
+Later performance versions may make candidate discovery itself more incremental.
 
-This models the Unix/Linux durability path used by this educational implementation.
+## 7. Server / persistence ordering
 
-## 6. Why AOF rewrite is necessary
-
-AOF stores mutation history:
-
-```text
-SET k 1
-SET k 2
-SET k 3
-DEL other
-SET k 4
-```
-
-Current logical state may require only:
-
-```text
-SET k 4
-```
-
-`persistence.Commands()` converts `SnapshotEntry[]` into a reconstruction stream using existing commands. Absolute expiry uses `PEXPIREAT`, never a relative duration.
-
-The rewrite therefore compacts **history → sufficient state reconstruction**.
-
-## 7. Rewrite concurrency boundary
-
-A naive implementation has a lost-write window:
-
-```text
-snapshot S0
-          ← mutation happens here and is not in S0
-start buffering
-```
-
-v0.5 closes that gap with `Server.persistenceMu`:
+For a successful memory-growing command under an eviction policy:
 
 ```text
 lock persistenceMu
-  Snapshot S0
-  AOF.BeginRewrite()      # buffering becomes active
-unlock persistenceMu
+   ↓
+execute logical mutation
+   ↓
+expire invalid keys
+   ↓
+if over limit: sample + evict complete live keys
+   ↓
+build AOF batch:
+  original mutation
+  DEL victim...
+   ↓
+append batch
+   ↓
+unlock / acknowledge
 ```
 
-Every normal command executes its Store mutation and AOF append while holding the same server lock. Therefore no command can cross the snapshot/buffer boundary invisibly.
+For `noeviction`, an OOM path restores the pre-command logical snapshot before returning and does not append the rejected mutation.
 
-After buffering begins, command `C` is represented twice temporarily:
+This reference implementation favors a visible correctness boundary over efficient pre-admission byte deltas.
 
-```text
-C → old/live AOF      # preserves current durability path
-C → rewrite buffer    # preserves replacement correctness
-```
+## 8. Eviction and key metadata
 
-The compact base is written to a temp file without holding the AOF mutex. Final commit briefly locks the AOF:
+Eviction calls the normal Store delete path, so value and expiry dictionary entries disappear together. The wrapper also removes its access metadata for that key.
 
-```text
-append rewriteBuffer to temp
-fsync(temp)
-rename(temp, AOF)
-swap live file descriptor
-fsync(directory)
-```
+Incremental Dict rehash invariants therefore remain owned by the existing Store rather than being reimplemented by the policy layer.
 
-After that, new appends go only to the replacement AOF.
+## 9. Persistence interaction
 
-## 8. Crash windows
+AOF needs to persist eviction because eviction changes logical state. The server emits `DEL` for selected victims after the triggering mutation.
 
-### Before temp creation / during base generation
+RDB and AOF do not persist LRU/LFU metadata. On recovery, base logical state is restored/replayed first; only then is the memory-policy wrapper installed.
 
-Old AOF/RDB remains authoritative.
+That ordering prevents replaying historical commands from accidentally manufacturing access heat.
 
-### Temp partially written
+## 10. Failure and edge cases
 
-Old target remains untouched; temp is not published.
+- a rejected noeviction command restores logical state and does not change AOF;
+- reads never trigger eviction;
+- removal-only writes remain available above a noeviction limit;
+- if expiry alone frees enough memory, no live key is evicted;
+- restored keys without fresh access metadata are naturally considered cold when sampled after startup;
+- AOF failure after an already-applied acknowledged-path mutation remains the existing educational durability limitation and is not hidden by v0.6.
 
-### Temp complete but before rename
-
-Old target remains untouched. Tests inject failure exactly here.
-
-### After rename
-
-The replacement is the visible file. The code then synchronizes the parent directory to make the renamed entry durable under the target filesystem model.
-
-The implementation does not claim to simulate every storage-device failure mode; it teaches the file-publication boundary explicitly.
-
-## 9. Startup precedence
-
-Startup avoids ambiguous merging:
-
-```text
-appendonly=true
-      ↓
-replay AOF only
-(RDB ignored)
-
-appendonly=false
-      ↓
-RDB exists? ── no ─► empty DB
-      │ yes
-      ▼
-validate magic/version/length/checksum
-      ↓
-restore logical snapshot
-```
-
-A complete invalid AOF command fails replay. A truncated final AOF frame is ignored as the explicit crash-tail policy inherited from v0.1. Corrupt/incompatible RDB does not silently turn into an empty database.
-
-## 10. TTL correctness
-
-TTL crosses persistence only as an absolute Unix-millisecond deadline:
-
-```text
-now=100s
-EXPIRE key 60
-absolute deadline=160s
-       ↓ persistence / downtime
-restart at 140s
-       ↓
-remaining ≈20s, NOT 60s
-```
-
-If restart happens after 160s, restoration/replay removes or skips the expired state. Downtime cannot extend key lifetime.
-
-## 11. RDB and AOF roles
-
-```text
-RDB
-  state snapshot
-  compact restart input
-  periodic work concentration
-
-AOF
-  mutation history
-  append-oriented durability path
-  grows with redundant history
-
-AOF rewrite
-  converts history back into compact state reconstruction
-```
-
-v0.5 deliberately keeps both visible because the learning goal is their trade-off, not hiding them behind one persistence abstraction.
-
-## 12. Testing and demo
+## 11. Demo
 
 ```bash
-make persistence-demo
+make eviction-demo
 ```
 
-The demo shows:
+It demonstrates:
 
-- logical state saved and restored through RDB;
-- redundant AOF history rewritten to a compact base;
-- a mutation after the snapshot boundary retained through the rewrite buffer;
-- the temp → fsync → rename → directory-fsync publication model.
+1. an expired key removed without counting as eviction;
+2. noeviction returning OOM while the live key remains;
+3. sampled LRU choosing the oldest candidate;
+4. sampled LFU protecting a repeatedly accessed key.
 
-CI also runs race detection, both network-engine smoke tests, v0.3/v0.4 demos and persistence recovery tests.
+## 12. Next architectural layer
 
-## 13. Next architectural layer
-
-v0.6 introduces memory pressure:
+v0.7 introduces per-client state and optimistic transactions:
 
 ```text
-keyspace + expiry
+WATCH versions
       ↓
-maxmemory accounting
+MULTI queue
       ↓
-policy chooses victim
+EXEC ordered unit / DISCARD
+
+plus
+
+channel broker ↔ subscribed connections
 ```
 
-Expiration remains time validity; eviction will be memory-pressure policy. The two must stay separate even when both delete keys.
+Transaction/watch state and Pub/Sub subscriptions are runtime/session state, not normal durable key values.

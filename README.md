@@ -2,7 +2,7 @@
 
 An architecture-driven Redis learning implementation in Go. Each version replaces one hidden mechanism with an explicit, testable implementation.
 
-## Current milestone: v0.5
+## Current milestone: v0.6
 
 ```text
 v0.1  request → command → state → TTL → AOF
@@ -13,9 +13,11 @@ v0.3  Redis-like Dict + bounded incremental rehash
   ↓
 v0.4  List / Hash / Set / ZSet + adaptive encodings
   ↓
-v0.5  logical snapshots + RDB-like state + AOF rewrite   ← current
+v0.5  logical snapshots + RDB-like state + AOF rewrite
   ↓
-v0.6  maxmemory + sampled eviction policies
+v0.6  maxmemory + expiration vs eviction + sampled LRU/LFU   ← current
+  ↓
+v0.7  transactions + WATCH + Pub/Sub
 ```
 
 ## Architecture
@@ -23,38 +25,81 @@ v0.6  maxmemory + sampled eviction policies
 ```text
 client
   ↓ TCP/RESP2
-reactor (Linux epoll) or legacy transport
+reactor or legacy transport
   ↓
 command.Registry
   ↓
-store.Store
+Server persistence / memory-pressure boundary
   ↓
-Memory
-  ├── keyspace incremental Dict
-  ├── expiry incremental Dict
+memorypolicy.Manager              runtime only
+  ├── approximate logical bytes
+  ├── access time
+  ├── LFU heat
+  └── sampled victim selection
+  ↓
+versionedmemory.Memory
+  ├── keyspace Dict
+  ├── expiry Dict
   └── Object{Type, Encoding, payload}
-             ↓
-         logical state
-             ↓
-       SnapshotEntry[]
-         ┌───┴────┐
-         ▼        ▼
-       RDB       AOF rewrite
+  ↓
+SnapshotEntry[] → RDB / AOF rewrite
 ```
 
-Persistence never serializes quicklist nodes, Dict buckets, intset internals or SkipList levels.
+LRU/LFU metadata never enters `SnapshotEntry`, RDB or AOF.
 
-## Data types and encodings
+## Memory-pressure configuration
 
-| Type | Small encoding | General encoding |
-| --- | --- | --- |
-| String | `int` | `raw` |
-| List | `listpack` | `quicklist` |
-| Hash | `listpack` | `hashtable` |
-| Set | `intset` | `hashtable` |
-| ZSet | `listpack` | `skiplist` + score Dict |
+```bash
+./bin/mini-redis-server \
+  -maxmemory 1048576 \
+  -maxmemory-policy allkeys-lru \
+  -maxmemory-samples 5
+```
 
-The compact→general threshold is intentionally **8 entries** for teaching. Use `OBJECT ENCODING <key>` to observe transitions.
+Policies:
+
+```text
+noeviction
+allkeys-random
+allkeys-lru
+allkeys-lfu
+```
+
+`-maxmemory 0` disables memory-pressure enforcement. The memory figure is a deterministic educational estimate of logical key/value state, **not** Go heap or RSS.
+
+LFU decay can be adjusted with `-lfu-decay`, and `-eviction-seed` makes sampling deterministic for learning/tests.
+
+## Expiration is not eviction
+
+```text
+TTL deadline passes
+    ↓
+key is invalid by time
+    ↓
+expiration
+
+memory estimate exceeds maxmemory
+    ↓
+policy selects a still-valid victim
+    ↓
+eviction
+```
+
+They can both delete keys, but they answer different questions and are counted separately.
+
+## noeviction semantics
+
+A memory-growing command that would leave the database above maxmemory is rolled back to the pre-command logical snapshot and is not appended to AOF. Removal-only commands remain usable above the limit so memory can be recovered.
+
+This is an intentionally clear reference path, not an optimized production admission algorithm.
+
+## Eviction persistence
+
+When an eviction policy removes keys, the original successful mutation plus a logical `DEL` for the victims are appended to AOF in order. Restart reconstructs the same surviving keyspace, but access heat starts fresh.
+
+## Persistence policy
+
+AOF remains authoritative at startup when enabled. With `-appendonly=false`, the RDB-like `dump.mrdb` snapshot is used instead. TTL persists as absolute deadlines.
 
 ## Supported command subset
 
@@ -65,14 +110,11 @@ INCR INCRBY
 EXPIRE PEXPIREAT TTL
 KEYS DBSIZE FLUSHDB
 OBJECT ENCODING
-
 LPUSH RPUSH LPOP RPOP LLEN LRANGE
 HSET HGET HDEL HLEN HGETALL
 SADD SREM SISMEMBER SMEMBERS SCARD
 ZADD ZSCORE ZRANK ZRANGE ZREM
 ```
-
-This is an educational compatibility subset, not a production Redis replacement.
 
 ## Run
 
@@ -82,69 +124,17 @@ make all
 redis-cli -p 6379
 ```
 
-Linux `auto` selects the epoll reactor. The v0.1-style reference transport remains available with `-network-engine=legacy`.
-
-### Startup persistence policy
-
-Default configuration enables AOF:
-
-```bash
-./bin/mini-redis-server \
-  -appendonly=true \
-  -appendfilename appendonly.aof \
-  -appendfsync everysec
-```
-
-When AOF is enabled, it is the authoritative startup source and an RDB file is ignored.
-
-To start from the RDB-like snapshot path instead:
-
-```bash
-./bin/mini-redis-server \
-  -appendonly=false \
-  -dbfilename dump.mrdb
-```
-
-A missing RDB means an empty database; corrupt or unsupported RDB input fails startup rather than silently discarding state.
-
-`Server.SaveRDB()` and `Server.RewriteAOF()` expose the v0.5 reference mechanisms in code. They are intentionally **not** yet exposed as Redis `SAVE/BGSAVE/BGREWRITEAOF` commands; use the persistence demo to study them.
-
-## Persistence model
-
-### RDB-like snapshot
-
-```text
-SnapshotEntry[]
-     ↓
-MRDB | version | payload length | logical payload | CRC32
-     ↓
-temp file → fsync(file) → atomic rename → fsync(directory)
-```
-
-### AOF rewrite
-
-```text
-old history
-SET x 1
-SET x 2
-SET x 3
-     ↓ logical snapshot
-compact reconstruction
-SET x 3
-     +
-mutations that happened after the snapshot boundary
-```
-
-Expiry is persisted as an absolute `PEXPIREAT` deadline so process downtime does not restart the TTL duration.
+Linux `auto` selects the epoll reactor; use `-network-engine=legacy` for the v0.1-style comparison path.
 
 ## Learning demos
 
 ```bash
-make rehash-demo       # v0.3: one bounded Dict migration step at a time
-make encodings-demo    # v0.4: compact→general object encodings
-make persistence-demo  # v0.5: RDB round-trip + AOF rewrite/buffering
-make benchmark         # v0.2: reactor vs legacy networking comparison
-make benchmark-dict    # v0.3: educational Dict vs Go map microbenchmark
+make rehash-demo       # v0.3 Dict migration
+make encodings-demo    # v0.4 compact→general encodings
+make persistence-demo  # v0.5 RDB + AOF rewrite
+make eviction-demo     # v0.6 expiration/noeviction/sampled LRU/LFU
+make benchmark         # v0.2 reactor vs legacy comparison
+make benchmark-dict    # v0.3 custom Dict vs Go map microbenchmark
 ```
 
 ## Validation
@@ -157,31 +147,28 @@ go build ./cmd/mini-redis-server
 make rehash-demo
 make encodings-demo
 make persistence-demo
+make eviction-demo
 make smoke
 NETWORK_ENGINE=legacy PORT=16380 make smoke
 ```
 
-## Read the code in this order
-
-For v0.5:
+## Read v0.6 in this order
 
 ```text
-internal/store/store.go                       # SnapshotEntry boundary
+internal/store/memory_policy.go
   ↓
-internal/store/versionedmemory/snapshot.go    # logical extraction / restore
+internal/store/memorypolicy/manager.go
   ↓
-internal/rdb/rdb.go                           # state snapshot format
+internal/command/registry.go
   ↓
-internal/persistence/atomicfile.go            # crash-safe publication
+internal/server/server.go
   ↓
-internal/persistence/commands.go              # state → AOF commands
+internal/config/config.go
   ↓
-internal/aof/aof.go                           # rewrite buffer / fd swap
-  ↓
-internal/server/server.go                     # startup + coordination boundary
+examples/eviction/main.go
 ```
 
-Compare historical branches `v0.1` through `v0.5` to see one architecture change at a time.
+Compare historical branches `v0.1` through `v0.6` to see one architecture change at a time.
 
 ## Repository contracts
 
