@@ -13,13 +13,13 @@ func TestPrimaryPartialResyncAndLiveHandoff(t *testing.T) {
 	first := p.Append([]byte("frame-one"))
 	second := p.Append([]byte("frame-two"))
 
-	suffix, current, sub, ok := p.SubscribeFrom("primary-A", first.End)
+	frames, current, sub, ok := p.SubscribeFrom("primary-A", first.End)
 	if !ok {
 		t.Fatal("expected partial resync")
 	}
 	defer p.Unsubscribe(sub)
-	if current != second.End || string(suffix) != "frame-two" {
-		t.Fatalf("current=%d suffix=%q", current, suffix)
+	if current != second.End || len(frames) != 1 || string(frames[0].Data) != "frame-two" {
+		t.Fatalf("current=%d frames=%#v", current, frames)
 	}
 
 	third := p.Append([]byte("frame-three"))
@@ -39,7 +39,7 @@ func TestPrimaryRejectsStaleIdentityAndWrappedOffset(t *testing.T) {
 		t.Fatal(err)
 	}
 	f1 := p.Append([]byte("111"))
-	p.Append([]byte("222")) // evicts f1 because total exceeds five bytes
+	p.Append([]byte("222"))
 
 	if _, _, sub, ok := p.SubscribeFrom("old-primary", f1.End); ok || sub != nil {
 		t.Fatal("stale replication id must force full sync")
