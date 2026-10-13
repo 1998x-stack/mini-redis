@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/1998x-stack/mini-redis/internal/store"
 )
@@ -27,7 +28,15 @@ type MigrationSource interface {
 // source→target migration is already active, the operation resumes from the
 // source's remaining keys. The stable owner changes only after every remaining
 // source key transfers successfully.
-func MigrateSlot(ctx context.Context, topology *Topology, slot int, source MigrationSource, target MigrationTarget) error {
+func MigrateSlot(ctx context.Context, topology *Topology, slot int, source MigrationSource, target MigrationTarget) (err error) {
+	started := time.Now()
+	moved := 0
+	defer func() {
+		if topology != nil {
+			topology.observeMigration(time.Since(started), moved, err)
+		}
+	}()
+
 	if topology == nil || source == nil || target == nil {
 		return fmt.Errorf("cluster: topology/source/target are required")
 	}
@@ -60,6 +69,7 @@ func MigrateSlot(ctx context.Context, topology *Topology, slot int, source Migra
 			// stable state would hide reality. A retry resumes from remaining keys.
 			return fmt.Errorf("cluster: transfer key %q: %w", key, err)
 		}
+		moved++
 	}
 	if err := topology.CommitMigration(slot, source.ID(), target.ID()); err != nil {
 		return fmt.Errorf("cluster: commit slot %d migration: %w", slot, err)
