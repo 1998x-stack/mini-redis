@@ -254,9 +254,13 @@ func (t *Topology) GossipPage(start, limit int) (GossipPage, error) {
 	return page, nil
 }
 
+func slotTieKey(state SlotState) string {
+	return state.OwnerID + "\x00" + state.MigrationTarget
+}
+
 // MergePage is last-writer-wins by explicit topology epoch. Equal epochs use
-// stable IDs as a deterministic tie break, which is a teaching mechanism, not
-// a distributed-consensus claim.
+// stable owner+migration-target tuples as a deterministic tie break, which is a
+// teaching mechanism, not a distributed-consensus claim.
 func (t *Topology) MergePage(page GossipPage) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -278,7 +282,7 @@ func (t *Topology) MergePage(page GossipPage) error {
 		}
 		current := t.slots[record.Slot]
 		incoming := record.State
-		if incoming.Epoch > current.Epoch || (incoming.Epoch == current.Epoch && incoming.OwnerID > current.OwnerID) {
+		if incoming.Epoch > current.Epoch || (incoming.Epoch == current.Epoch && slotTieKey(incoming) > slotTieKey(current)) {
 			t.slots[record.Slot] = incoming
 		}
 		if incoming.Epoch > t.epoch {
