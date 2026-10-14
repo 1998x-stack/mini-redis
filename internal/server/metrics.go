@@ -64,16 +64,18 @@ func (s *Server) MetricsSnapshot() ServerMetricsSnapshot {
 		Upstream: s.currentReplicationUpstream(),
 	}
 	if primary := s.currentReplicationPrimary(); primary != nil && s.currentReplicationRole() == role {
-		stats := primary.Stats()
-		repl.BacklogStart = primary.BacklogStartOffset()
-		repl.BacklogBytes = primary.Offset() - repl.BacklogStart
+		primarySnapshot := primary.Snapshot(now)
+		repl.ID = primarySnapshot.ID
+		repl.Offset = primarySnapshot.Offset
+		repl.BacklogStart = primarySnapshot.BacklogStart
+		repl.BacklogBytes = primarySnapshot.Offset - primarySnapshot.BacklogStart
 		if repl.BacklogBytes < 0 {
 			repl.BacklogBytes = 0
 		}
-		repl.FullSyncs = stats.FullSyncs
-		repl.PartialSyncs = stats.PartialSyncs
-		repl.Subscribers = stats.Subscribers
-		for _, progress := range primary.ReplicaProgressSnapshot(now) {
+		repl.FullSyncs = primarySnapshot.Stats.FullSyncs
+		repl.PartialSyncs = primarySnapshot.Stats.PartialSyncs
+		repl.Subscribers = primarySnapshot.Stats.Subscribers
+		for _, progress := range primarySnapshot.Replicas {
 			ackAgeMillis := int64(-1)
 			if progress.Acknowledged {
 				ackAgeMillis = progress.AckAge.Milliseconds()
