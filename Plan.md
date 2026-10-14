@@ -5,6 +5,8 @@
 ## 1. Dependency-first roadmap
 
 ```text
+Original architecture-learning arc
+
 v0.1 request/state/AOF
   ↓
 v0.2 event loop
@@ -28,9 +30,16 @@ v0.10 Cluster / hash slots
 v0.11 RESP3
   ↓
 v0.12 observability / performance
+
+Second evidence-driven systems arc
+
+v0.12 reveals an unmeasurable quantity:
+primary cannot know replica applied progress
+  ↓
+v0.13 replica ACK / authoritative lag
 ```
 
-The sequence follows mechanism dependency, not command popularity.
+The sequence follows mechanism dependency and evidence, not command popularity or version-number momentum.
 
 ## 2. Completed milestones
 
@@ -75,87 +84,112 @@ Primary question:
 
 Implemented:
 
-- `internal/observability` atomic Counter/Gauge primitives;
-- dynamic counter/gauge maps with synchronized label creation and copy-based snapshots;
-- fixed-bucket bounded duration histograms with count/sum/max;
-- server command count/error/latency metrics;
-- RESP2/RESP3 request/reply and Push counters;
-- accepted/active connection metrics;
-- actual legacy `net.Conn` read/write byte metrics;
-- actual reactor `syscall.Read/Write` byte metrics;
-- reactor poll call/event/wait duration metrics;
-- input/output backpressure events;
-- expiration, eviction, maintenance and rehash-work counters;
-- AOF append, RDB save and AOF rewrite operations/bytes/failures/durations;
-- primary replication identity/offset/backlog/full/partial-sync/subscriber snapshot;
-- replica-local link failures, sync mode, applied frame/byte/offset evidence;
-- Cluster routing, MOVED/ASK/CROSSSLOT, migration and bounded gossip metrics;
-- Sentinel Tick/probe/failover/promotion/reconfiguration metrics and bounded latency histograms;
-- immutable `Server.MetricsSnapshot`, `Topology.MetricsSnapshot` and `Controller.MetricsSnapshot` surfaces;
-- read-only `INFO [section]` teaching view;
-- real TCP legacy/reactor observability tests;
-- control-plane Cluster/Sentinel metric tests against real decision paths;
-- `make observability-demo` cross-layer teaching demo;
-- `make benchmark-observability` microbenchmarks;
-- `docs/PERFORMANCE.md` workload/profile discipline and pprof workflow.
+- atomic counter/gauge primitives and synchronized labeled maps;
+- fixed-bucket bounded duration histograms;
+- command/protocol/network/reactor/backpressure/state/persistence metrics;
+- Cluster and Sentinel control-plane metrics;
+- immutable server/topology/controller snapshots;
+- read-only `INFO [section]`;
+- observability demo, microbenchmarks and pprof workflow;
+- repeatable performance reporting discipline.
 
-Critical invariants:
+Critical result for the next arc:
 
-- metrics never enter Store, SnapshotEntry, AOF, RDB, replication frames or slot metadata;
-- metrics never participate in success/failure, eviction, persistence, routing or failover decisions;
-- established mechanisms still work when instrumentation is absent;
-- snapshots expose copies/atomic loads, not mutable internal metric maps;
-- histogram memory is bounded independent of request count;
-- network byte counters reflect actual transport reads/writes rather than encoded-size estimates;
-- persistence timing wraps real persistence calls;
-- replication reports only information the v0.8 protocol can truthfully know;
-- because v0.8 has no replica ACK, the primary does not claim authoritative remote applied-offset lag;
-- benchmarks state workload/configuration instead of making context-free speed claims.
+> v0.12 could report primary canonical offset and replica-local applied offset, but the primary could not truthfully report a remote replica's applied-offset lag because v0.8 had no receiver→sender acknowledgement.
 
-Intentional teaching simplifications:
+That limitation is the evidence that justifies v0.13.
 
-- no Prometheus/OpenTelemetry exporter;
-- no distributed metric aggregation;
-- no production alerting/SLO system;
-- no claim of zero instrumentation overhead;
-- no production Redis performance-parity claim.
+## 3. v0.13 — Replication ACK / authoritative lag
 
-## 3. Original learning arc complete
+### Primary question
 
-v0.1–v0.12 now form one complete mechanism chain:
+**How can the sender distinguish bytes it has produced from work the receiver has actually applied?**
+
+### Mechanism
 
 ```text
-request/protocol
-  ↓
-network scheduling
-  ↓
-dictionary + object encodings
-  ↓
-persistence + memory pressure
-  ↓
-sessions / transactions / PubSub
-  ↓
-replication / HA / sharding
-  ↓
-richer protocol representation
-  ↓
-measurement / profiling
+primary canonical stream
+      ↓
+FULLRESYNC / CONTINUE / live frame
+      ↓
+replica installs/applies complete boundary
+      ↓
+REPLCONF ACK <connection-replica-id> <applied-offset>
+      ↓
+primary validates under replication.Primary.mu
+      ↓
+live per-replica progress
+      ↓
+lag_bytes = primary_offset - acknowledged_offset
 ```
 
-A future v0.13 should not be chosen merely because the number follows v0.12. It should start a new arc from one measured bottleneck or one explicit new systems question.
+Implemented scope:
 
-Potential future arcs, only after evidence:
+- one fresh connection-local replica ID per accepted replication connection;
+- replica ID included in FULLRESYNC and CONTINUE handshake lines;
+- bidirectional replication TCP connection with independent data and ACK directions;
+- ACK after successful full-sync snapshot install;
+- ACK after every successfully applied complete replication frame;
+- immediate ACK of the retained local offset on CONTINUE reconnect;
+- primary ACK registry colocated with live subscribers under `replication.Primary.mu`;
+- accepted ACK invariant `0 <= previous <= new <= primary offset`;
+- explicit wrong-ID, negative, regression and ahead-of-primary rejection;
+- disconnect/backpressure subscriber removal also removes live progress;
+- immutable replica progress snapshots with remote address, sync mode, acknowledged offset, lag bytes and ACK age;
+- INFO replication view for live replica progress;
+- ACK received/rejected counters;
+- real-replica, manual delayed-ACK and reconnect tests under race detector;
+- deterministic `make replication-ack-demo`.
 
-- active defragmentation / allocator behavior;
-- IO threads and command-execution ownership;
-- replica ACK and authoritative lag tracking;
-- production-style Cluster bus/failure detection;
-- Lua/functions and deterministic replication semantics;
-- storage tiering or disk-backed structures.
+### Critical invariants
 
-None of these are part of v0.12.
+- ACK frames never enter AOF, RDB, canonical replication backlog or offset accounting;
+- primary canonical offset means mutation-stream bytes, not network control traffic;
+- replica sends progress only after a complete apply boundary;
+- a rejected ACK cannot change the last accepted progress;
+- disconnect removes live progress instead of leaving stale lag records;
+- reconnect gets a new connection-local replica ID even when CONTINUE succeeds;
+- `lag_bytes` is authoritative according to the protocol's receiver-reported applied offset;
+- ACK is not independently verifiable proof against a malicious peer;
+- ACK is not disk durability because teaching replicas remain memory-only;
+- `ack_age_ms` is age of the last applied-progress ACK, not heartbeat age;
+- Sentinel does not consume ACK age/lag for failure detection or candidate ranking in v0.13.
 
-## 4. Version completion rule
+### Intentional teaching simplifications
+
+- no Redis WAIT / WAITAOF;
+- no client write waiting for replica ACKs;
+- no replica fsync acknowledgement;
+- no durable replica identity across reconnects;
+- no periodic heartbeat/equal-ACK timer;
+- no quorum durability or failover fencing;
+- no production Redis REPLCONF compatibility claim beyond the teaching ACK form.
+
+## 4. Evidence-driven second arc
+
+v0.13 establishes the rule for later versions:
+
+```text
+observe a real limitation
+        ↓
+name one systems question
+        ↓
+add the minimum mechanism needed to answer it
+        ↓
+measure again
+```
+
+Potential later questions remain deliberately uncommitted. Examples include:
+
+- should client writes wait for N replica ACKs, and what consistency promise would that actually provide?
+- should replicas periodically report progress/heartbeat during idle periods?
+- how should Sentinel distinguish replication freshness from network liveness?
+- what does disk durability acknowledgement require beyond memory-applied ACK?
+- where do profiles justify IO-thread or allocator work?
+
+A future version must select one such question explicitly rather than bundle them.
+
+## 5. Version completion rule
 
 ```text
 mechanism implemented
@@ -173,10 +207,12 @@ exact version SHA passes CI
 fast-forward main
       ↓
 same SHA passes CI on main
+      ↓
+main and version branch identical
 ```
 
-## 5. Current directive
+## 6. Current directive
 
-Freeze candidate: **v0.12 — observer-only bounded metrics, immutable snapshots/INFO and repeatable profiling workflow**.
+Freeze candidate: **v0.13 — receiver ACKs, primary-visible applied offsets and authoritative byte lag while preserving v0.8 stream/backlog semantics**.
 
-After v0.12 is green on one identical branch/main SHA, treat the original mini-redis learning roadmap as complete.
+Do not introduce WAIT, failover policy based on lag, or replica disk durability into v0.13; those are separate future questions.
