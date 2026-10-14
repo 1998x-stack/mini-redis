@@ -13,29 +13,41 @@ import (
 	"github.com/1998x-stack/mini-redis/internal/version"
 )
 
+type ReplicaProgressMetricsSnapshot struct {
+	ReplicaID          string `json:"replica_id"`
+	RemoteAddr         string `json:"remote_addr"`
+	SyncMode           string `json:"sync_mode"`
+	Acknowledged       bool   `json:"acknowledged"`
+	AcknowledgedOffset int64  `json:"acknowledged_offset"`
+	LagBytes           int64  `json:"lag_bytes"`
+	AckAgeMillis       int64  `json:"ack_age_ms"`
+}
+
 type ReplicationMetricsSnapshot struct {
-	Role         string `json:"role"`
-	ID           string `json:"id"`
-	Offset       int64  `json:"offset"`
-	BacklogStart int64  `json:"backlog_start"`
-	BacklogBytes int64  `json:"backlog_bytes"`
-	FullSyncs    uint64 `json:"full_syncs"`
-	PartialSyncs uint64 `json:"partial_syncs"`
-	Subscribers  int    `json:"subscribers"`
-	Upstream     string `json:"upstream,omitempty"`
+	Role         string                           `json:"role"`
+	ID           string                           `json:"id"`
+	Offset       int64                            `json:"offset"`
+	BacklogStart int64                            `json:"backlog_start"`
+	BacklogBytes int64                            `json:"backlog_bytes"`
+	FullSyncs    uint64                           `json:"full_syncs"`
+	PartialSyncs uint64                           `json:"partial_syncs"`
+	Subscribers  int                              `json:"subscribers"`
+	Upstream     string                           `json:"upstream,omitempty"`
+	Replicas     []ReplicaProgressMetricsSnapshot `json:"replicas,omitempty"`
 }
 
 type ServerMetricsSnapshot struct {
-	Runtime     observability.Snapshot     `json:"runtime"`
-	Keys        int                        `json:"keys"`
-	Memory      store.MemoryStats          `json:"memory"`
+	Runtime     observability.Snapshot      `json:"runtime"`
+	Keys        int                         `json:"keys"`
+	Memory      store.MemoryStats           `json:"memory"`
 	Replication ReplicationMetricsSnapshot `json:"replication"`
 }
 
 // MetricsSnapshot returns copies/atomically loaded values only. Callers cannot
 // mutate server metric maps, Store state or replication internals through it.
 func (s *Server) MetricsSnapshot() ServerMetricsSnapshot {
-	snapshot := ServerMetricsSnapshot{Runtime: s.metrics.Snapshot(time.Now())}
+	now := time.Now()
+	snapshot := ServerMetricsSnapshot{Runtime: s.metrics.Snapshot(now)}
 
 	s.persistenceMu.Lock()
 	snapshot.Keys = s.store.Len()
@@ -61,6 +73,21 @@ func (s *Server) MetricsSnapshot() ServerMetricsSnapshot {
 		repl.FullSyncs = stats.FullSyncs
 		repl.PartialSyncs = stats.PartialSyncs
 		repl.Subscribers = stats.Subscribers
+		for _, progress := range primary.ReplicaProgressSnapshot(now) {
+			ackAgeMillis := int64(-1)
+			if progress.Acknowledged {
+				ackAgeMillis = progress.AckAge.Milliseconds()
+			}
+			repl.Replicas = append(repl.Replicas, ReplicaProgressMetricsSnapshot{
+				ReplicaID:          progress.ReplicaID,
+				RemoteAddr:         progress.RemoteAddr,
+				SyncMode:           progress.SyncMode,
+				Acknowledged:       progress.Acknowledged,
+				AcknowledgedOffset: progress.AcknowledgedOffset,
+				LagBytes:           progress.LagBytes,
+				AckAgeMillis:       ackAgeMillis,
+			})
+		}
 	}
 	snapshot.Replication = repl
 	return snapshot
@@ -181,6 +208,22 @@ func intMapValue(values map[string]int64) resp.Value {
 	return resp.MapValue(entries)
 }
 
+func replicaProgressValue(values []ReplicaProgressMetricsSnapshot) resp.Value {
+	items := make([]resp.Value, 0, len(values))
+	for _, value := range values {
+		items = append(items, resp.MapValue([]resp.MapEntry{
+			{Key: resp.BulkString("replica_id"), Value: resp.BulkString(value.ReplicaID)},
+			{Key: resp.BulkString("remote_addr"), Value: resp.BulkString(value.RemoteAddr)},
+			{Key: resp.BulkString("sync_mode"), Value: resp.BulkString(value.SyncMode)},
+			{Key: resp.BulkString("acknowledged"), Value: resp.Boolean(value.Acknowledged)},
+			{Key: resp.BulkString("acknowledged_offset"), Value: resp.Integer(value.AcknowledgedOffset)},
+			{Key: resp.BulkString("lag_bytes"), Value: resp.Integer(value.LagBytes)},
+			{Key: resp.BulkString("ack_age_ms"), Value: resp.Integer(value.AckAgeMillis)},
+		}))
+	}
+	return resp.Array(items)
+}
+
 func (s *Server) infoCommand(argv []string) resp.Value {
 	if len(argv) > 2 {
 		return resp.Error("ERR syntax: INFO [section]")
@@ -235,6 +278,9 @@ func (s *Server) infoCommand(argv []string) resp.Value {
 		{Key: resp.BulkString("full_syncs"), Value: resp.Integer(int64(snapshot.Replication.FullSyncs))},
 		{Key: resp.BulkString("partial_syncs"), Value: resp.Integer(int64(snapshot.Replication.PartialSyncs))},
 		{Key: resp.BulkString("subscribers"), Value: resp.Integer(int64(snapshot.Replication.Subscribers))},
+		{Key: resp.BulkString("replicas"), Value: replicaProgressValue(snapshot.Replication.Replicas)},
+		{Key: resp.BulkString("acks_received"), Value: resp.Integer(int64(snapshot.Runtime.ReplicationAcksReceived))},
+		{Key: resp.BulkString("acks_rejected"), Value: resp.Integer(int64(snapshot.Runtime.ReplicationAcksRejected))},
 		{Key: resp.BulkString("link_failures"), Value: resp.Integer(int64(snapshot.Runtime.ReplicationLinkFailures))},
 		{Key: resp.BulkString("frames_applied"), Value: resp.Integer(int64(snapshot.Runtime.ReplicationFramesApplied))},
 		{Key: resp.BulkString("bytes_applied"), Value: resp.Integer(int64(snapshot.Runtime.ReplicationBytesApplied))},
