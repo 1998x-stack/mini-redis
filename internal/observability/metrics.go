@@ -246,6 +246,8 @@ type Metrics struct {
 	ReplicationBytesApplied        Counter
 	ReplicationFullSyncsApplied    Counter
 	ReplicationPartialSyncsApplied Counter
+	ReplicationAcksReceived        Counter
+	ReplicationAcksRejected        Counter
 }
 
 func NewMetrics() *Metrics {
@@ -301,6 +303,8 @@ type Snapshot struct {
 	ReplicationBytesApplied        uint64 `json:"replication_bytes_applied"`
 	ReplicationFullSyncsApplied    uint64 `json:"replication_full_syncs_applied"`
 	ReplicationPartialSyncsApplied uint64 `json:"replication_partial_syncs_applied"`
+	ReplicationAcksReceived        uint64 `json:"replication_acks_received"`
+	ReplicationAcksRejected        uint64 `json:"replication_acks_rejected"`
 }
 
 func (m *Metrics) Snapshot(now time.Time) Snapshot {
@@ -347,5 +351,7 @@ func (m *Metrics) Snapshot(now time.Time) Snapshot {
 		ReplicationBytesApplied:        m.ReplicationBytesApplied.Load(),
 		ReplicationFullSyncsApplied:    m.ReplicationFullSyncsApplied.Load(),
 		ReplicationPartialSyncsApplied: m.ReplicationPartialSyncsApplied.Load(),
+		ReplicationAcksReceived:        m.ReplicationAcksReceived.Load(),
+		ReplicationAcksRejected:        m.ReplicationAcksRejected.Load(),
 	}
 }
