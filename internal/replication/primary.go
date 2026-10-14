@@ -52,6 +52,17 @@ type ReplicaProgress struct {
 	AckAge             time.Duration
 }
 
+// PrimarySnapshot captures canonical offset/backlog state and all live replica
+// progress under one Primary.mu boundary so INFO cannot combine different
+// replication instants during a concurrent append.
+type PrimarySnapshot struct {
+	ID           string
+	Offset       int64
+	BacklogStart int64
+	Stats        Stats
+	Replicas     []ReplicaProgress
+}
+
 // Primary owns one replication identity, canonical byte offset, retained
 // backlog, live replica fan-out and v0.13 applied-offset acknowledgements.
 // ACK metadata is runtime connection state; it never enters the backlog.
@@ -113,6 +124,27 @@ func (p *Primary) Stats() Stats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return Stats{FullSyncs: p.fullSyncs, PartialSyncs: p.partialSyncs, Subscribers: len(p.subs)}
+}
+
+// Snapshot returns one self-consistent primary/replica observation.
+func (p *Primary) Snapshot(now time.Time) PrimarySnapshot {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if now.IsZero() {
+		now = time.Now()
+	}
+	end := p.backlog.EndOffset()
+	return PrimarySnapshot{
+		ID:           p.id,
+		Offset:       end,
+		BacklogStart: p.backlog.StartOffset(),
+		Stats: Stats{
+			FullSyncs:    p.fullSyncs,
+			PartialSyncs: p.partialSyncs,
+			Subscribers:  len(p.subs),
+		},
+		Replicas: p.replicaProgressSnapshotLocked(now, end),
+	}
 }
 
 func (p *Primary) RecordFullSync() {
@@ -232,7 +264,10 @@ func (p *Primary) ReplicaProgressSnapshot(now time.Time) []ReplicaProgress {
 	if now.IsZero() {
 		now = time.Now()
 	}
-	end := p.backlog.EndOffset()
+	return p.replicaProgressSnapshotLocked(now, p.backlog.EndOffset())
+}
+
+func (p *Primary) replicaProgressSnapshotLocked(now time.Time, end int64) []ReplicaProgress {
 	out := make([]ReplicaProgress, 0, len(p.subs))
 	for _, sub := range p.subs {
 		progress := ReplicaProgress{
