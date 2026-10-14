@@ -104,3 +104,32 @@ func TestPrimaryDisconnectRemovesLiveProgress(t *testing.T) {
 		t.Fatalf("progress survived disconnect: %d", got)
 	}
 }
+
+func TestPrimarySnapshotUsesOneCanonicalOffsetForLag(t *testing.T) {
+	p, err := NewPrimaryWithID("primary-A", 1024, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := p.Append([]byte("first"))
+	_, _, sub := p.SubscribeAtCurrent()
+	defer p.Unsubscribe(sub)
+	if err := p.Acknowledge(sub.ReplicaID, first.End, time.Unix(100, 0)); err != nil {
+		t.Fatal(err)
+	}
+	second := p.Append([]byte("second-frame"))
+
+	snapshot := p.Snapshot(time.Unix(101, 0))
+	if snapshot.ID != "primary-A" || snapshot.Offset != second.End {
+		t.Fatalf("snapshot identity/offset=%#v", snapshot)
+	}
+	if snapshot.Stats.Subscribers != 1 || len(snapshot.Replicas) != 1 {
+		t.Fatalf("snapshot subscriber state=%#v", snapshot)
+	}
+	progress := snapshot.Replicas[0]
+	if progress.AcknowledgedOffset != first.End {
+		t.Fatalf("ack offset=%d want=%d", progress.AcknowledgedOffset, first.End)
+	}
+	if want := snapshot.Offset - progress.AcknowledgedOffset; progress.LagBytes != want {
+		t.Fatalf("lag=%d want=%d snapshot=%#v", progress.LagBytes, want, snapshot)
+	}
+}
