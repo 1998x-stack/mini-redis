@@ -37,9 +37,9 @@ type ReplicationMetricsSnapshot struct {
 }
 
 type ServerMetricsSnapshot struct {
-	Runtime     observability.Snapshot      `json:"runtime"`
-	Keys        int                         `json:"keys"`
-	Memory      store.MemoryStats           `json:"memory"`
+	Runtime     observability.Snapshot     `json:"runtime"`
+	Keys        int                        `json:"keys"`
+	Memory      store.MemoryStats          `json:"memory"`
 	Replication ReplicationMetricsSnapshot `json:"replication"`
 }
 
