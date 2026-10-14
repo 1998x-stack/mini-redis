@@ -49,7 +49,8 @@ main ─────────────────────────
  ├── v0.9 Sentinel-inspired HA
  ├── v0.10 Cluster/hash slots
  ├── v0.11 RESP3
- └── v0.12 observability/performance
+ ├── v0.12 observability/performance
+ └── v0.13 replication ACK / authoritative lag
 ```
 
 Create a version branch from current `main`. Definition of Done requires exact-SHA CI on the version branch, fast-forwarding `main` to that same SHA, then exact-SHA CI on `main`.
@@ -74,11 +75,15 @@ command registry / Store
    ↓
 logical state + canonical mutation commands
    ├── AOF/RDB
-   └── v0.8 replication
+   └── replication data stream
           ↓
-    primary / replicas
-          ↑
-    v0.9 Sentinel control
+       primary ───────────────► replica
+          ▲   canonical frame      │
+          │                        │ apply complete frame
+          └──── v0.13 ACK ─────────┘
+               applied offset
+
+v0.9 Sentinel control observes/reconfigures topology separately.
 
 logical reply
    ↓
@@ -99,14 +104,16 @@ Rules:
 
 - protocol representation never owns database semantics;
 - RESP parsing/encoding does not depend on Store internals;
-- Store never owns network/failover/slot/protocol/metrics metadata;
+- Store never owns network/failover/slot/protocol/metrics/ACK metadata;
 - command handlers do not inspect private encoding payloads;
 - persistence and replication serialize logical state/commands, never client protocol or metrics state;
+- ACK control frames are not canonical mutation frames and never enter AOF/RDB/backlog;
 - Sentinel monitors/reconfigures replication topology and never copies database values;
 - Cluster ownership/migration remains separate from Store values;
 - Cluster migration crosses nodes via `SnapshotEntry`;
 - response adaptation occurs only after command and Cluster authorization;
-- observability records completed/attempted mechanism work but never decides mechanism behavior.
+- observability records completed/attempted mechanism work but never decides mechanism behavior;
+- ACK-derived lag is observable protocol state and must not silently become Sentinel/failover policy.
 
 ## 5. Concurrency / atomicity
 
@@ -122,6 +129,8 @@ Rules:
 - transports may read protocol mode to encode bytes, but must not implement separate HELLO semantics.
 - v0.12 hot-path counters use atomics; dynamic metric-label creation/snapshot copying may use their own small mutexes.
 - v0.12 histograms are fixed-bucket bounded structures; no unbounded per-request samples.
+- v0.13 `replication.Primary.mu` owns backlog end offset, live subscribers, connection-local replica IDs and accepted ACK progress together; ACK validation is atomic with respect to those values.
+- removing a replication subscriber must remove its live ACK/progress entry under the same `Primary.mu`.
 - metrics locks/atomics never replace Store, persistence, replication, Sentinel or Cluster synchronization.
 - never claim atomicity without naming its lock, filesystem or protocol boundary.
 
@@ -138,7 +147,7 @@ Rules:
 - eviction-generated DEL belongs to durability and replication order.
 - LRU/LFU heat is runtime policy state, never database state.
 
-## 7. Replication rules — v0.8
+## 7. Replication rules — v0.8 foundation
 
 - one primary runtime owns one repl-id and canonical byte offset;
 - backlog evicts whole frames only;
@@ -147,7 +156,7 @@ Rules:
 - replica offset advances only after complete frame application;
 - replica client writes are READONLY;
 - client RESP2/RESP3 mode never changes replication frames;
-- v0.8 has no replica→primary ACK protocol, so a primary cannot truthfully report authoritative remote applied-offset lag.
+- the v0.8 protocol alone had no replica→primary ACK, which is the limitation v0.13 explicitly extends.
 
 ## 8. Sentinel rules — v0.9
 
@@ -212,7 +221,6 @@ Rules:
 - reactor bytes are counted from actual `syscall.Read/Write`, and epoll wait is measured at `Poller.Wait`;
 - fixed histogram buckets bound memory independently of request count;
 - persistence byte evidence comes from actual encoded AOF work or resulting RDB/rewrite files;
-- replication exposes primary offset/backlog/sync counts and replica-local applied offset/work; no remote lag is invented without ACKs;
 - Cluster redirect/migration/gossip and Sentinel probe/failover metrics are recorded after/around existing policy decisions, never consulted by them.
 
 ### Performance claims
@@ -222,7 +230,46 @@ Rules:
 - do not claim production Redis parity or context-free speedups;
 - profile before changing a mechanism and rerun the identical workload afterward.
 
-## 12. Testing baseline
+## 12. Replication ACK rules — v0.13
+
+### Separate data and control directions
+
+```text
+primary → replica : canonical mutation frames
+replica → primary : REPLCONF ACK <connection-replica-id> <applied-offset>
+```
+
+- ACK frames are control metadata; they never enter the canonical backlog and never advance primary replication offset;
+- FULLRESYNC/CONTINUE handshakes include one connection-local replica ID;
+- reconnect creates a fresh connection-local replica ID even when repl-id/offset permit CONTINUE;
+- replica ID is not durable node identity.
+
+### Applied-progress contract
+
+- FULLRESYNC ACK is sent only after `RestoreSnapshot` succeeds and local replica offset becomes the snapshot base offset;
+- frame ACK is sent only after the complete frame decodes and all commands apply successfully;
+- accepted ACK offsets obey `0 <= previous_ack <= new_ack <= primary_offset`;
+- equal ACK is valid and may refresh ACK age without inventing progress;
+- wrong-ID, negative, regressing and ahead-of-primary ACKs are rejected without modifying accepted progress;
+- protocol-level ACK is trusted receiver-reported progress; the primary cannot independently prove that a malicious/manual peer truly applied the data.
+
+### Live progress / lag contract
+
+For a connected acknowledged replica:
+
+```text
+lag_bytes = max(primary_offset - acknowledged_offset, 0)
+ack_age_ms = now - last_accepted_ack_time
+```
+
+- no ACK yet is represented explicitly, not as fake zero lag;
+- disconnect or subscriber eviction removes live replica progress;
+- `ack_age_ms` measures age of the last applied-progress ACK, not heartbeat age;
+- an idle caught-up replica can have growing `ack_age_ms` while `lag_bytes == 0`;
+- Sentinel health/quorum/candidate logic must not read ACK age or lag in v0.13;
+- ACK does not mean disk/fsync durability because teaching replicas remain memory-only.
+
+## 13. Testing baseline
 
 Before reporting a version clean, run on the exact SHA:
 
@@ -237,6 +284,7 @@ make persistence-demo
 make eviction-demo
 make session-demo
 make replication-demo
+make replication-ack-demo
 make sentinel-demo
 make cluster-demo
 make resp3-demo
@@ -245,24 +293,23 @@ make smoke
 NETWORK_ENGINE=legacy PORT=16380 make smoke
 ```
 
-For v0.12 specifically prove:
+For v0.13 specifically prove:
 
-- concurrent counters/histograms are race-free and bounded;
-- metric snapshots do not expose mutable maps;
-- INFO is read-only;
-- command/protocol/connection/actual-wire-byte/latency metrics work on legacy and reactor;
-- reactor poll observation does not change event-loop behavior;
-- expiration/eviction observation preserves established semantics;
-- AOF/RDB/rewrite metrics measure real operations/bytes and errors;
-- replication metrics expose truthful local/full/partial/backlog evidence without inventing remote ACK state;
-- Cluster MOVED/ASK/CROSSSLOT/gossip/migration metrics come from real paths;
-- Sentinel probe/failover metrics come from the existing quorum/election path;
-- `make observability-demo` produces a coherent cross-layer snapshot;
+- ACK registry accepts monotonic in-range progress and rejects wrong/negative/regressing/ahead values;
+- ACK traffic does not change primary canonical offset or backlog framing;
+- real replica FULLRESYNC sends ACK only after snapshot installation;
+- real replica live/backlog frames ACK only after complete apply;
+- withholding ACK while primary advances makes `lag_bytes > 0`;
+- later ACK returns lag to zero;
+- disconnect removes live progress;
+- CONTINUE reconnect creates a fresh connection-local replica ID and can re-establish lag zero from the retained offset;
+- INFO/immutable snapshots expose ACK progress without mutable subscriber state;
+- `make replication-ack-demo` demonstrates the full lag lifecycle;
 - all historical demos remain green.
 
 Do not claim a check passed unless it ran on the exact reported SHA.
 
-## 13. Documentation contract
+## 14. Documentation contract
 
 Every version keeps synchronized:
 
@@ -275,7 +322,7 @@ Every version keeps synchronized:
 
 `version.md` explains prior-version delta, mechanisms, invariants, non-goals, reading order and next dependency.
 
-## 14. Definition of Done
+## 15. Definition of Done
 
 - [ ] primary mental model explicit;
 - [ ] promised mechanism implemented;
@@ -286,10 +333,11 @@ Every version keeps synchronized:
 - [ ] exact version SHA passes CI;
 - [ ] `main` fast-forwarded to same SHA;
 - [ ] same SHA passes CI on `main`;
+- [ ] version branch and `main` compare identical;
 - [ ] next-version rationale documented.
 
-## 15. Current directive
+## 16. Current directive
 
-Freeze candidate: **v0.12 — bounded observer-only metrics, immutable snapshots/INFO, cross-layer mechanism evidence and repeatable profiling workflow**.
+Freeze candidate: **v0.13 — bidirectional replication ACK, connection-local replica identity, primary-visible applied offsets and authoritative byte lag**.
 
-v0.12 completes the original architecture-learning sequence. Do not start a v0.13 feature list by momentum alone; a next arc should begin from measured evidence and one explicit new learning question.
+Do not turn ACK age/lag into failover policy in this version. A future milestone should again start from a separate systems question and measured evidence rather than feature momentum.
