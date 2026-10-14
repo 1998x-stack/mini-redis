@@ -5,11 +5,11 @@
 - Historical learning branch: `v0.13`
 - Previous snapshot: `v0.12`
 - Version label: `v0.13.0`
-- Theme: replica acknowledgements, primary-visible applied offsets and truthful replication lag
+- Theme: receiver acknowledgements, primary-visible applied offsets and truthful replication lag
 
 ## 2. Primary question
 
-**How can a primary know how far each replica has actually applied the canonical replication stream, rather than merely knowing what it has sent?**
+**How can a primary distinguish replication bytes it has produced from work a replica has actually applied?**
 
 ```text
 primary canonical offset
@@ -18,69 +18,70 @@ replication frame
         ↓
 replica fully decodes + applies frame
         ↓
-ACK <replica-id> <applied-offset>
+REPLCONF ACK <connection-replica-id> <applied-offset>
         ↓
-primary validates monotonic ACK
+primary validates progress under Primary.mu
         ↓
-per-replica acknowledged offset
+acknowledged offset
         ↓
 lag_bytes = primary_offset - acknowledged_offset
 ```
 
 The dominant lesson is:
 
-> **Replication lag becomes authoritative only when the receiver explicitly reports durable/applied progress back to the sender.**
+> **Sender progress and receiver progress are different facts. Authoritative lag requires an explicit receiver→sender acknowledgement.**
 
 ## 3. Delta from v0.12
 
-Planned additions:
+Implemented:
 
-- connection-local replica identity assigned during PSYNC handshake;
-- replica → primary ACK control frames after successful full-sync install and each successfully applied replication frame;
-- primary-side per-replica acknowledgement registry;
-- monotonic ACK validation;
-- rejection of ACK offsets ahead of the primary canonical offset;
-- connection teardown removes that connection's live ACK state;
-- immutable replica progress snapshots;
-- authoritative `lag_bytes` and `ack_age_ms` in replication metrics / INFO;
-- metrics for ACK received/rejected and last ACK age;
-- deterministic lag demo covering caught-up, delayed, disconnected and resumed states;
-- tests proving ACK is emitted only after successful apply;
-- tests proving malformed/regressing/ahead ACKs cannot corrupt progress state;
-- preservation of existing FULLRESYNC / CONTINUE / backlog semantics.
+- one connection-local replica identity for every accepted replication connection;
+- replica ID included in FULLRESYNC and CONTINUE handshake lines;
+- bidirectional ACK control traffic on the existing replication TCP connection;
+- FULLRESYNC ACK only after successful snapshot installation;
+- frame ACK only after complete decode/apply and replica-offset advancement;
+- immediate ACK of the retained local applied offset after CONTINUE negotiation;
+- primary-side live ACK registry colocated with subscribers under `replication.Primary.mu`;
+- monotonic/in-range ACK validation;
+- rejection of wrong-ID, negative, regressing and ahead-of-primary ACKs;
+- live progress removal on disconnect or subscriber backpressure eviction;
+- one-lock `PrimarySnapshot` containing canonical offset, backlog state, sync counters and replica progress;
+- immutable server replication snapshots exposing acknowledged offset, byte lag and ACK age;
+- `INFO replication` live replica entries plus ACK received/rejected counters;
+- real-replica integration tests;
+- delayed/manual ACK tests that make lag become positive and return to zero;
+- reconnect tests proving CONTINUE gets a fresh connection-local replica ID;
+- `make replication-ack-demo` for the full lag lifecycle.
 
 Unchanged:
 
 - canonical mutation byte stream;
 - primary repl-id semantics;
 - frame-aware backlog retention;
-- snapshot boundary under `Server.persistenceMu`;
-- replica applied offset advances only after full frame application;
+- PSYNC eligibility rules;
+- snapshot/base-offset/live-subscriber boundary under `Server.persistenceMu`;
+- replica applied offset advances only after complete frame application;
 - AOF/RDB formats;
-- Sentinel candidate ranking policy;
+- Sentinel failure detection and candidate ranking policy;
 - Cluster routing/migration;
 - RESP2/RESP3 client protocol semantics.
 
 ## 4. Protocol shape
 
-### Handshake
-
-Replica still starts with:
+Replica still begins with:
 
 ```text
 PSYNC <repl-id|?> <offset|-1>
 ```
 
-Primary replies with a mode line that additionally carries one connection-local replica ID:
+Primary replies with:
 
 ```text
 FULLRESYNC <repl-id> <base-offset> <replica-id>
 CONTINUE   <repl-id> <current-offset> <replica-id>
 ```
 
-`replica-id` identifies one live replication connection, not durable replica identity.
-
-### ACK
+`replica-id` belongs to one live replication connection. It is not persistent node identity.
 
 After the replica has actually installed/applied state through offset `N`, it writes:
 
@@ -88,102 +89,124 @@ After the replica has actually installed/applied state through offset `N`, it wr
 REPLCONF ACK <replica-id> <N>
 ```
 
-ACK traffic is control-plane metadata. It is not part of the canonical mutation stream and therefore does not advance replication offsets or enter the backlog.
+ACK traffic is control metadata. It never enters AOF, RDB, the canonical replication backlog, or canonical offset accounting.
 
 ## 5. ACK invariants
 
-For one live replica connection:
+For one live replication connection:
 
 ```text
-last_ack <= new_ack <= primary_offset
+0 <= previous_ack <= new_ack <= primary_offset
 ```
 
-The primary must reject:
+The primary rejects:
 
 - malformed ACK frames;
-- wrong replica IDs;
+- wrong connection-local replica IDs;
 - negative offsets;
 - regressing offsets;
-- offsets beyond the primary's current canonical offset.
+- offsets beyond the primary canonical offset.
 
-A rejected ACK never changes accepted progress.
+A rejected ACK never changes the last accepted progress.
 
-The replica sends ACK only after:
+Equal ACKs are valid. They can refresh ACK age without inventing new progress.
 
-- a FULLRESYNC snapshot has been installed successfully; or
-- an entire live/backlog frame has been decoded and applied successfully.
-
-Therefore `acknowledged_offset` means **applied progress**, not bytes merely read from TCP.
-
-## 6. Connection ownership
-
-ACK state belongs to the live primary ↔ replica connection.
-
-Primary registry entry:
-
-```text
-replica-id
-remote address
-acknowledged offset
-last ACK time
-sync mode
-connected=true
-```
-
-When the connection closes, the live entry is removed. Historical counters may remain in observability, but stale connection progress must not be presented as live replica lag.
-
-## 7. Lag semantics
-
-For a connected replica:
-
-```text
-lag_bytes = max(primary_offset - acknowledged_offset, 0)
-ack_age_ms = now - last_ack_time
-```
-
-This is authoritative with respect to the mini-redis definition of applied offset.
-
-It is **not** a wall-clock replication-delay estimate and does not imply fsync/durable disk acknowledgement, because replicas remain memory-only in this teaching implementation.
-
-## 8. Full sync and partial resync
+## 6. Apply-before-ACK invariant
 
 ### FULLRESYNC
 
 ```text
-snapshot base offset B
-        ↓
-replica RestoreSnapshot succeeds
-        ↓
-replica local offset = B
-        ↓
-ACK B
+snapshot payload
+    ↓
+RestoreSnapshot succeeds
+    ↓
+replica local offset = base offset
+    ↓
+ACK base offset
 ```
 
-### CONTINUE
+### live / catch-up frame
 
 ```text
-replica asks from offset R
-        ↓
-primary sends retained frames
-        ↓
-replica applies frame ending at N
-        ↓
-ACK N
+complete canonical frame
+    ↓
+decode all commands
+    ↓
+apply successfully under replica mutation boundary
+    ↓
+advance replica local offset by complete frame length
+    ↓
+ACK new applied offset
 ```
 
-The ACK mechanism must not alter backlog frame boundaries or PSYNC eligibility.
+The replica never ACKs bytes merely read from TCP.
 
-## 9. Observability
+## 7. Primary ownership and snapshot boundary
 
-`Server.MetricsSnapshot().Replication` should expose live replica progress entries on a primary:
+`replication.Primary.mu` owns together:
+
+```text
+primary repl-id
+backlog end/start offsets
+live subscribers
+connection-local replica IDs
+accepted ACK offsets/timestamps
+```
+
+`PrimarySnapshot(now)` captures all of those values under one lock so INFO cannot combine an old primary offset with newer lag calculations, or vice versa.
+
+Subscriber removal also removes the corresponding live ACK record under the same lock.
+
+## 8. Lag semantics
+
+For an acknowledged connected replica:
+
+```text
+lag_bytes = max(primary_offset - acknowledged_offset, 0)
+ack_age_ms = now - last_accepted_ack_time
+```
+
+Before the first ACK:
+
+```text
+acknowledged_offset = -1
+lag_bytes           = -1
+ack_age_ms          = -1
+```
+
+This avoids silently treating unknown progress as zero lag.
+
+`lag_bytes` is authoritative **according to the mini-redis protocol's receiver-reported applied offset**. A primary cannot independently prove that a malicious/manual peer truly applied what it ACKed.
+
+`ack_age_ms` is not heartbeat age. An idle, caught-up replica may have `lag_bytes == 0` while ACK age keeps increasing.
+
+ACK also does not mean fsync/disk durability because teaching replicas remain memory-only.
+
+## 9. Reconnect semantics
+
+Disconnect removes live progress.
+
+A reconnect using the same primary repl-id and retained applied offset may receive CONTINUE, but the new TCP connection always receives a fresh connection-local replica ID:
+
+```text
+old connection: replica-1  → close → progress removed
+new connection: replica-2  → CONTINUE → ACK retained offset
+```
+
+The durable continuity is repl-id + canonical offset, not connection-local replica ID.
+
+## 10. Observability
+
+Primary `Server.MetricsSnapshot().Replication.Replicas` exposes copies of:
 
 ```text
 replica_id
 remote_addr
+sync_mode
+acknowledged
 acknowledged_offset
 lag_bytes
 ack_age_ms
-sync_mode
 ```
 
 Runtime metrics add:
@@ -193,65 +216,72 @@ replication_acks_received
 replication_acks_rejected
 ```
 
-Replica-local metrics from v0.12 remain useful and unchanged.
+`INFO replication` is assembled from the immutable snapshot and does not expose subscriber pointers or mutable ACK maps.
 
-## 10. Tests that must prove the mechanism
+## 11. Validation
 
-- primary ACK registry accepts monotonic in-range progress;
-- regressing/ahead/wrong-ID ACKs are rejected without changing state;
-- snapshot ACK occurs only after successful RestoreSnapshot;
-- frame ACK occurs only after successful complete frame application;
-- ACK control frames do not enter backlog or advance primary offset;
-- caught-up replica reports `lag_bytes == 0`;
-- paused/delayed ACK produces positive lag while primary advances;
-- reconnect receives a new connection-local replica ID;
-- CONTINUE preserves offset continuity and catches lag back to zero;
-- disconnect removes live replica progress;
-- existing replication/Sentinel/Cluster/RESP3/observability regressions remain green under `-race`.
+The version must prove:
 
-## 11. Non-goals
+- monotonic in-range ACK acceptance;
+- wrong-ID/negative/regressing/ahead ACK rejection without progress corruption;
+- ACK control traffic does not alter primary canonical offset;
+- real FULLRESYNC replica reaches acknowledged lag zero;
+- live frame apply is followed by ACK and lag zero;
+- deliberately withheld ACK while primary advances produces positive lag;
+- later ACK returns lag to zero;
+- disconnect removes live progress;
+- CONTINUE reconnect receives a new connection-local replica ID;
+- primary snapshot keeps offset/backlog/progress under one lock;
+- historical replication/Sentinel/Cluster/RESP3/observability behavior remains green under race detector;
+- `make replication-ack-demo` exercises caught-up → lagging → caught-up → disconnected → CONTINUE.
+
+## 12. Non-goals
 
 v0.13 does not implement:
 
 - Redis WAIT / WAITAOF semantics;
-- synchronous write acknowledgement to clients;
-- disk/fsync acknowledgement from replicas;
+- synchronous client writes waiting for replicas;
+- replica fsync/disk acknowledgements;
 - persistent replica IDs across reconnects;
+- periodic ACK heartbeat timers;
 - quorum write durability;
-- automatic failover policy based on ACK age;
-- TCP heartbeat replacement for Sentinel probes;
+- automatic failover policy based on ACK age or byte lag;
+- ACK-based replacement for Sentinel probes;
 - production Redis REPLCONF compatibility beyond the teaching ACK shape.
-
-## 12. Definition of Done
-
-- ACK protocol implemented end-to-end;
-- primary live progress registry implemented;
-- authoritative lag exposed through immutable snapshot / INFO;
-- malformed/regressing/ahead ACK tests exist;
-- integration demo proves lag rises and returns to zero;
-- ACK observation remains separate from failover policy;
-- all historical CI gates remain green;
-- VERSION/docs synchronized;
-- exact `v0.13` SHA passes CI;
-- `main` fast-forwarded to the same SHA;
-- same SHA passes CI on `main`;
-- `main` and `v0.13` compare identical.
 
 ## 13. Read this version in order
 
 ```text
 internal/replication/primary.go
-  ↓ live replica progress registry
+  ↓ live subscriber + ACK registry + PrimarySnapshot
 internal/server/replication.go
-  ↓ handshake + ACK reader/writer
+  ↓ FULLRESYNC/CONTINUE + ACK reader/writer
 internal/server/metrics.go
-  ↓ authoritative lag snapshot
-internal/replication/*_test.go
-internal/server/replication*_test.go
-  ↓
+  ↓ authoritative lag snapshot / INFO
+internal/replication/progress_test.go
+internal/server/replication_ack_test.go
+  ↓ invariants and real wire behavior
 examples/replication-ack/main.go
+  ↓ deterministic lag lifecycle
 ```
 
-## 14. Next step
+## 14. Definition of Done
 
-v0.13 starts a second systems-learning arc by converting a v0.12 measurement limitation into a real protocol mechanism. Any v0.14 should again be justified by an explicit systems question revealed by the now-observable replication path.
+- [x] ACK protocol implemented end-to-end;
+- [x] primary live progress registry implemented;
+- [x] authoritative byte lag exposed through immutable snapshot / INFO;
+- [x] invalid ACK tests exist;
+- [x] real delayed-ACK integration test proves lag rises and returns to zero;
+- [x] reconnect/fresh connection ID behavior tested;
+- [x] ACK observation remains separate from failover policy;
+- [x] VERSION is `v0.13.0`;
+- [ ] exact final `v0.13` SHA passes complete CI;
+- [ ] `main` fast-forwarded to the same SHA;
+- [ ] same SHA passes CI on `main`;
+- [ ] `main` and `v0.13` compare identical.
+
+## 15. Next step
+
+v0.13 starts the second evidence-driven systems arc by converting a v0.12 observability limitation into a real protocol mechanism.
+
+A future v0.14 must again choose one explicit systems question. ACK-based client write waiting, idle heartbeat/progress reporting, disk durability acknowledgement and failover freshness are intentionally separate possible directions rather than bundled follow-ons.
