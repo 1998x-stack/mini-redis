@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.13.0
+
+Architecture milestone: add an explicit replica→primary acknowledgement protocol so the primary can distinguish canonical bytes it has produced from offsets a live replica reports having fully applied.
+
+- add one connection-local replica ID for every live replication subscription;
+- include that replica ID in `FULLRESYNC` and `CONTINUE` handshake responses;
+- add teaching `REPLCONF ACK <replica-id> <applied-offset>` control frames on the existing full-duplex replication TCP connection;
+- send the FULLRESYNC ACK only after snapshot restore succeeds and replica offset is installed;
+- send frame ACKs only after complete frame decode/application and local offset advancement;
+- ACK the already-applied resume offset immediately after a successful CONTINUE handshake;
+- keep ACK traffic outside AOF, RDB, `SnapshotEntry`, canonical backlog frames and primary offset accounting;
+- add `replication.Primary` live ACK registry beside subscriber state under one mutex;
+- validate `0 <= previous_ack <= new_ack <= primary_offset`;
+- reject wrong connection IDs, negative offsets, regressions and ahead-of-primary offsets without changing accepted progress;
+- allow equal ACKs to refresh ACK age without inventing progress;
+- remove live ACK progress when the replication subscriber disconnects or is evicted for output backpressure;
+- add immutable `ReplicaProgress` snapshots with remote address, sync mode, acknowledged offset, byte lag and ACK age;
+- add one-lock `PrimarySnapshot` so primary offset/backlog/sync counters/replica lag come from one coherent replication instant;
+- expose live replica progress plus ACK accepted/rejected counters through `Server.MetricsSnapshot()` and `INFO replication`;
+- represent pre-ACK progress explicitly as unknown (`-1`) rather than fake zero lag;
+- add unit tests for monotonic ACKs, invalid ACKs, disconnect cleanup and snapshot/lag consistency;
+- add real primary/replica integration proving FULLRESYNC and live frames converge to ACKed lag zero;
+- add a delayed manual-replica test proving lag becomes positive while ACK is withheld and returns to zero after ACK;
+- add reconnect coverage proving a CONTINUE connection receives a fresh connection-local replica ID;
+- add `make replication-ack-demo` for FULLRESYNC → lag 0 → withheld ACK/lag > 0 → ACK/lag 0 → disconnect → CONTINUE/fresh ID;
+- keep Sentinel SDOWN/ODOWN/candidate policy independent from ACK age/lag;
+- explicitly keep WAIT/WAITAOF, client quorum writes, periodic ACK heartbeat, replica disk/fsync ACK and production REPLCONF compatibility outside v0.13.
+
 ## v0.12.0
 
 Architecture milestone: make the mechanisms built in v0.1–v0.11 measurable through observer-only bounded metrics, immutable snapshots and repeatable profiling without changing database semantics.
