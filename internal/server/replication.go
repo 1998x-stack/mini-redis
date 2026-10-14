@@ -120,10 +120,19 @@ func (s *Server) handleReplicaConnection(ctx context.Context, conn net.Conn, pri
 	}
 
 	writer := resp.NewWriter(conn)
+	remoteAddr := ""
+	if conn.RemoteAddr() != nil {
+		remoteAddr = conn.RemoteAddr().String()
+	}
+
 	if frames, current, sub, ok := primary.SubscribeFrom(argv[1], requestedOffset); ok {
 		defer primary.Unsubscribe(sub)
+		if !primary.SetReplicaInfo(sub, remoteAddr, "partial") {
+			return
+		}
+		ackErr := s.startReplicaAckReader(conn, reader, primary, sub.ReplicaID)
 		primary.RecordPartialSync()
-		if err := writer.WriteValue(resp.SimpleString(fmt.Sprintf("CONTINUE %s %d", primary.ID(), current))); err != nil {
+		if err := writer.WriteValue(resp.SimpleString(fmt.Sprintf("CONTINUE %s %d %s", primary.ID(), current, sub.ReplicaID))); err != nil {
 			return
 		}
 		for _, frame := range frames {
@@ -131,7 +140,7 @@ func (s *Server) handleReplicaConnection(ctx context.Context, conn net.Conn, pri
 				return
 			}
 		}
-		s.streamReplicationFrames(ctx, writer, sub)
+		s.streamReplicationFrames(ctx, writer, sub, ackErr)
 		return
 	}
 
@@ -152,25 +161,81 @@ func (s *Server) handleReplicaConnection(ctx context.Context, conn net.Conn, pri
 		return
 	}
 	defer primary.Unsubscribe(sub)
+	if !primary.SetReplicaInfo(sub, remoteAddr, "full") {
+		return
+	}
+	ackErr := s.startReplicaAckReader(conn, reader, primary, sub.ReplicaID)
 
 	payload, err := json.Marshal(entries)
 	if err != nil {
 		return
 	}
 	primary.RecordFullSync()
-	if err := writer.WriteValue(resp.SimpleString(fmt.Sprintf("FULLRESYNC %s %d", id, baseOffset))); err != nil {
+	if err := writer.WriteValue(resp.SimpleString(fmt.Sprintf("FULLRESYNC %s %d %s", id, baseOffset, sub.ReplicaID))); err != nil {
 		return
 	}
 	if err := writer.WriteValue(resp.BulkString(string(payload))); err != nil {
 		return
 	}
-	s.streamReplicationFrames(ctx, writer, sub)
+	s.streamReplicationFrames(ctx, writer, sub, ackErr)
 }
 
-func (s *Server) streamReplicationFrames(ctx context.Context, writer *resp.Writer, sub *replication.Subscription) {
+func (s *Server) startReplicaAckReader(conn net.Conn, reader *resp.Reader, primary *replication.Primary, replicaID string) <-chan error {
+	result := make(chan error, 1)
+	go func() {
+		err := s.readReplicaAcks(reader, primary, replicaID)
+		if err != nil {
+			_ = conn.Close()
+		}
+		result <- err
+		close(result)
+	}()
+	return result
+}
+
+func (s *Server) readReplicaAcks(reader *resp.Reader, primary *replication.Primary, replicaID string) error {
+	for {
+		argv, err := reader.ReadCommand()
+		if err != nil {
+			return err
+		}
+		if len(argv) != 4 || strings.ToUpper(argv[0]) != "REPLCONF" || strings.ToUpper(argv[1]) != "ACK" {
+			if s.metrics != nil {
+				s.metrics.ReplicationAcksRejected.Inc()
+			}
+			return fmt.Errorf("invalid replication ACK frame %q", strings.Join(argv, " "))
+		}
+		if argv[2] != replicaID {
+			if s.metrics != nil {
+				s.metrics.ReplicationAcksRejected.Inc()
+			}
+			return fmt.Errorf("replication ACK identity mismatch: got %q want %q", argv[2], replicaID)
+		}
+		offset, err := strconv.ParseInt(argv[3], 10, 64)
+		if err != nil {
+			if s.metrics != nil {
+				s.metrics.ReplicationAcksRejected.Inc()
+			}
+			return fmt.Errorf("invalid replication ACK offset %q", argv[3])
+		}
+		if err := primary.Acknowledge(replicaID, offset, time.Now()); err != nil {
+			if s.metrics != nil {
+				s.metrics.ReplicationAcksRejected.Inc()
+			}
+			return fmt.Errorf("reject replication ACK: %w", err)
+		}
+		if s.metrics != nil {
+			s.metrics.ReplicationAcksReceived.Inc()
+		}
+	}
+}
+
+func (s *Server) streamReplicationFrames(ctx context.Context, writer *resp.Writer, sub *replication.Subscription, ackErr <-chan error) {
 	for {
 		select {
 		case <-ctx.Done():
+			return
+		case <-ackErr:
 			return
 		case frame, ok := <-sub.C:
 			if !ok {
@@ -186,7 +251,9 @@ func (s *Server) streamReplicationFrames(ctx context.Context, writer *resp.Write
 func (s *Server) runReplicaLoop(ctx context.Context, upstream string) {
 	for ctx.Err() == nil {
 		if err := s.followPrimaryOnce(ctx, upstream); err != nil && ctx.Err() == nil {
-			s.metrics.ReplicationLinkFailures.Inc()
+			if s.metrics != nil {
+				s.metrics.ReplicationLinkFailures.Inc()
+			}
 			s.logger.Warn("replication link lost", "upstream", upstream, "error", err)
 		}
 		timer := time.NewTimer(s.cfg.ReplicationReconnectDelay)
@@ -226,7 +293,7 @@ func (s *Server) followPrimaryOnce(ctx context.Context, upstream string) error {
 		id = "?"
 		offset = -1
 	}
-	if _, err := conn.Write(resp.EncodeCommand([]string{"PSYNC", id, strconv.FormatInt(offset, 10)})); err != nil {
+	if err := writeReplicationCommand(conn, []string{"PSYNC", id, strconv.FormatInt(offset, 10)}); err != nil {
 		return err
 	}
 
@@ -240,14 +307,19 @@ func (s *Server) followPrimaryOnce(ctx context.Context, upstream string) error {
 		return errors.New("empty replication handshake")
 	}
 
+	var connectionReplicaID string
 	switch parts[0] {
 	case "FULLRESYNC":
-		if len(parts) != 3 {
+		if len(parts) != 4 {
 			return fmt.Errorf("invalid FULLRESYNC header %q", header)
 		}
 		baseOffset, err := strconv.ParseInt(parts[2], 10, 64)
-		if err != nil {
-			return err
+		if err != nil || baseOffset < 0 {
+			return fmt.Errorf("invalid FULLRESYNC offset %q", parts[2])
+		}
+		connectionReplicaID = parts[3]
+		if connectionReplicaID == "" {
+			return errors.New("FULLRESYNC missing replica id")
 		}
 		snapshotPayload, err := readReplicationBulk(reader)
 		if err != nil {
@@ -260,15 +332,34 @@ func (s *Server) followPrimaryOnce(ctx context.Context, upstream string) error {
 		if err := s.installReplicaSnapshot(entries, parts[1], baseOffset); err != nil {
 			return err
 		}
-		s.metrics.ReplicationFullSyncsApplied.Inc()
+		if s.metrics != nil {
+			s.metrics.ReplicationFullSyncsApplied.Inc()
+		}
+		if err := writeReplicationACK(conn, connectionReplicaID, baseOffset); err != nil {
+			return err
+		}
 	case "CONTINUE":
-		if len(parts) != 3 {
+		if len(parts) != 4 {
 			return fmt.Errorf("invalid CONTINUE header %q", header)
 		}
 		if parts[1] != id {
 			return fmt.Errorf("CONTINUE identity mismatch: got %q want %q", parts[1], id)
 		}
-		s.metrics.ReplicationPartialSyncsApplied.Inc()
+		if _, err := strconv.ParseInt(parts[2], 10, 64); err != nil {
+			return fmt.Errorf("invalid CONTINUE offset %q", parts[2])
+		}
+		connectionReplicaID = parts[3]
+		if connectionReplicaID == "" {
+			return errors.New("CONTINUE missing replica id")
+		}
+		if s.metrics != nil {
+			s.metrics.ReplicationPartialSyncsApplied.Inc()
+		}
+		// The PSYNC request offset is already the replica's locally applied
+		// boundary. ACK it explicitly before catch-up frames arrive.
+		if err := writeReplicationACK(conn, connectionReplicaID, offset); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("unexpected replication handshake %q", header)
 	}
@@ -284,7 +375,35 @@ func (s *Server) followPrimaryOnce(ctx context.Context, upstream string) error {
 		if err := s.applyReplicationPayload(payload); err != nil {
 			return err
 		}
+		if err := writeReplicationACK(conn, connectionReplicaID, s.replicaAppliedOffset()); err != nil {
+			return err
+		}
 	}
+}
+
+func writeReplicationACK(writer io.Writer, replicaID string, offset int64) error {
+	return writeReplicationCommand(writer, []string{"REPLCONF", "ACK", replicaID, strconv.FormatInt(offset, 10)})
+}
+
+func writeReplicationCommand(writer io.Writer, argv []string) error {
+	payload := resp.EncodeCommand(argv)
+	for len(payload) > 0 {
+		n, err := writer.Write(payload)
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return io.ErrShortWrite
+		}
+		payload = payload[n:]
+	}
+	return nil
+}
+
+func (s *Server) replicaAppliedOffset() int64 {
+	s.replStateMu.Lock()
+	defer s.replStateMu.Unlock()
+	return s.replicaOffset
 }
 
 func (s *Server) installReplicaSnapshot(entries []store.SnapshotEntry, id string, offset int64) error {
@@ -344,8 +463,10 @@ func (s *Server) applyReplicationPayload(payload []byte) error {
 	s.replStateMu.Lock()
 	s.replicaOffset += int64(len(payload))
 	s.replStateMu.Unlock()
-	s.metrics.ReplicationFramesApplied.Inc()
-	s.metrics.ReplicationBytesApplied.Add(uint64(len(payload)))
+	if s.metrics != nil {
+		s.metrics.ReplicationFramesApplied.Inc()
+		s.metrics.ReplicationBytesApplied.Add(uint64(len(payload)))
+	}
 	return nil
 }
 
