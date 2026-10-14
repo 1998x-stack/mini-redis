@@ -1,396 +1,257 @@
-# mini-redis v0.12 — Observability / Performance
+# mini-redis v0.13 — Replication ACK / Authoritative Lag
 
 ## 1. Identity
 
-- Historical learning branch: `v0.12`
-- Previous snapshot: `v0.11`
-- Version label: `v0.12.0`
-- Theme: observer-only bounded metrics, immutable snapshots, latency/byte evidence and repeatable profiling
+- Historical learning branch: `v0.13`
+- Previous snapshot: `v0.12`
+- Version label: `v0.13.0`
+- Theme: replica acknowledgements, primary-visible applied offsets and truthful replication lag
 
 ## 2. Primary question
 
-**Once Redis mechanisms are explicit, how can we measure where time, queueing, durability cost, memory pressure, replication work and topology work are spent without changing their semantics?**
+**How can a primary know how far each replica has actually applied the canonical replication stream, rather than merely knowing what it has sent?**
 
 ```text
-existing mechanism
-       ↓
-real event / operation boundary
-       ↓
-observer-only counter / histogram
-       ↓
-immutable snapshot
-       ↓
-INFO / demo / benchmark / profile
+primary canonical offset
+        ↓
+replication frame
+        ↓
+replica fully decodes + applies frame
+        ↓
+ACK <replica-id> <applied-offset>
+        ↓
+primary validates monotonic ACK
+        ↓
+per-replica acknowledged offset
+        ↓
+lag_bytes = primary_offset - acknowledged_offset
 ```
 
 The dominant lesson is:
 
-> **Instrumentation is an observer of mechanism state and events. It is never database state, routing state or mutation policy.**
+> **Replication lag becomes authoritative only when the receiver explicitly reports durable/applied progress back to the sender.**
 
-## 3. Delta from v0.11
+## 3. Delta from v0.12
 
-Added:
+Planned additions:
 
-- `internal/observability` package;
-- atomic monotonic counters and signed gauges;
-- dynamic label maps with synchronized creation and copy-based snapshots;
-- fixed-bucket bounded latency histograms storing count/sum/max but no raw samples;
-- command call/error/latency observation;
-- RESP2/RESP3 request/reply and Push counts;
-- accepted/active connection metrics;
-- real legacy socket read/write byte counts;
-- real reactor syscall read/write byte counts;
-- reactor poll calls/events/wait histogram and buffer-limit events;
-- expiration, eviction, maintenance and bounded rehash-work counts;
-- AOF append, RDB save and AOF rewrite ops/bytes/failures/durations;
-- primary replication identity/offset/backlog/full/partial-sync/subscriber snapshot;
-- replica-local full/partial sync, link failure and applied frame/byte evidence;
-- `Server.MetricsSnapshot()`;
-- read-only `INFO [section]` teaching view;
-- `Topology.MetricsSnapshot()` for Cluster routing/migration/gossip evidence;
-- `Controller.MetricsSnapshot()` for Sentinel probe/failover evidence;
-- race-tested primitive, wire, persistence and control-plane observability tests;
-- `make observability-demo`;
-- `make benchmark-observability`;
-- `docs/PERFORMANCE.md` profiling and workload-reporting contract.
+- connection-local replica identity assigned during PSYNC handshake;
+- replica → primary ACK control frames after successful full-sync install and each successfully applied replication frame;
+- primary-side per-replica acknowledgement registry;
+- monotonic ACK validation;
+- rejection of ACK offsets ahead of the primary canonical offset;
+- connection teardown removes that connection's live ACK state;
+- immutable replica progress snapshots;
+- authoritative `lag_bytes` and `ack_age_ms` in replication metrics / INFO;
+- metrics for ACK received/rejected and last ACK age;
+- deterministic lag demo covering caught-up, delayed, disconnected and resumed states;
+- tests proving ACK is emitted only after successful apply;
+- tests proving malformed/regressing/ahead ACKs cannot corrupt progress state;
+- preservation of existing FULLRESYNC / CONTINUE / backlog semantics.
 
 Unchanged:
 
-- command semantics and mutation ordering;
-- Store/Object encodings;
-- AOF/RDB logical formats and fsync policy;
-- replication wire frames and offset rules;
-- Sentinel SDOWN/ODOWN/quorum/candidate policy;
-- Cluster slot ownership/MOVED/ASK/migration policy;
-- RESP2/RESP3 negotiation and reply adaptation.
+- canonical mutation byte stream;
+- primary repl-id semantics;
+- frame-aware backlog retention;
+- snapshot boundary under `Server.persistenceMu`;
+- replica applied offset advances only after full frame application;
+- AOF/RDB formats;
+- Sentinel candidate ranking policy;
+- Cluster routing/migration;
+- RESP2/RESP3 client protocol semantics.
 
-## 4. Observer-only invariant
+## 4. Protocol shape
 
-Metrics never become inputs to the mechanisms they describe.
+### Handshake
 
-They do not decide:
-
-```text
-command success
-expiration
-eviction
-AOF persistence
-replication publication
-MOVED / ASK
-slot migration commit
-SDOWN / ODOWN
-candidate ranking
-promotion
-protocol negotiation
-```
-
-Metrics also never enter:
+Replica still starts with:
 
 ```text
-Store
-SnapshotEntry
-AOF / RDB
-replication frames
-Cluster slot records
-Sentinel election state
+PSYNC <repl-id|?> <offset|-1>
 ```
 
-Established mechanisms must still work when instrumentation is absent. This is tested by historical minimal-Server construction paths where `metrics == nil`.
-
-## 5. Metrics primitives
-
-### Atomic counters/gauges
-
-Hot monotonic/signed updates use `sync/atomic` rather than sharing Store/topology locks.
-
-### Dynamic labels
-
-Command/engine label creation uses a small mutex. Existing-label increments remain atomic.
-
-### Bounded histograms
-
-Duration histograms use a fixed bucket set plus:
+Primary replies with a mode line that additionally carries one connection-local replica ID:
 
 ```text
-count
-sum_ns
-max_ns
+FULLRESYNC <repl-id> <base-offset> <replica-id>
+CONTINUE   <repl-id> <current-offset> <replica-id>
 ```
 
-No individual samples are retained, so memory use stays bounded independently of request volume.
+`replica-id` identifies one live replication connection, not durable replica identity.
 
-### Snapshot copying
+### ACK
 
-Dynamic maps are copied on snapshot. Mutating a returned map cannot mutate internal metrics.
-
-## 6. Server data-plane snapshot
-
-`Server.MetricsSnapshot()` exposes:
-
-### Command/session/protocol
-
-- per-command calls/errors;
-- command latency histogram;
-- RESP2/RESP3 requests;
-- RESP2/RESP3 replies;
-- Push replies.
-
-### Network
-
-- accepted and active connections;
-- actual read/write bytes by engine;
-- reactor poll calls/events/wait histogram;
-- input/output backpressure events.
-
-### State/memory
-
-- key count at snapshot time;
-- memory-policy stats when available;
-- expired/evicted keys;
-- maintenance cycles and bounded rehash work.
-
-### Persistence
-
-- AOF append ops/bytes/failures/duration;
-- RDB save ops/resulting bytes/failures/duration;
-- AOF rewrite ops/resulting bytes/failures/duration.
-
-### Replication
-
-- role / repl-id / offset / upstream;
-- primary backlog start/window;
-- full/partial sync counts;
-- live primary subscribers;
-- replica-local link failures;
-- replica full/partial syncs applied;
-- frames/bytes applied.
-
-## 7. INFO
-
-`INFO [section]` is a read-only session command assembled from a `Server.MetricsSnapshot()`.
-
-Sections:
+After the replica has actually installed/applied state through offset `N`, it writes:
 
 ```text
-server
-clients
-commands
-protocol
-persistence
-replication
-memory
-reactor
+REPLCONF ACK <replica-id> <N>
 ```
 
-It returns a logical Map. RESP3 encodes it as Map; RESP2 uses the existing v0.11 downgrade path.
+ACK traffic is control-plane metadata. It is not part of the canonical mutation stream and therefore does not advance replication offsets or enter the backlog.
 
-INFO does not reset counters or mutate database state and does not expose metric maps by reference.
+## 5. ACK invariants
 
-Cluster/Sentinel are not folded into INFO because they own separate control-plane state.
-
-## 8. Real network evidence
-
-Legacy uses a transparent `metricConn` wrapper around actual `net.Conn` operations.
-
-Reactor records at the actual syscall/poller boundary:
+For one live replica connection:
 
 ```text
-syscall.Read
-syscall.Write
-Poller.Wait
+last_ack <= new_ack <= primary_offset
 ```
 
-This avoids treating encoded payload length as if it were successful socket I/O.
+The primary must reject:
 
-Both legacy and reactor share the same command/session metrics semantics.
+- malformed ACK frames;
+- wrong replica IDs;
+- negative offsets;
+- regressing offsets;
+- offsets beyond the primary's current canonical offset.
 
-## 9. Persistence evidence
+A rejected ACK never changes accepted progress.
 
-AOF append timing wraps the real append call. RDB save and AOF rewrite timing wrap the established real persistence operations.
+The replica sends ACK only after:
 
-Successful RDB/rewrite byte evidence comes from resulting files. Persistence observation never changes which logical commands are durable or fsync policy.
+- a FULLRESYNC snapshot has been installed successfully; or
+- an entire live/backlog frame has been decoded and applied successfully.
 
-## 10. Replication evidence and an explicit limit
+Therefore `acknowledged_offset` means **applied progress**, not bytes merely read from TCP.
 
-The primary can truthfully expose:
+## 6. Connection ownership
+
+ACK state belongs to the live primary ↔ replica connection.
+
+Primary registry entry:
 
 ```text
-repl-id
-canonical end offset
-backlog start / retained window
-FULLRESYNC count
-CONTINUE count
-live subscribers
+replica-id
+remote address
+acknowledged offset
+last ACK time
+sync mode
+connected=true
 ```
 
-The replica can truthfully expose locally:
+When the connection closes, the live entry is removed. Historical counters may remain in observability, but stale connection progress must not be presented as live replica lag.
+
+## 7. Lag semantics
+
+For a connected replica:
 
 ```text
-repl-id
-applied offset
-full/partial sync applied
-frames/bytes applied
-link failures
+lag_bytes = max(primary_offset - acknowledged_offset, 0)
+ack_age_ms = now - last_ack_time
 ```
 
-v0.8 has no replica→primary acknowledgement protocol. Therefore v0.12 does **not** invent an authoritative primary-visible remote applied offset or replica lag metric.
+This is authoritative with respect to the mini-redis definition of applied offset.
 
-Adding such a metric correctly would first require a replication protocol change.
+It is **not** a wall-clock replication-delay estimate and does not imply fsync/durable disk acknowledgement, because replicas remain memory-only in this teaching implementation.
 
-## 11. Cluster control-plane snapshot
+## 8. Full sync and partial resync
 
-`Topology.MetricsSnapshot()` exposes:
-
-- routes and executes;
-- MOVED / ASK / CLUSTERDOWN;
-- CROSSSLOT;
-- gossip pages, records processed and merges;
-- migration runs, successful key transfers, errors and duration.
-
-Route metrics are recorded after route decisions. Migration timing wraps existing `MigrateSlot`; no metric participates in ownership/commit decisions.
-
-## 12. Sentinel control-plane snapshot
-
-`Controller.MetricsSnapshot()` exposes:
-
-- Tick count/errors/duration;
-- Probe count/failures/duration;
-- failover attempts/duration;
-- promotions/reconfigurations;
-- current epoch, primary and last decision.
-
-The existing candidate ranking remains:
+### FULLRESYNC
 
 ```text
-reachable votes DESC
-replication offset DESC
-node ID ASC
+snapshot base offset B
+        ↓
+replica RestoreSnapshot succeeds
+        ↓
+replica local offset = B
+        ↓
+ACK B
 ```
 
-No metric is consulted by that ranking.
-
-Metrics are owned by each Controller, not by a process-global pointer registry.
-
-## 13. Tests that prove the mechanism
-
-### Primitive
-
-- concurrent counters/maps under `go test -race`;
-- histogram bucket totals/count/max and bounded structure;
-- snapshot mutation isolation.
-
-### Server/wire
-
-On both network engines:
-
-- real commands increment command counts/latency;
-- HELLO changes protocol-request mix on the correct request boundary;
-- actual socket bytes become non-zero;
-- accepted/active connections are visible;
-- reactor poll evidence is non-zero;
-- INFO remains read-only.
-
-### Persistence
-
-Real temporary AOF/RDB files prove operation counts, byte evidence and duration observations.
-
-### Cluster/Sentinel
-
-- real MOVED/ASK/CROSSSLOT/gossip/migration paths produce Cluster evidence;
-- real down-after/quorum/election/promotion paths produce Sentinel evidence.
-
-Everything remains under the historical `go test -race ./...` gate.
-
-## 14. Demo
-
-```bash
-make observability-demo
-```
-
-It drives a real TCP server through:
+### CONTINUE
 
 ```text
-SET
-PING
-HELLO 3
-INFO commands
+replica asks from offset R
+        ↓
+primary sends retained frames
+        ↓
+replica applies frame ending at N
+        ↓
+ACK N
 ```
 
-and then prints coherent Server evidence. It separately drives Cluster MOVED/ASK/gossip and a Sentinel failover, then prints those control-plane snapshots.
+The ACK mechanism must not alter backlog frame boundaries or PSYNC eligibility.
 
-The demo's timing values are evidence from that run, not benchmark claims.
+## 9. Observability
 
-## 15. Performance workflow
-
-Instrumentation microbenchmark:
-
-```bash
-make benchmark-observability
-```
-
-End-to-end legacy/reactor workload:
-
-```bash
-make benchmark
-```
-
-`docs/PERFORMANCE.md` requires performance claims to include commit SHA, Go/OS/CPU and workload configuration, and documents `go test -cpuprofile` + `go tool pprof` usage.
-
-Microbenchmarks and end-to-end workloads are deliberately treated as different forms of evidence.
-
-## 16. Critical invariants
-
-- metrics never become database/persistence/replication/topology state;
-- metrics never make business/control-plane decisions;
-- established mechanisms work without a metric sink;
-- dynamic maps returned by snapshots are copies;
-- histogram memory is bounded independently of event count;
-- socket-byte counters observe actual I/O boundaries;
-- persistence metrics wrap real persistence operations;
-- Cluster/Sentinel metrics remain owned by their control planes;
-- no primary-visible remote replica lag is claimed without ACK protocol support;
-- benchmark claims always name workload/configuration.
-
-## 17. Explicit non-goals
-
-v0.12 does not claim:
-
-- Prometheus/OpenTelemetry compatibility;
-- distributed metric aggregation;
-- production alerting/SLO infrastructure;
-- zero-cost instrumentation;
-- production Redis performance parity;
-- benchmark portability without workload/environment metadata;
-- authoritative remote replica lag unavailable to the current protocol.
-
-## 18. Read this version in order
+`Server.MetricsSnapshot().Replication` should expose live replica progress entries on a primary:
 
 ```text
-internal/observability/metrics.go
-  ↓
-internal/server/metrics.go
-internal/server/command_metrics.go
-  ↓
-internal/server/legacy.go
-internal/server/reactor_linux.go
-  ↓
-internal/server/server.go
+replica_id
+remote_addr
+acknowledged_offset
+lag_bytes
+ack_age_ms
+sync_mode
+```
+
+Runtime metrics add:
+
+```text
+replication_acks_received
+replication_acks_rejected
+```
+
+Replica-local metrics from v0.12 remain useful and unchanged.
+
+## 10. Tests that must prove the mechanism
+
+- primary ACK registry accepts monotonic in-range progress;
+- regressing/ahead/wrong-ID ACKs are rejected without changing state;
+- snapshot ACK occurs only after successful RestoreSnapshot;
+- frame ACK occurs only after successful complete frame application;
+- ACK control frames do not enter backlog or advance primary offset;
+- caught-up replica reports `lag_bytes == 0`;
+- paused/delayed ACK produces positive lag while primary advances;
+- reconnect receives a new connection-local replica ID;
+- CONTINUE preserves offset continuity and catches lag back to zero;
+- disconnect removes live replica progress;
+- existing replication/Sentinel/Cluster/RESP3/observability regressions remain green under `-race`.
+
+## 11. Non-goals
+
+v0.13 does not implement:
+
+- Redis WAIT / WAITAOF semantics;
+- synchronous write acknowledgement to clients;
+- disk/fsync acknowledgement from replicas;
+- persistent replica IDs across reconnects;
+- quorum write durability;
+- automatic failover policy based on ACK age;
+- TCP heartbeat replacement for Sentinel probes;
+- production Redis REPLCONF compatibility beyond the teaching ACK shape.
+
+## 12. Definition of Done
+
+- ACK protocol implemented end-to-end;
+- primary live progress registry implemented;
+- authoritative lag exposed through immutable snapshot / INFO;
+- malformed/regressing/ahead ACK tests exist;
+- integration demo proves lag rises and returns to zero;
+- ACK observation remains separate from failover policy;
+- all historical CI gates remain green;
+- VERSION/docs synchronized;
+- exact `v0.13` SHA passes CI;
+- `main` fast-forwarded to the same SHA;
+- same SHA passes CI on `main`;
+- `main` and `v0.13` compare identical.
+
+## 13. Read this version in order
+
+```text
+internal/replication/primary.go
+  ↓ live replica progress registry
 internal/server/replication.go
+  ↓ handshake + ACK reader/writer
+internal/server/metrics.go
+  ↓ authoritative lag snapshot
+internal/replication/*_test.go
+internal/server/replication*_test.go
   ↓
-internal/cluster/metrics.go
-internal/sentinel/metrics.go
-  ↓
-internal/server/observability_test.go
-internal/cluster/metrics_test.go
-internal/sentinel/metrics_test.go
-  ↓
-examples/observability/main.go
-  ↓
-docs/PERFORMANCE.md
+examples/replication-ack/main.go
 ```
 
-## 19. Completion of the original arc
+## 14. Next step
 
-v0.12 completes the initial dependency-ordered mini-redis learning sequence.
-
-A future v0.13 should begin a new learning arc only after measured evidence or a new systems question justifies one mechanism to extend or replace.
+v0.13 starts a second systems-learning arc by converting a v0.12 measurement limitation into a real protocol mechanism. Any v0.14 should again be justified by an explicit systems question revealed by the now-observable replication path.
