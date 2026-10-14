@@ -26,6 +26,7 @@ jobs:
       - run: make eviction-demo
       - run: make session-demo
       - run: make replication-demo
+      - run: make replication-ack-demo
       - run: make sentinel-demo
       - run: make cluster-demo
       - run: make resp3-demo
