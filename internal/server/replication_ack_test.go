@@ -64,7 +64,6 @@ func TestManualReplicaMakesLagVisibleUntilACK(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
 	if err := writeReplicationCommand(conn, []string{"PSYNC", "?", "-1"}); err != nil {
 		t.Fatal(err)
 	}
@@ -77,6 +76,7 @@ func TestManualReplicaMakesLagVisibleUntilACK(t *testing.T) {
 	if len(parts) != 4 || parts[0] != "FULLRESYNC" {
 		t.Fatalf("header=%q", header)
 	}
+	primaryReplID := parts[1]
 	baseOffset, err := strconv.ParseInt(parts[2], 10, 64)
 	if err != nil {
 		t.Fatal(err)
@@ -123,6 +123,47 @@ func TestManualReplicaMakesLagVisibleUntilACK(t *testing.T) {
 	if after := primary.MetricsSnapshot().Replication.Offset; after != ackOffset || after <= beforeOffset {
 		t.Fatalf("primary offset after ACK=%d want=%d before=%d", after, ackOffset, beforeOffset)
 	}
+
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitForCondition(t, time.Second, "manual disconnect clears live progress", func() bool {
+		return len(primary.MetricsSnapshot().Replication.Replicas) == 0
+	})
+
+	reconnected, err := net.DialTimeout("tcp", primary.ReplicationAddr().String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reconnected.Close()
+	if err := writeReplicationCommand(reconnected, []string{"PSYNC", primaryReplID, strconv.FormatInt(ackOffset, 10)}); err != nil {
+		t.Fatal(err)
+	}
+	reconnectedReader := bufio.NewReader(reconnected)
+	continueHeader, err := readReplicationSimpleString(reconnectedReader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	continueParts := strings.Fields(continueHeader)
+	if len(continueParts) != 4 || continueParts[0] != "CONTINUE" {
+		t.Fatalf("continue header=%q", continueHeader)
+	}
+	if continueParts[1] != primaryReplID {
+		t.Fatalf("CONTINUE repl-id=%q want=%q", continueParts[1], primaryReplID)
+	}
+	newReplicaID := continueParts[3]
+	if newReplicaID == replicaID {
+		t.Fatalf("reconnect reused connection-local replica id %q", replicaID)
+	}
+	if err := writeReplicationACK(reconnected, newReplicaID, ackOffset); err != nil {
+		t.Fatal(err)
+	}
+	waitForCondition(t, time.Second, "reconnected ACK establishes new live progress", func() bool {
+		snapshot := primary.MetricsSnapshot()
+		return len(snapshot.Replication.Replicas) == 1 &&
+			snapshot.Replication.Replicas[0].ReplicaID == newReplicaID &&
+			snapshot.Replication.Replicas[0].LagBytes == 0
+	})
 }
 
 func TestReplicationACKReaderRejectsWrongConnectionIdentity(t *testing.T) {
