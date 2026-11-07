@@ -3,6 +3,8 @@ package resp
 import (
 	"math"
 	"reflect"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -96,5 +98,50 @@ func TestRESP3DoubleSpecialValues(t *testing.T) {
 		if string(encoded) != tc.wire {
 			t.Fatalf("wire=%q want=%q", encoded, tc.wire)
 		}
+	}
+}
+
+func TestParseValueRejectsOversizedBlobAndAggregateLengths(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	cases := []struct {
+		name string
+		wire string
+	}{
+		{name: "blob integer overflow", wire: "$" + strconv.Itoa(maxInt) + "\r\n"},
+		{name: "blob above limit", wire: "$" + strconv.Itoa(maxValueBlobBytes+1) + "\r\n"},
+		{name: "array above limit", wire: "*" + strconv.Itoa(maxValueContainerElements+1) + "\r\n"},
+		{name: "set above limit", wire: "~" + strconv.Itoa(maxValueContainerElements+1) + "\r\n"},
+		{name: "push above limit", wire: ">" + strconv.Itoa(maxValueContainerElements+1) + "\r\n"},
+		{name: "map above limit", wire: "%" + strconv.Itoa(maxValueContainerElements+1) + "\r\n"},
+		{name: "array integer overflow", wire: "*" + strconv.Itoa(maxInt) + "\r\n"},
+		{name: "map integer overflow", wire: "%" + strconv.Itoa(maxInt) + "\r\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, complete, err := ParseValue([]byte(tc.wire))
+			if err == nil {
+				t.Fatal("expected oversized length to be rejected")
+			}
+			if complete {
+				t.Fatal("oversized length must not be reported as a complete value")
+			}
+		})
+	}
+}
+
+func TestParseValueAcceptsContainerLimitAndValidIncompleteBlob(t *testing.T) {
+	wire := "*" + strconv.Itoa(maxValueContainerElements) + "\r\n" +
+		strings.Repeat("_\r\n", maxValueContainerElements)
+	value, consumed, complete, err := ParseValue([]byte(wire))
+	if err != nil || !complete || consumed != len(wire) {
+		t.Fatalf("container boundary complete=%v consumed=%d err=%v", complete, consumed, err)
+	}
+	if len(value.Array) != maxValueContainerElements {
+		t.Fatalf("container elements=%d want=%d", len(value.Array), maxValueContainerElements)
+	}
+
+	_, consumed, complete, err = ParseValue([]byte("$3\r\nab"))
+	if err != nil || complete || consumed != 0 {
+		t.Fatalf("valid incomplete blob complete=%v consumed=%d err=%v", complete, consumed, err)
 	}
 }

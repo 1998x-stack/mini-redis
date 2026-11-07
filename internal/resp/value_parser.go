@@ -8,7 +8,11 @@ import (
 	"strings"
 )
 
-const maxValueDepth = 64
+const (
+	maxValueDepth              = 64
+	maxValueBlobBytes          = 64 << 20
+	maxValueContainerElements  = 1024
+)
 
 // ParseValue parses one RESP2/RESP3 value from data without consuming an
 // incomplete frame. complete=false means the prefix is valid so far and more
@@ -108,7 +112,11 @@ func parseValueAt(data []byte, offset, depth int) (Value, int, bool, error) {
 			}
 			return NullBulkString(), next, true, nil
 		}
-		if len(data)-next < length+2 {
+		if length > maxValueBlobBytes {
+			return Value{}, 0, false, fmt.Errorf("%w: blob length exceeds limit", ErrProtocol)
+		}
+		remaining := len(data) - next
+		if remaining < 2 || length > remaining-2 {
 			return Value{}, 0, false, nil
 		}
 		if data[next+length] != '\r' || data[next+length+1] != '\n' {
@@ -129,7 +137,7 @@ func parseValueAt(data []byte, offset, depth int) (Value, int, bool, error) {
 			return Value{}, 0, false, nil
 		}
 		count, err := strconv.Atoi(line)
-		if err != nil || count < -1 {
+		if err != nil || count < -1 || count > maxValueContainerElements {
 			return Value{}, 0, false, fmt.Errorf("%w: invalid container length", ErrProtocol)
 		}
 		if count == -1 {
@@ -162,7 +170,7 @@ func parseValueAt(data []byte, offset, depth int) (Value, int, bool, error) {
 			return Value{}, 0, false, nil
 		}
 		count, err := strconv.Atoi(line)
-		if err != nil || count < 0 {
+		if err != nil || count < 0 || count > maxValueContainerElements {
 			return Value{}, 0, false, fmt.Errorf("%w: invalid map length", ErrProtocol)
 		}
 		entries := make([]MapEntry, 0, count)
