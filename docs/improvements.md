@@ -12,5 +12,5 @@
 - Security & regression review: No dependencies, workflows, credentials, permissions, persistence, or replication state are changed. Limits match the existing command-reader limits. Valid fragmented nested RESP3 test remains in place; oversized declarations fail before allocation/indexing.
 - Risk & rollback: RESP3 values above 64 MiB or aggregates/maps above 1024 elements are now rejected; revert the implementation commit to restore prior parser behavior. The package is internal and the limits align with its existing reader.
 - Follow-up: If larger RESP3 values become a supported requirement, introduce explicit parser limits and a bounded streaming-buffer policy rather than removing bounds.
-- Commit: pending
-- PR: pending
+- Commit: `b7f4f6a8235a09d2a64a86673824f2ce07c2bf19` (implementation, tests and initial history; branch head also includes gofmt alignment commit `e1070b3dff211f2b0193d21911021a12f989d9de`)
+- PR: https://github.com/1998x-stack/mini-redis/pull/1
