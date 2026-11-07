@@ -9,9 +9,9 @@ import (
 )
 
 const (
-	maxValueDepth              = 64
-	maxValueBlobBytes          = 64 << 20
-	maxValueContainerElements  = 1024
+	maxValueDepth             = 64
+	maxValueBlobBytes         = 64 << 20
+	maxValueContainerElements = 1024
 )
 
 // ParseValue parses one RESP2/RESP3 value from data without consuming an
